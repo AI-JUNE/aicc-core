@@ -10,11 +10,26 @@ const RULES: { name: string; re: RegExp; mask: (m: string) => string }[] = [
 
 export interface MaskResult { text: string; masked: boolean; hits: string[] }
 
+/** 이미 마스킹된 구간을 뒤 규칙이 다시 잡지 않도록 자리표시자로 보호한다(숫자 미포함). */
+const PH = (i: number) => `\u0001${String(i).replace(/\d/g, (d) => String.fromCharCode(103 + Number(d)))}\u0001`;
+
 export function maskPii(input: string): MaskResult {
-  let out = input; const hits: string[] = [];
+  let out = input;
+  const hits: string[] = [];
+  const vault: string[] = [];
   for (const r of RULES) {
-    if (r.re.test(out)) { hits.push(r.name); out = out.replace(new RegExp(r.re.source, 'g'), (m) => r.mask(m)); }
-    r.re.lastIndex = 0;
+    const re = new RegExp(r.re.source, 'g');
+    let hit = false;
+    out = out.replace(re, (m) => {
+      hit = true;
+      vault.push(r.mask(m));
+      return PH(vault.length - 1);
+    });
+    if (hit) hits.push(r.name);
   }
+  out = out.replace(/\u0001([g-p]+)\u0001/g, (_m, k: string) => {
+    const idx = Number(String(k).replace(/[g-p]/g, (c) => String(c.charCodeAt(0) - 103)));
+    return vault[idx] ?? '';
+  });
   return { text: out, masked: hits.length > 0, hits };
 }
