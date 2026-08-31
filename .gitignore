@@ -3,3 +3,7 @@ dist
 *.tsbuildinfo
 .env
 .env*.local
+
+# 영업 산출물은 98. 제안 폴더에서 관리
+*.pptx
+*.pdf
