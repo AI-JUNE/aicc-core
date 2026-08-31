@@ -298,7 +298,9 @@ export function publish(reg: FlowRegistry, input: PublishInput): LifecycleResult
   if (!input.by) return fail('E_ACTOR_EMPTY', '배포자가 비어 있습니다.');
   if (input.channels.length === 0) return fail('E_STAGE_INVALID', '배포 대상 채널이 비어 있습니다.');
 
-  const found = loadDraftable(reg, { scope: input.scope, flowId: input.flowId, version: input.version }, ['approved']);
+  // 'published' 도 허용한다 — 콜봇에 먼저 올리고 하루 뒤 챗봇에 올리는 단계적 배포는 정상 운영이며,
+  // 이미 승인된 같은 리비전을 채널만 늘리는 것이므로 재승인을 요구할 이유가 없다.
+  const found = loadDraftable(reg, { scope: input.scope, flowId: input.flowId, version: input.version }, ['approved', 'published']);
   if (!found.ok) {
     return found.code === 'E_STAGE_INVALID'
       ? fail('E_NOT_APPROVED', `승인된 리비전만 배포할 수 있습니다: ${found.message}`)

@@ -114,6 +114,15 @@ test('새 버전 배포 시 어느 채널에도 안 남은 이전 버전만 arch
   assert.equal(lc.findRevision(reg, scope, 'greeting', 1).stage, 'archived');
 });
 
+test('단계적 배포 — 이미 published 인 리비전에 채널을 추가하는 것은 재승인 없이 가능하다', behavioral, () => {
+  let reg = approved(1);
+  reg = lc.publish(reg, { scope, flowId: 'greeting', version: 1, channels: ['voice'], by: 'ops', at: '2026-09-01T03:00:00Z' }).value;
+  const add = lc.publish(reg, { scope, flowId: 'greeting', version: 1, channels: ['chat'], by: 'ops', at: '2026-09-02T03:00:00Z' });
+  assert.equal(add.ok, true);
+  assert.equal(lc.activeDeployment(add.value, scope, 'greeting', 'voice').version, 1);
+  assert.equal(lc.activeDeployment(add.value, scope, 'greeting', 'chat').version, 1);
+});
+
 test('§9.3 롤백은 과거 배포 이력이 있는 버전으로만 가능하다', behavioral, () => {
   let reg = approved(1);
   reg = lc.publish(reg, { scope, flowId: 'greeting', version: 1, channels: ['voice'], by: 'ops', at: '2026-09-01T03:00:00Z' }).value;
