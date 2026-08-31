@@ -25,13 +25,27 @@ export interface LlmAdapter {
   complete(messages: LlmMessage[], tools?: unknown[]): AsyncIterable<string>;
 }
 
-export interface EngineSet { stt: SttAdapter; tts: TtsAdapter; llm: LlmAdapter }
+/** 임베딩 엔진(§5.2 RAG). 지식 원문이 그대로 흘러가므로 residency 판정 대상에 반드시 포함된다(§10.3). */
+export interface EmbeddingAdapter {
+  readonly name: string;
+  readonly residency: 'domestic' | 'onprem' | 'overseas';
+  /** 입력은 §10.3 마스킹을 통과한 텍스트만 넣는다. 차원 수는 엔진이 정한다 — Core가 가정하지 않는다. */
+  embed(texts: string[]): Promise<number[][]>;
+}
+
+export interface EngineSet {
+  stt: SttAdapter;
+  tts: TtsAdapter;
+  llm: LlmAdapter;
+  /** RAG를 쓰는 테넌트만 설정한다. */
+  embedding?: EmbeddingAdapter;
+}
 
 /** §10.3 — 국외이전이 금지된 테넌트에서 해외 엔진 사용을 사전 차단 */
 export function assertResidency(engines: EngineSet, allowOverseas: boolean): void {
   if (allowOverseas) return;
   const bad = Object.entries(engines)
-    .filter(([, e]) => (e as { residency: string }).residency === 'overseas')
+    .filter(([, e]) => e && (e as { residency: string }).residency === 'overseas')
     .map(([k]) => k);
   if (bad.length) {
     throw new Error(`국외이전 불가 테넌트에 해외 엔진이 설정됨: ${bad.join(', ')} (설계서 §10.3)`);

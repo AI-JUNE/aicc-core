@@ -5,6 +5,12 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 const read = (p) => readFileSync(new URL(`../${p}`, import.meta.url), 'utf8');
 
+let g = null;
+try {
+  g = await import('../src/core/policyGuard.ts');
+} catch { /* 타입 스트리핑 미지원 런타임 */ }
+const behavioral = { skip: g ? false : '타입 스트리핑 미지원 런타임' };
+
 test('§4.1 Outcome 4종이 모두 정의되어 있다', () => {
   const s = read('src/domain/types.ts');
   for (const v of ['AUTO_RESOLVED', 'TRANSFERRED', 'ABANDONED', 'FAILED']) assert.match(s, new RegExp(v));
@@ -53,4 +59,15 @@ test('§1.2 채널 합류(attachChannel)로 하나의 Interaction 유지', () =>
 test('시뮬 어댑터는 외부 호출이 없다(실엔진 미연동)', () => {
   const s = read('src/adapters/sim.ts');
   assert.equal(/fetch\(|https?:\/\//.test(s), false);
+});
+
+test('§10.3 규칙 우선순위 — 휴대폰은 phone, 계좌는 account로 분류된다', behavioral, () => {
+  const phone = g.maskPii('연락처 010-1234-5678');
+  assert.deepEqual(phone.hits, ['phone']);
+  assert.ok(!phone.text.includes('010-1234-5678'));
+  const acct = g.maskPii('입금계좌 110-123-456789');
+  assert.deepEqual(acct.hits, ['account']);
+  assert.ok(!acct.text.includes('110-123-456789'));
+  const both = g.maskPii('010-1234-5678 / 110-123-456789');
+  assert.deepEqual(both.hits.sort(), ['account', 'phone']);
 });

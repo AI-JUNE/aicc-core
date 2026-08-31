@@ -58,10 +58,10 @@ test('§10.3 요약 본문은 마스킹을 통과한 값만 담는다', behavior
   }), { now: NOW });
 
   assert.equal(s.piiMasked, true);
-  // 규칙명은 policyGuard 규칙 순서에 종속된다(휴대폰 번호가 account 규칙에 먼저 걸린다 — 별도 과제).
-  // 여기서 고정해야 할 불변식은 "원문이 요약에 남지 않는다"이다.
-  assert.ok(s.piiKinds.length > 0);
+  // 규칙 우선순위 정정 후: 휴대폰 번호는 phone으로 분류된다(§8.1 pii_kinds 통계 정확도).
   assert.ok(s.piiKinds.includes('card'));
+  assert.ok(s.piiKinds.includes('phone'));
+  assert.ok(!s.piiKinds.includes('account'));
   assert.ok(!s.text.includes('010-1234-5678'), '원문 전화번호가 남으면 안 된다');
   assert.ok(!s.text.includes('5678-9012'), '원문 카드번호가 남으면 안 된다');
   assert.ok(s.text.includes('5678'), '상담사 식별용 뒷자리는 유지된다');
