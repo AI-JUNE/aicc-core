@@ -20,6 +20,21 @@ export interface LatencyMs {
   total_ms?: number;
 }
 
+/**
+ * 과금 근거가 되는 사용량(§11.2). 실측값만 넣는다 — 추정·기본값 금지(§13-3).
+ * 엔진마다 단위가 다르므로(초 vs ms, 토큰 정의) 어댑터가 이 형태로 환산해 채운다(§6.2).
+ */
+export interface UsageMetrics {
+  /** LLM 입력 토큰 */
+  llm_prompt_tokens?: number;
+  /** LLM 출력 토큰 */
+  llm_completion_tokens?: number;
+  /** STT가 처리한 오디오 길이(ms) */
+  stt_audio_ms?: number;
+  /** TTS가 합성한 오디오 길이(ms) */
+  tts_audio_ms?: number;
+}
+
 export type EntryPoint = 'inbound_call' | 'outbound_call' | 'visual_link' | 'web_chat' | 'app_chat';
 
 /** 이벤트 생성 시 호출자가 제공하는 식별 정보 (id·시각은 주입 — 순수 함수 유지) */
@@ -65,6 +80,8 @@ export interface TurnCompletedEvent extends EventBase {
   intent?: string;
   confidence?: number;
   retry_count?: number;
+  /** §11.2 과금 근거 — 어댑터가 실측으로 채운 경우에만 존재한다. */
+  usage?: UsageMetrics;
 }
 
 export interface HandoffRequestedEvent extends EventBase {
@@ -82,6 +99,12 @@ export interface SessionEndedEvent extends EventBase {
   duration_ms?: number;
   /** §4.1 최종 Outcome 확정은 재문의 반영 후 resolveOutcome이 담당한다 */
   re_contact_within_24h?: boolean;
+  /**
+   * §11.2 통화 과금 대상 구간(ms). duration_ms(세션 전체)와 다를 수 있다 —
+   * 대기·호 설정 구간을 과금에 포함할지는 계약에 달렸으므로 채널 어댑터가 계약대로 채운다.
+   * 미제공 시 과금 집계는 이 세션을 통화 분 집계에서 제외한다(임의 추정 금지 §13-3).
+   */
+  billable_ms?: number;
 }
 
 export type InteractionEvent =
@@ -131,6 +154,7 @@ export function turnCompleted(
     confidence?: number;
     retryCount?: number;
     latency?: LatencyMs;
+    usage?: UsageMetrics;
   },
 ): TurnCompletedEvent {
   const masked = maskPii(p.utterance);
@@ -143,6 +167,7 @@ export function turnCompleted(
     ...(p.intent !== undefined ? { intent: p.intent } : {}),
     ...(p.confidence !== undefined ? { confidence: p.confidence } : {}),
     ...(p.retryCount !== undefined ? { retry_count: p.retryCount } : {}),
+    ...(p.usage !== undefined ? { usage: p.usage } : {}),
   };
 }
 
@@ -162,7 +187,14 @@ export function handoffRequested(
 
 export function sessionEnded(
   m: EventMeta,
-  p: { outcome: Outcome; turnCount: number; durationMs?: number; reContactWithin24h?: boolean; latency?: LatencyMs },
+  p: {
+    outcome: Outcome;
+    turnCount: number;
+    durationMs?: number;
+    reContactWithin24h?: boolean;
+    latency?: LatencyMs;
+    billableMs?: number;
+  },
 ): SessionEndedEvent {
   return {
     ...base(m, 'session.ended', { masked: false, kinds: [] }, p.latency ?? {}),
@@ -170,6 +202,7 @@ export function sessionEnded(
     turn_count: p.turnCount,
     ...(p.durationMs !== undefined ? { duration_ms: p.durationMs } : {}),
     ...(p.reContactWithin24h !== undefined ? { re_contact_within_24h: p.reContactWithin24h } : {}),
+    ...(p.billableMs !== undefined ? { billable_ms: p.billableMs } : {}),
   };
 }
 
