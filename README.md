@@ -9,7 +9,7 @@
 | `src/domain/types.ts` | §4·§4.1 | Interaction·Turn·Outcome 판정(24h 재문의 반영) |
 | `src/adapters/index.ts` | §6.2·§13-8 | STT/TTS/LLM 어댑터 인터페이스 + 국외이전 차단 가드(§10.3) |
 | `src/adapters/sim.ts` | — | 시뮬 어댑터(외부 호출 없음). **실엔진 연동은 [승인 필요]** |
-| `src/flow/types.ts` | §5.3 | Flow 노드 5종 + 채널별 렌더러(시나리오 이중 관리 제거) |
+| `src/flow/types.ts` | §5.3·§6.1 | Flow 노드 6종(Say·Collect·Choice·Confirm·Transfer·Api) + 채널별 렌더러(시나리오 이중 관리 제거) |
 | `src/core/policyGuard.ts` | §10.3 | 주민·카드·계좌·전화 자동 마스킹 |
 | `src/core/session.ts` | §1.2·§5.1 | 세션 생성·채널 합류·턴 기록·폴백 정책 |
 | `src/knowledge/rag.ts` | §5.2·§11.1·§10.3·§7 | 지식 인제스트(청킹·마스킹)·테넌트 스코프 검색·근거 판정·인용. 근거 미달 시 자유 생성 대신 §5.1 폴백 |
@@ -22,6 +22,8 @@
 | `src/core/channelSwitch.ts` | §5.2·§1.2·§10.3·§11.1 | 채널 전환 초대 — 1회용·만료·스코프 검증, 승계 슬롯 allowlist+마스킹, 같은 Interaction 합류 |
 | `src/routing/agentQueue.ts` | §2·§9.3·§11.1 | 이관 라우팅·큐 — 규칙 기반 큐 선택, 운영시간·수용 판정, 오버플로, 오퍼 상태기계 |
 | `src/nlu/intent.ts` | §5.1·§5.2·§6.2 | 인텐트 판정 — 카탈로그·정책 검증, 확정/명확화/미분류, 임계값은 테넌트 운영값 |
+| `src/integration/connector.ts` | §6.1·§9.3·§10.3·§11.1 | 외부 업무시스템 연동 계약 — 시크릿 참조 키, 응답 allowlist·마스킹, 재시도·실패 판정 |
+| `src/consent/consent.ts` | §10.1·§10.3·§11.1 | 동의 관리 — 목적별 상태·만료, append-only 이력, 행위 게이트(녹취·저장·국외이전) |
 
 ## 검증
 ```

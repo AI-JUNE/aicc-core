@@ -44,7 +44,7 @@ test('무음 대기 단계는 턴으로 집계되지 않는다(§8.1)', behavior
   const silentFlow = { ...flow, nodes: { ...flow.nodes, lookup: { id: 'lookup', kind: 'Api', connectorId: 'crm_lookup', next: 'reply' } } };
   const r1 = runner.start(silentFlow, ctx);
   const r2 = runner.send(silentFlow, r1.state, { kind: 'utterance', text: '010-1234-5678' }, ctx);
-  const botTurns = r2.events.filter(e => e.type === 'turn.completed' && e.payload.speaker === 'bot');
+  const botTurns = r2.events.filter(e => e.type === 'turn.completed' && e.speaker === 'bot');
   assert.equal(botTurns.length, 0);
   assert.equal(r2.state.pendingConnectorId, 'crm_lookup');
 });
