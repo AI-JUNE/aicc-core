@@ -18,6 +18,7 @@ export type IssueCode =
   | 'E_CHOICE_DUPLICATE_VALUE'
   | 'E_MAX_RETRY_INVALID'
   | 'E_INFINITE_LOOP'
+  | 'E_CONNECTOR_UNDEFINED'
   // 경고 — 배포는 가능하나 운영 리스크
   | 'W_UNREACHABLE_NODE'
   | 'W_CYCLE'
@@ -59,6 +60,10 @@ export function edgesOf(node: FlowNode): FlowEdge[] {
     case 'Confirm':
       push(node.onYes, 'onYes');
       push(node.onNo, 'onNo');
+      push(node.next, 'next');
+      break;
+    case 'Api':
+      push(node.onError, 'onError');
       push(node.next, 'next');
       break;
     case 'Transfer':
@@ -124,6 +129,10 @@ function checkRequired(node: FlowNode, add: (i: ValidationIssue) => void): void 
       break;
     case 'Transfer':
       req('queue', node.queue);
+      break;
+    case 'Api':
+      req('connectorId', node.connectorId);
+      // onError 미지정은 오류가 아니다 — 지정하지 않으면 §9.3 상담사 이관으로 내려간다.
       break;
   }
 }
@@ -244,19 +253,27 @@ export function validateFlow(flow: Flow): ValidationResult {
     }
 
     for (const cycle of findCycles(flow, reach)) {
-      const waitsForInput = cycle.some(id => {
-        const k = (flow.nodes[id] as FlowNode).kind;
-        return k === 'Collect' || k === 'Choice' || k === 'Confirm';
-      });
-      add(waitsForInput
-        ? {
-            code: 'W_CYCLE', severity: 'warning', nodeId: cycle[0], path: cycle,
-            message: `순환 경로가 있습니다: ${cycle.join(' → ')} → ${cycle[0]}. 고객 입력으로 벗어날 수 있는지 확인하세요.`,
-          }
-        : {
-            code: 'E_INFINITE_LOOP', severity: 'error', nodeId: cycle[0], path: cycle,
-            message: `입력 대기 없는 무한 순환입니다: ${cycle.join(' → ')} → ${cycle[0]}.`,
-          });
+      const kinds = cycle.map(id => (flow.nodes[id] as FlowNode).kind);
+      const waitsForInput = kinds.some(k => k === 'Collect' || k === 'Choice' || k === 'Confirm');
+      // Api 순환은 고객 입력 없이 돌지만 외부 응답에 따라 벗어날 수 있다(재조회·폴링).
+      // 무한 루프로 단정해 배포를 막지 않고, 종료 조건 확인을 요구하는 경고로 남긴다.
+      const callsExternal = kinds.some(k => k === 'Api');
+      if (waitsForInput) {
+        add({
+          code: 'W_CYCLE', severity: 'warning', nodeId: cycle[0], path: cycle,
+          message: `순환 경로가 있습니다: ${cycle.join(' → ')} → ${cycle[0]}. 고객 입력으로 벗어날 수 있는지 확인하세요.`,
+        });
+      } else if (callsExternal) {
+        add({
+          code: 'W_CYCLE', severity: 'warning', nodeId: cycle[0], path: cycle,
+          message: `외부 연동 호출이 포함된 순환입니다: ${cycle.join(' → ')} → ${cycle[0]}. 조회 실패가 반복될 때 벗어날 조건이 있는지 확인하세요.`,
+        });
+      } else {
+        add({
+          code: 'E_INFINITE_LOOP', severity: 'error', nodeId: cycle[0], path: cycle,
+          message: `입력 대기 없는 무한 순환입니다: ${cycle.join(' → ')} → ${cycle[0]}.`,
+        });
+      }
     }
 
     // 종료도 이관도 없는 시나리오 — 고객이 나갈 길이 없다
@@ -272,6 +289,27 @@ export function validateFlow(flow: Flow): ValidationResult {
   const errors = issues.filter(i => i.severity === 'error');
   const warnings = issues.filter(i => i.severity === 'warning');
   return { ok: errors.length === 0, issues, errors, warnings, reachable, unreachable };
+}
+
+/**
+ * Api 노드가 가리키는 커넥터가 실제로 등록돼 있는지 대조한다(§6.1).
+ * Flow만으로는 알 수 없어 validateFlow 와 분리했다 — 배포 게이트가 테넌트 커넥터 목록을 넣어 호출한다.
+ * 커넥터 목록은 반드시 해당 테넌트 스코프로 조회한 것이어야 한다(§11.1).
+ */
+export function validateFlowConnectors(flow: Flow, registeredConnectorIds: readonly string[]): ValidationIssue[] {
+  const known = new Set(registeredConnectorIds);
+  const issues: ValidationIssue[] = [];
+  for (const node of Object.values(flow.nodes ?? {})) {
+    if (node.kind !== 'Api') continue;
+    if (blank(node.connectorId)) continue;   // 필수 필드 누락은 validateFlow 가 이미 잡는다
+    if (!known.has(node.connectorId)) {
+      issues.push({
+        code: 'E_CONNECTOR_UNDEFINED', severity: 'error', nodeId: node.id, field: 'connectorId',
+        message: `Api 노드 '${node.id}' 가 등록되지 않은 커넥터 '${node.connectorId}' 를 가리킵니다.`,
+      });
+    }
+  }
+  return issues;
 }
 
 /** 배포 게이트 — 스튜디오 publish 버튼이 호출한다. */

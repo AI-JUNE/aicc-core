@@ -15,7 +15,13 @@ export type RunStatus = 'running' | 'completed' | 'transferred' | 'failed';
 export type FlowInput =
   | { kind: 'utterance'; text: string; confidence?: number; latency?: LatencyMs }
   | { kind: 'dtmf'; digits: string; latency?: LatencyMs }
-  | { kind: 'timeout' };
+  | { kind: 'timeout' }
+  /**
+   * 외부 연동 호출 결과(§6.1). Runner는 순수·동기 함수이므로 커넥터를 직접 부르지 않는다.
+   * 호스트가 Api 단계를 보고 호출한 뒤, 결과만 이 입력으로 되돌려준다.
+   * slots 는 applyResponse()를 통과한 값이어야 한다 — 마스킹 책임은 커넥터 계층에 있다(§10.3).
+   */
+  | { kind: 'connectorResult'; ok: boolean; slots?: Record<string, string>; errorCode?: string; latency?: LatencyMs };
 
 export interface FlowState {
   flowId: string;
@@ -31,6 +37,8 @@ export interface FlowState {
   visited: string[];
   lastFallback?: FallbackAction;
   handoff?: { reason: Handoff['reason']; queue?: string };
+  /** Api 노드에서 대기 중인 커넥터 id. 값이 있으면 호스트의 호출 결과를 기다리는 상태다(§6.1). */
+  pendingConnectorId?: string;
   error?: string;
 }
 
@@ -84,7 +92,7 @@ function inputText(input: FlowInput): string {
 }
 
 function inputLatency(input: FlowInput): LatencyMs {
-  return input.kind === 'timeout' ? {} : (input.latency ?? {});
+  return input.kind === 'timeout' || input.kind === 'connectorResult' ? {} : (input.latency ?? {});
 }
 
 /** 신뢰도 임계값이 설정된 테넌트에서만 게이팅한다 */
@@ -120,9 +128,18 @@ function advance(flow: Flow, s: FlowState, ctx: RunnerContext, steps: RenderedSt
     if (!s.visited.includes(node.id)) s.visited.push(node.id);
     const step = renderNode(node, s.channel);
     steps.push(step);
-    events.push(turnCompleted(meta(s, ctx), {
-      turnId: `t_${++s.turnCount}`, speaker: 'bot', utterance: step.text, nodeId: node.id,
-    }));
+    // 무음 단계(Api 대기)는 발화가 없으므로 턴으로 집계하지 않는다 — 없는 발화가 통계에 잡히면 §8.1 신뢰도가 깨진다.
+    if (step.silent !== true) {
+      events.push(turnCompleted(meta(s, ctx), {
+        turnId: `t_${++s.turnCount}`, speaker: 'bot', utterance: step.text, nodeId: node.id,
+      }));
+    }
+
+    if (node.kind === 'Api') {
+      // 호출은 호스트가 한다(§6.2). Runner는 대기 상태만 표시하고 결과 입력을 기다린다.
+      s.pendingConnectorId = node.connectorId;
+      return;
+    }
 
     if (node.kind === 'Transfer') {
       s.handoff = { reason: (node.reason as Handoff['reason']) ?? 'policy', queue: node.queue };
@@ -190,6 +207,38 @@ export function send(flow: Flow, prev: FlowState, input: FlowInput, ctx: RunnerC
     terminate(s, ctx, events, 'failed', 'FAILED');
     return { state: s, steps, events };
   }
+
+  // ── Api 노드 대기 구간 (§6.1) ───────────────────────────────────────────────
+  // 커넥터 결과 외의 입력은 무시한다. 조회 중 고객이 말을 걸어도 흐름을 흔들지 않는다.
+  if (node.kind === 'Api') {
+    if (input.kind !== 'connectorResult') return { state: s, steps, events };
+    delete s.pendingConnectorId;
+    if (input.ok) {
+      // slots 는 커넥터 계층에서 allowlist·마스킹을 마친 값이다(§10.3). 예약 슬롯은 덮어쓸 수 없다.
+      for (const [k, v] of Object.entries(input.slots ?? {})) {
+        if (!k.startsWith('__')) s.slots[k] = v;
+      }
+      s.failCount = 0;
+      delete s.lastFallback;
+      s.currentNodeId = node.next ?? null;
+      advance(flow, s, ctx, steps, events);
+      return { state: s, steps, events };
+    }
+    // 외부 장애는 고객 잘못이 아니다 — §5.1 실패 카운트를 올리지 않는다.
+    s.slots['__last_connector_error__'] = input.errorCode ?? 'unknown';
+    if (node.onError !== undefined && node.onError !== '') {
+      s.currentNodeId = node.onError;
+      advance(flow, s, ctx, steps, events);
+      return { state: s, steps, events };
+    }
+    // 대체 분기가 없으면 §9.3에 따라 상담사로 내린다. 조회 실패로 콜을 끊지 않는다.
+    s.handoff = { reason: 'error' };
+    events.push(handoffRequested(meta(s, ctx), { reason: 'error' }));
+    terminate(s, ctx, events, 'transferred', 'TRANSFERRED');
+    return { state: s, steps, events };
+  }
+  // 커넥터 결과가 Api 노드 밖에서 도착하면 늦게 온 응답이다 — 무시한다(멱등, §8.1).
+  if (input.kind === 'connectorResult') return { state: s, steps, events };
 
   // 고객 발화는 turnCompleted 내부에서 마스킹된다(§10.3).
   events.push(turnCompleted(meta(s, ctx), {
