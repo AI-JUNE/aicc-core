@@ -383,7 +383,8 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       if (!rec) throw new Error(`세션을 찾을 수 없습니다: ${interactionId}`);
       const reg = registration(rec.adapter);
       // 종료된 세션에 늦게 도착한 입력은 새 이벤트를 만들지 않는다(멱등, §8.1).
-      if (rec.ended || rec.state.status !== 'running') return rec.lastResult;
+      // events를 비워 돌려준다 — 채널이 마지막 결과를 다시 발행해 중복 집계하는 경로를 막는다.
+      if (rec.ended || rec.state.status !== 'running') return { ...rec.lastResult, events: [] };
 
       const decision = health(rec.state.channel);
       const outage = await applyOutage(rec, decision, reg);
@@ -428,7 +429,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       const rec = sessions.get(interactionId);
       if (!rec) throw new Error(`세션을 찾을 수 없습니다: ${interactionId}`);
       const reg = registration(rec.adapter);
-      if (rec.ended) return rec.lastResult;      // 중복 종료 요청은 이벤트를 늘리지 않는다
+      if (rec.ended) return { ...rec.lastResult, events: [] };   // 중복 종료 요청은 이벤트를 늘리지 않는다
 
       // §4.1 — 목표 미달 상태에서 고객이 끊으면 자동완결이 아니다.
       const outcome = resolveOutcome({

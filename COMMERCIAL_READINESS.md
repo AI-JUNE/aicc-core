@@ -20,8 +20,13 @@
 - [ ] **테스트** 핵심 로직 커버리지 확보, CI에서 실행
 
 ## AICC-Core 전용 (라이브러리, 준비도 ~38%)
-- [ ] **실엔진 어댑터 1종 이상** — 현재 sim만. STT/TTS/LLM 중 인터페이스 준수 구현체 **[실호출은 승인]**
+- [x] **실엔진 어댑터 1종 이상** — HTTP 엔진 어댑터(STT·TTS·LLM·임베딩 4종 §6.2 인터페이스 준수).
+      근거: `src/adapters/http.ts` · `tests/adapters.http.test.mjs`(13건).
+      기본 `dry_run`(네트워크 호출 없음), `live` 전환은 승인 근거(approvalRef)+비밀값 주입이 있어야만 가능 **[실호출은 승인]**
 - [ ] 채널 어댑터 계약 실적용 — Callbot·챗봇·D-ARS가 Core를 실제로 소비하도록 연결
+      · Core 측 완료: `src/channels/runtime.ts`(ConversationCorePort 실구현 — 세션·Flow·이벤트·§9.3 폴백·이관 요약 배선),
+        `src/channels/profiles.ts`(채널 3종 능력 기본값) · `tests/channels.runtime.test.mjs`(15건)·`tests/channels.profiles.test.mjs`(5건)
+      · 남은 것: 채널 저장소 3곳의 `ChannelPort` 구현(실회선·실메신저 연결은 **[승인 필요]**)
 - [ ] 이벤트 버스 영속화 어댑터 (현재 인메모리)
 - [ ] 과금 근거 데이터 대사(reconciliation) 검증 시나리오
 - [ ] 관리 포털 IA 타입과 실제 화면 매핑 문서
