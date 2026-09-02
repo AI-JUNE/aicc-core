@@ -119,13 +119,19 @@ function safeErrorText(e: unknown): string {
 
 async function withTimeout(p: Promise<void>, ms: number | undefined): Promise<void> {
   if (ms === undefined) return p;
+  // 예산을 넘긴 뒤 뒤늦게 거부되는 promise 가 unhandled rejection 으로 프로세스를 죽이지 않게 한다.
+  let settledByRace = false;
+  p.catch(() => { if (settledByRace) { /* 이미 실패로 기록됨 */ } });
   let timer: ReturnType<typeof setTimeout> | undefined;
   const guard = new Promise<'__timeout__'>((resolve) => {
     timer = setTimeout(() => resolve('__timeout__'), ms);
   });
   try {
     const r = await Promise.race([p.then(() => '__ok__' as const), guard]);
-    if (r === '__timeout__') throw new ChannelPortError('E_TIMEOUT', `매체 전송이 ${ms}ms 예산 안에 정착하지 않았습니다.`);
+    if (r === '__timeout__') {
+      settledByRace = true;
+      throw new ChannelPortError('E_TIMEOUT', `매체 전송이 ${ms}ms 예산 안에 정착하지 않았습니다.`);
+    }
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }
