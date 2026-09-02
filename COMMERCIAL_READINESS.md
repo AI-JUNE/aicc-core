@@ -26,9 +26,19 @@
 - [ ] 채널 어댑터 계약 실적용 — Callbot·챗봇·D-ARS가 Core를 실제로 소비하도록 연결
       · Core 측 완료: `src/channels/runtime.ts`(ConversationCorePort 실구현 — 세션·Flow·이벤트·§9.3 폴백·이관 요약 배선),
         `src/channels/profiles.ts`(채널 3종 능력 기본값) · `tests/channels.runtime.test.mjs`(15건)·`tests/channels.profiles.test.mjs`(5건)
-      · 남은 것: 채널 저장소 3곳의 `ChannelPort` 구현(실회선·실메신저 연결은 **[승인 필요]**)
-- [ ] 이벤트 버스 영속화 어댑터 (현재 인메모리)
-- [ ] 과금 근거 데이터 대사(reconciliation) 검증 시나리오
+      · Core 측 완료(2): `src/channels/conformance.ts` — 채널 저장소가 자기 `ChannelPort` 구현을 CI에서
+        드라이런 검증하는 적합성 스위트 10종(정적계약·비동기·빈입력·입력불변·미지세션·큐없는이관·
+        중복종료·응답예산·오류 PII·시나리오 렌더) + 참조 드라이런 포트 `createDryRunPort`.
+        근거: `tests/channels.conformance.test.mjs`(18건)
+      · 남은 것: 채널 저장소 3곳이 이 스위트를 통과하는 `ChannelPort` 를 구현(실회선·실메신저 연결은 **[승인 필요]**)
+- [x] **이벤트 버스 영속화 어댑터** — 추가 전용 이벤트 원장(`EventLog`)·원장 기반 멱등 저장소·
+      JSONL 직렬화/부분손상 복구·커서 기반 재전송·무결성 점검.
+      근거: `src/events/store.ts` · `tests/events.store.test.mjs`(16건).
+      인메모리+JSONL 참조 구현까지. 실 DB·브로커 어댑터 연결은 **[승인 필요]**
+- [x] **과금 근거 데이터 대사(reconciliation) 검증 시나리오** — 이벤트→집계→외부명세 대조를 순수함수
+      시나리오로 묶고, 차이를 원인 가설(중복·유실·반올림·단위환산·실측누락·미설명)로 분류.
+      **과다청구 방향 미해소 차이가 있으면 `blocked` 판정으로 청구를 막는다.**
+      근거: `src/billing/reconcile.ts` · `tests/billing.reconcile.test.mjs`(17건)
 - [ ] 관리 포털 IA 타입과 실제 화면 매핑 문서
 - [ ] 공개 API 문서 — 각 모듈 사용법과 계약
 

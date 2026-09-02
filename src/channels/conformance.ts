@@ -75,15 +75,26 @@ function step(channel: ChannelKind, text: string): RenderedStep {
   return { channel, nodeId: 'n_probe', kind: 'Say', text };
 }
 
-/** 예산 초과를 실패로 바꾼다. 매달린 호출을 무한정 기다리면 CI 자체가 멈춘다. */
-async function withBudget<T>(p: Promise<T> | T, ms: number | undefined): Promise<{ ok: true; value: T } | { ok: false; error: unknown } | { ok: false; timeout: true }> {
+type BudgetOutcome<T> = { ok: true; value: T } | { ok: false; error: unknown } | { ok: false; timeout: true };
+
+/**
+ * 예산 초과를 실패로 바꾼다. 매달린 호출을 무한정 기다리면 CI 자체가 멈춘다.
+ * 인자를 thunk 로 받는 이유: 동기 예외를 던지는 구현이 있어도 검사기가 함께 죽지 않아야 한다.
+ */
+async function withBudget<T>(call: () => Promise<T> | T, ms: number | undefined): Promise<BudgetOutcome<T>> {
+  let started: Promise<T> | T;
+  try {
+    started = call();
+  } catch (error) {
+    return { ok: false, error };
+  }
   if (ms === undefined) {
-    try { return { ok: true, value: await p }; } catch (error) { return { ok: false, error }; }
+    try { return { ok: true, value: await started }; } catch (error) { return { ok: false, error }; }
   }
   let timer: ReturnType<typeof setTimeout> | undefined;
   const guard = new Promise<'__timeout__'>((resolve) => { timer = setTimeout(() => resolve('__timeout__'), ms); });
   try {
-    const r = await Promise.race([Promise.resolve(p).then((v) => ({ v })), guard]);
+    const r = await Promise.race([Promise.resolve(started).then((v) => ({ v })), guard]);
     if (r === '__timeout__') return { ok: false, timeout: true };
     return { ok: true, value: (r as { v: T }).v };
   } catch (error) {
@@ -143,13 +154,27 @@ export async function runChannelConformance(opts: ConformanceOptions): Promise<C
       ['end', () => port.end('i_probe', '적합성 검사 종료')],
     ];
     for (const [name, call] of probes) {
-      try {
-        const r = call();
-        if (!isThenable(r)) { asyncOk = false; asyncNotes.push(`${name}가 Promise를 돌려주지 않음`); continue; }
-        await (r as Promise<unknown>).catch((e) => { asyncOk = false; asyncNotes.push(`${name} 거부: ${errText(e)}`); });
-      } catch (e) {
+      let returned: unknown;
+      let threwSync = false;
+      // 예산 없이 await 하면, 정착하지 않는 구현 하나가 CI 자체를 매달아 버린다.
+      const settled = await withBudget(() => {
+        try {
+          returned = call();
+        } catch (e) {
+          threwSync = true;
+          throw e;
+        }
+        return returned as Promise<unknown>;
+      }, budget);
+      if (threwSync) {
         asyncOk = false;
-        asyncNotes.push(`${name}가 동기 예외를 던짐: ${errText(e)}`);
+        asyncNotes.push(`${name}가 동기 예외를 던짐: ${errText((settled as { error: unknown }).error)}`);
+        continue;
+      }
+      if (!isThenable(returned)) { asyncOk = false; asyncNotes.push(`${name}가 Promise를 돌려주지 않음`); continue; }
+      if (settled.ok === false) {
+        asyncOk = false;
+        asyncNotes.push('timeout' in settled ? `${name} 미정착(예산 ${String(budget)}ms 초과)` : `${name} 거부: ${errText((settled as { error: unknown }).error)}`);
       }
     }
   }
@@ -164,7 +189,7 @@ export async function runChannelConformance(opts: ConformanceOptions): Promise<C
 
   // 3) 빈 입력 — 무음 단계만 있는 턴에서는 steps 가 비어 온다(§ runtime visibleSteps).
   {
-    const r = await withBudget(port.present('i_probe_empty', []), budget);
+    const r = await withBudget(() => port.present('i_probe_empty', []), budget);
     const ok = r.ok === true;
     add({
       id: 'EMPTY_STEPS',
@@ -180,7 +205,7 @@ export async function runChannelConformance(opts: ConformanceOptions): Promise<C
   {
     const steps: RenderedStep[] = [step(channel, '첫 번째'), step(channel, '두 번째')];
     const snapshot = JSON.stringify(steps);
-    const r = await withBudget(port.present('i_probe_imm', steps), budget);
+    const r = await withBudget(() => port.present('i_probe_imm', steps), budget);
     const unchanged = JSON.stringify(steps) === snapshot;
     add({
       id: 'INPUT_IMMUTABLE',
@@ -194,7 +219,7 @@ export async function runChannelConformance(opts: ConformanceOptions): Promise<C
 
   // 5) 모르는 세션 — 재시도·중복 이벤트로 이미 끝난 id 가 다시 온다. 예외를 던지면 Core 턴이 통째로 실패한다.
   {
-    const r = await withBudget(port.present('i_does_not_exist', [step(channel, '유령 세션')]), budget);
+    const r = await withBudget(() => port.present('i_does_not_exist', [step(channel, '유령 세션')]), budget);
     add({
       id: 'UNKNOWN_SESSION',
       passed: r.ok === true,
@@ -207,7 +232,7 @@ export async function runChannelConformance(opts: ConformanceOptions): Promise<C
 
   // 6) 이관 부분 실패 — §9.3 장애 이관은 큐도 요약도 없이 온다(요약 생성마저 실패한 경우).
   {
-    const r = await withBudget(port.transfer('i_probe_tr', undefined, undefined), budget);
+    const r = await withBudget(() => port.transfer('i_probe_tr', undefined, undefined), budget);
     add({
       id: 'TRANSFER_OPTIONALS',
       passed: r.ok === true,
@@ -220,8 +245,8 @@ export async function runChannelConformance(opts: ConformanceOptions): Promise<C
 
   // 7) 종료 재시도 — 고객 끊음과 Core 종료가 동시에 오면 end 가 두 번 온다.
   {
-    const first = await withBudget(port.end('i_probe_end', '고객 종료'), budget);
-    const second = await withBudget(port.end('i_probe_end', '고객 종료'), budget);
+    const first = await withBudget(() => port.end('i_probe_end', '고객 종료'), budget);
+    const second = await withBudget(() => port.end('i_probe_end', '고객 종료'), budget);
     add({
       id: 'END_REPEATABLE',
       passed: first.ok === true && second.ok === true,
@@ -236,7 +261,7 @@ export async function runChannelConformance(opts: ConformanceOptions): Promise<C
   if (budget === undefined) {
     add({ id: 'TIMEOUT_BUDGET', passed: true, skipped: true, severity: 'warning', messageKo: 'timeoutMs 미지정 — 응답 예산을 검사하지 않았습니다.' });
   } else {
-    const r = await withBudget(port.present('i_probe_budget', [step(channel, '예산 검사')]), budget);
+    const r = await withBudget(() => port.present('i_probe_budget', [step(channel, '예산 검사')]), budget);
     const timedOut = r.ok === false && 'timeout' in r;
     add({
       id: 'TIMEOUT_BUDGET',
@@ -251,7 +276,7 @@ export async function runChannelConformance(opts: ConformanceOptions): Promise<C
   // 9) 오류 메시지 개인정보(§10.3) — 실패를 알리되 원문을 되뱉으면 로그·오류리포트에 개인정보가 남는다.
   {
     const masked = maskPii(PII_PROBE).text;
-    const r = await withBudget(port.present('i_probe_pii', [step(channel, `연락처는 ${masked} 입니다`)]), budget);
+    const r = await withBudget(() => port.present('i_probe_pii', [step(channel, `연락처는 ${masked} 입니다`)]), budget);
     const leaked = r.ok === false && !('timeout' in r) && errText((r as { error: unknown }).error).includes(PII_PROBE);
     add({
       id: 'PII_SAFE_ECHO',
