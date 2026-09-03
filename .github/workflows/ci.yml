@@ -1,0 +1,53 @@
+# CI — 타입 검증 · 전체 테스트 · 복구 리허설.
+#
+# 왜 이 셋인가:
+#  - 타입 검증: Core 는 채널 3곳이 소비하는 라이브러리다. 계약이 깨지면 세 저장소가 동시에 깨진다.
+#  - 테스트: 실패 경로(마스킹 누락·테넌트 혼입·부분 실패)를 사람이 매번 손으로 확인할 수 없다.
+#  - 복구 리허설: 백업은 "돌려봤는가"로만 증명된다. 절차 리허설은 참조 구현이라 CI에서 매번 돌 수 있다.
+#
+# 실엔진·실회선·실 DB 에는 붙지 않는다. 어댑터는 모두 dry_run 기본값이다 — 실활성화는 [승인 필요].
+name: ci
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # 테스트가 소스(.ts)를 그대로 import 하므로 타입 스트리핑을 지원하는 런타임이 필요하다.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+
+      # 의존성은 devDependencies(typescript·@types/node)뿐이다. 락파일이 없어도 실패하지 않게 install 을 쓴다.
+      - name: install
+        run: npm install --no-audit --no-fund
+
+      - name: typecheck
+        run: npm run typecheck
+
+      - name: test
+        run: npm test
+
+      # 종료코드 0=통과, 1=실패, 2=판정보류. 판정보류도 통과로 넘기지 않는다.
+      - name: recovery drill
+        run: node scripts/recovery-drill.mjs
+
+      # 채널 저장소(Callbot·챗봇·D-ARS)는 자기 CI에서 이 스위트를 자기 ChannelPort 구현에 대고 돌린다.
+      # 여기서는 참조 드라이런 포트가 계약을 계속 만족하는지만 확인한다.
+      - name: channel contract conformance (reference dry-run port)
+        run: node --test tests/channels.conformance.test.mjs tests/channels.basePort.test.mjs

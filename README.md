@@ -25,11 +25,18 @@
 | `src/integration/connector.ts` | §6.1·§9.3·§10.3·§11.1 | 외부 업무시스템 연동 계약 — 시크릿 참조 키, 응답 allowlist·마스킹, 재시도·실패 판정 |
 | `src/consent/consent.ts` | §10.1·§10.3·§11.1 | 동의 관리 — 목적별 상태·만료, append-only 이력, 행위 게이트(녹취·저장·국외이전) |
 
+## 문서
+- `API.md` — 공개 API. 채널 저장소(Callbot·Chatbot·D-ARS)가 Core를 소비하는 방법과 전 모듈 계약
+- `RUNBOOK.md` — 백업·복구 절차와 복구 리허설 기록
+- `COMMERCIAL_READINESS.md` — 상용 출시 잔여 과제 · `QUALITY_BAR.md` — 완료 판정 기준
+
 ## 검증
 ```
 npm test        # 불변식 테스트 (의존성 0)
 npm run typecheck
+node scripts/recovery-drill.mjs   # 복구 리허설: 0=통과 1=실패 2=판정보류
 ```
+CI(`.github/workflows/ci.yml`)가 push·PR마다 위 셋과 채널 적합성 스위트를 실행한다.
 
 ## 원칙
 - 엔진 종속 코드는 Core에 넣지 않는다(온프렘 수주 가능성 확보, §6.2)
