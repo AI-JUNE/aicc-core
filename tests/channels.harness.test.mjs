@@ -4,19 +4,32 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   parseHarnessArgs, resolvePortFromModule, runHarness, formatHarnessResult,
-  harnessResultToJson, HARNESS_EXIT_CODE, HARNESS_USAGE_KO,
+  harnessResultToJson, resolveFlowsFromModule, safeReasonText, HARNESS_EXIT_CODE, HARNESS_USAGE_KO,
 } from '../src/channels/harness.ts';
 import { createDryRunPort } from '../src/channels/conformance.ts';
 import { createChannelPort } from '../src/channels/basePort.ts';
+
+/** 모든 채널이 렌더할 수 있는 최소 시나리오. Transfer·Choice 가 없어 능력 제약을 타지 않는다. */
+const SAMPLE_FLOWS = [{
+  id: 'f_probe',
+  version: 1,
+  startNodeId: 'n1',
+  nodes: { n1: { id: 'n1', kind: 'Say', text: '적합성 검사 시나리오' } },
+}];
+const flowsModule = { flows: SAMPLE_FLOWS };
+
+/** 포트 모듈과 시나리오 모듈을 경로로 구분해 돌려주는 로더. */
+const loaderWithFlows = (portMod) => async (spec) => (spec.includes('flow') ? flowsModule : portMod);
 
 const loaderFor = (mod) => async () => mod;
 
 // ── 인자 해석 ────────────────────────────────────────────────────────────────
 
 test('인자 해석: 전체 옵션을 읽는다', () => {
-  const cfg = parseHarnessArgs(['--port', './p.mjs', '--export', 'myPort', '--adapter', 'chatbot', '--timeout-ms', '250', '--json', '--strict-warnings']);
+  const cfg = parseHarnessArgs(['--port', './p.mjs', '--export', 'myPort', '--flows', './flows.mjs', '--adapter', 'chatbot', '--timeout-ms', '250', '--json', '--strict-warnings']);
   assert.equal(cfg.portModule, './p.mjs');
   assert.equal(cfg.exportName, 'myPort');
+  assert.equal(cfg.flowsModule, './flows.mjs');
   assert.equal(cfg.adapter, 'chatbot');
   assert.equal(cfg.timeoutMs, 250);
   assert.equal(cfg.json, true);
@@ -77,9 +90,9 @@ test('포트 해석 실패: 팩토리가 던지면 원문을 그대로 흘리지
 // ── 하네스 판정 ──────────────────────────────────────────────────────────────
 
 test('정상: 드라이런 참조 포트는 통과하고 종료코드 0', async () => {
-  const cfg = parseHarnessArgs(['--port', './dry.mjs', '--timeout-ms', '500']);
+  const cfg = parseHarnessArgs(['--port', './dry.mjs', '--flows', './flows.mjs', '--timeout-ms', '500']);
   const port = createDryRunPort({ id: 'callbot' });
-  const r = await runHarness({ config: cfg, load: loaderFor({ default: port }) });
+  const r = await runHarness({ config: cfg, load: loaderWithFlows({ default: port }) });
   assert.equal(r.verdict, 'passed');
   assert.equal(r.exitCode, 0);
   assert.equal(r.dryRunDeclared, true);
@@ -87,9 +100,9 @@ test('정상: 드라이런 참조 포트는 통과하고 종료코드 0', async 
 });
 
 test('정상: basePort 로 만든 포트도 통과한다(저장소 채택 경로)', async () => {
-  const cfg = parseHarnessArgs(['--port', './base.mjs', '--adapter', 'dars', '--timeout-ms', '500']);
+  const cfg = parseHarnessArgs(['--port', './base.mjs', '--adapter', 'dars', '--flows', './flows.mjs', '--timeout-ms', '500']);
   const port = createChannelPort({ id: 'dars' });
-  const r = await runHarness({ config: cfg, load: loaderFor({ port }) });
+  const r = await runHarness({ config: cfg, load: loaderWithFlows({ port }) });
   assert.equal(r.verdict, 'passed', formatHarnessResult(r, cfg));
   assert.equal(r.dryRunDeclared, true);
 });
@@ -139,14 +152,14 @@ test('실패: --adapter 와 포트 id 가 어긋나면 검사 전에 막는다',
 });
 
 test('판정보류: 드라이런 선언이 없으면 통과로 적지 않는다', async () => {
-  const cfg = parseHarnessArgs(['--port', './p.mjs', '--timeout-ms', '500']);
+  const cfg = parseHarnessArgs(['--port', './p.mjs', '--flows', './flows.mjs', '--timeout-ms', '500']);
   const silent = createDryRunPort({ id: 'callbot' });
   const undeclared = {
     id: silent.id, capabilities: silent.capabilities,
     present: silent.present.bind(silent), transfer: silent.transfer.bind(silent), end: silent.end.bind(silent),
     routeToLegacyIvr: silent.routeToLegacyIvr?.bind(silent), invite: silent.invite?.bind(silent),
   };
-  const r = await runHarness({ config: cfg, load: loaderFor({ port: undeclared }) });
+  const r = await runHarness({ config: cfg, load: loaderWithFlows({ port: undeclared }) });
   assert.equal(r.verdict, 'inconclusive');
   assert.equal(r.exitCode, 2);
   assert.ok(r.reasonsKo.some((m) => m.includes('드라이런임을 밝히지')));
@@ -171,7 +184,7 @@ test('판정보류: 건너뛴 항목 수를 반드시 남긴다(§13-3)', async 
 });
 
 test('--strict-warnings: 경고만 있어도 실패로 본다', async () => {
-  const cfg = parseHarnessArgs(['--port', './p.mjs', '--timeout-ms', '500', '--strict-warnings']);
+  const cfg = parseHarnessArgs(['--port', './p.mjs', '--flows', './flows.mjs', '--timeout-ms', '500', '--strict-warnings']);
   const port = createDryRunPort({ id: 'callbot' });
   const warnOnly = {
     ...port,
@@ -181,7 +194,7 @@ test('--strict-warnings: 경고만 있어도 실패로 본다', async () => {
       return port.present(id, steps);
     },
   };
-  const r = await runHarness({ config: cfg, load: loaderFor({ port: warnOnly }) });
+  const r = await runHarness({ config: cfg, load: loaderWithFlows({ port: warnOnly }) });
   assert.equal(r.report.errorCount, 0);
   assert.equal(r.report.warningCount, 1);
   assert.equal(r.verdict, 'failed');
@@ -225,7 +238,8 @@ test('JSON 출력: 판정·검사목록을 담고 임의 점수를 만들지 않
   const cfg = parseHarnessArgs(['--port', './p.mjs', '--timeout-ms', '500', '--json']);
   const r = await runHarness({ config: cfg, load: loaderFor({ port: createDryRunPort({ id: 'callbot' }) }) });
   const j = JSON.parse(harnessResultToJson(r, cfg));
-  assert.equal(j.verdict, 'inconclusive'); // flows 미지정으로 1건 건너뜀
+  assert.equal(j.verdict, 'inconclusive'); // flows 미지정으로 1건 건너뜀 → 통과로 적지 않는다
+  assert.equal(j.flowsModule, null);
   assert.equal(j.adapter, 'callbot');
   assert.equal(j.channel, 'voice');
   assert.equal(j.timeoutMs, 500);
@@ -236,4 +250,83 @@ test('JSON 출력: 판정·검사목록을 담고 임의 점수를 만들지 않
 test('사용법 안내에 승인 경계와 종료코드가 명시된다', () => {
   assert.match(HARNESS_USAGE_KO, /승인 필요/);
   assert.match(HARNESS_USAGE_KO, /0=통과, 1=실패, 2=판정보류/);
+});
+
+// ── 시나리오(--flows) ────────────────────────────────────────────────────────
+
+test('시나리오: flows·예산을 모두 주면 건너뛴 항목 없이 통과한다', async () => {
+  const cfg = parseHarnessArgs(['--port', './p.mjs', '--flows', './flows.mjs', '--timeout-ms', '500']);
+  const r = await runHarness({ config: cfg, load: loaderWithFlows({ port: createDryRunPort({ id: 'chatbot' }) }) });
+  assert.equal(r.verdict, 'passed', formatHarnessResult(r, cfg));
+  assert.equal(r.report.checks.filter((c) => c.skipped).length, 0);
+});
+
+test('시나리오 실패: 채널이 렌더할 수 없는 노드는 오류로 잡는다(§5.3)', async () => {
+  const cfg = parseHarnessArgs(['--port', './p.mjs', '--flows', './flows.mjs', '--timeout-ms', '500']);
+  // 상담사 이관을 지원하지 않는 채널 능력 + Transfer 노드
+  const port = createDryRunPort({
+    id: 'dars',
+    capabilities: { ...createDryRunPort({ id: 'dars' }).capabilities, transferToAgent: false },
+  });
+  const r = await runHarness({
+    config: cfg,
+    load: async () => ({ port }),
+    flows: [{ id: 'f_tr', version: 1, startNodeId: 'n1', nodes: { n1: { id: 'n1', kind: 'Transfer', queue: 'q_cs' } } }],
+  });
+  assert.equal(r.verdict, 'failed');
+  assert.ok(r.report.checks.some((c) => c.id === 'FLOW_SUPPORT' && !c.passed));
+});
+
+test('시나리오 실패: 모듈이 Flow 배열을 안 주거나 비어 있으면 조용히 넘기지 않는다', async () => {
+  assert.match(resolveFlowsFromModule({ nope: 1 }).errorKo, /Flow 배열을 내보내지 않습니다/);
+  assert.match(resolveFlowsFromModule({ flows: [] }).errorKo, /비어 있습니다/);
+  assert.match(resolveFlowsFromModule({ flows: [{ id: 'f' }] }).errorKo, /0번이 Flow 형태가 아닙니다/);
+  assert.match(resolveFlowsFromModule(null).errorKo, /객체가 아닙니다/);
+  assert.deepEqual(resolveFlowsFromModule({ default: SAMPLE_FLOWS }).flows, SAMPLE_FLOWS);
+});
+
+test('시나리오 실패: 모듈 로드 실패는 실패로 잡고 마스킹한다', async () => {
+  const cfg = parseHarnessArgs(['--port', './p.mjs', '--flows', './flows.mjs', '--timeout-ms', '500']);
+  const r = await runHarness({
+    config: cfg,
+    load: async (spec) => {
+      if (spec.includes('flow')) throw new Error('시나리오 없음 — 담당 010-1111-2222');
+      return { port: createDryRunPort({ id: 'callbot' }) };
+    },
+  });
+  assert.equal(r.verdict, 'failed');
+  assert.ok(!r.reasonsKo.join(' ').includes('010-1111-2222'));
+  assert.ok(r.reasonsKo.some((m) => m.includes('시나리오 모듈을 불러오지 못했습니다')));
+});
+
+test('오류 텍스트: 개인정보·자격증명·배포 경로를 모두 지운다(§10.3)', () => {
+  const out = safeReasonText(new Error(
+    "Cannot find module '/srv/deploy/aicc/secret-dir/port.mjs' — token=abcd1234efgh 담당 010-1234-5678",
+  ));
+  assert.ok(!out.includes('010-1234-5678'));
+  assert.ok(!out.includes('abcd1234efgh'));
+  assert.ok(!out.includes('/srv/deploy/aicc'));
+  assert.ok(out.includes('port.mjs')); // 무엇을 못 찾았는지는 남아야 디버깅이 된다
+});
+
+test('오류 텍스트: Error 가 아닌 값도 문자열로 처리한다', () => {
+  assert.equal(safeReasonText(undefined), 'undefined');
+  assert.equal(safeReasonText({ a: 1 }), '[object Object]');
+});
+
+test('참조 fixture 가 실행기를 그대로 통과한다(CI 자체점검과 같은 조건)', async () => {
+  const cfg = parseHarnessArgs([
+    '--port', './fixtures/reference-port.mjs', '--flows', './fixtures/reference-flows.mjs',
+    '--adapter', 'chatbot', '--timeout-ms', '2000',
+  ]);
+  const [portMod, flowsMod] = await Promise.all([
+    import('../fixtures/reference-port.mjs'),
+    import('../fixtures/reference-flows.mjs'),
+  ]);
+  const r = await runHarness({
+    config: cfg,
+    load: async (spec) => (spec.includes('flows') ? flowsMod : portMod),
+  });
+  assert.equal(r.verdict, 'passed', formatHarnessResult(r, cfg));
+  assert.equal(r.exitCode, 0);
 });

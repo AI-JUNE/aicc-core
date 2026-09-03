@@ -51,3 +51,14 @@ jobs:
       # 여기서는 참조 드라이런 포트가 계약을 계속 만족하는지만 확인한다.
       - name: channel contract conformance (reference dry-run port)
         run: node --test tests/channels.conformance.test.mjs tests/channels.basePort.test.mjs
+
+      # 채널 저장소가 실제로 부를 실행기 자체가 도는지 확인한다. 스위트가 멀쩡해도 실행기가
+      # 깨져 있으면 세 저장소의 CI 가 동시에 멈춘다. 종료코드 0=통과·1=실패·2=판정보류를 그대로 쓴다.
+      - name: channel conformance runner (self-check)
+        run: node scripts/channel-conformance.mjs --port ./fixtures/reference-port.mjs --flows ./fixtures/reference-flows.mjs --adapter chatbot --timeout-ms 2000
+
+      # 커버리지는 **측정**이다. 임계값(AICC_COVERAGE_MIN_*)을 주지 않으면 게이트로 쓰지 않는다 —
+      # 근거 없는 목표치를 CI에 박지 않기 위해서다(§13-3). 실측 추이를 보고 사람이 임계값을 정하면
+      # 그때 환경변수로 켜면 된다. 테스트가 깨진 상태의 수치는 근거가 아니므로 무조건 실패로 끝난다.
+      - name: coverage (measure)
+        run: node scripts/coverage.mjs

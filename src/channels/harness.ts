@@ -18,6 +18,7 @@
 //  - 임계값·예산 기본값을 만들어 넣지 않는다(§13-3). timeoutMs 는 준 경우에만 검사한다.
 import type { Flow } from '../flow/types.ts';
 import { maskPii } from '../core/policyGuard.ts';
+import { stripSecrets } from '../obs/errorMonitor.ts';
 import type { ChannelAdapterId, ChannelPort, ChannelRegistration } from './contract.ts';
 import { ADAPTER_CHANNEL } from './contract.ts';
 import type { ConformanceReport } from './conformance.ts';
@@ -64,6 +65,21 @@ export interface HarnessResult {
 }
 
 const KNOWN_ADAPTERS: readonly ChannelAdapterId[] = ['callbot', 'chatbot', 'dars'];
+
+/**
+ * 예외 원문을 CI 로그에 올려도 되는 형태로 바꾼다(§10.3).
+ * 세 가지를 지운다: 개인정보 · 자격증명(URL 비밀번호·Bearer·key=value) · 배포 디렉터리 구조.
+ * 마지막 것을 지우는 이유는, 모듈 로드 실패 메시지에 실행 경로가 통째로 실려 나오기 때문이다.
+ * 사용자가 직접 준 --port 값은 디버깅에 필요하므로 여기서 지우지 않고 그대로 따로 출력한다.
+ */
+export function safeReasonText(e: unknown): string {
+  const raw = e instanceof Error ? e.message : String(e);
+  const shortened = raw.replace(
+    /(?:file:\/\/)?(?:[A-Za-z]:)?[\\/](?:[^\s()\\/:]+[\\/]){2,}([^\s()\\/:]+)/g,
+    '…/$1',
+  );
+  return maskPii(stripSecrets(shortened)).text;
+}
 
 function isAdapterId(v: unknown): v is ChannelAdapterId {
   return typeof v === 'string' && (KNOWN_ADAPTERS as readonly string[]).includes(v);
@@ -194,7 +210,7 @@ function tryFactory(fn: (...a: unknown[]) => unknown): { port?: ChannelPort; err
     return { errorKo: '팩토리 반환값이 ChannelPort 형태가 아닙니다.' };
   } catch (e) {
     // 팩토리가 실키·설정을 요구해 던지는 경우다. 원문을 그대로 흘리지 않는다(§10.3).
-    return { errorKo: `팩토리 호출이 실패했습니다: ${maskPii(e instanceof Error ? e.message : String(e)).text}` };
+    return { errorKo: `팩토리 호출이 실패했습니다: ${safeReasonText(e)}` };
   }
 }
 
@@ -248,7 +264,7 @@ export async function runHarness(opts: RunHarnessOptions): Promise<HarnessResult
   try {
     mod = await opts.load(config.portModule);
   } catch (e) {
-    const why = maskPii(e instanceof Error ? e.message : String(e)).text;
+    const why = safeReasonText(e);
     return {
       verdict: 'failed',
       exitCode: HARNESS_EXIT_CODE.failed,
@@ -299,7 +315,7 @@ export async function runHarness(opts: RunHarnessOptions): Promise<HarnessResult
     try {
       flowsMod = await opts.load(config.flowsModule);
     } catch (e) {
-      const why = maskPii(e instanceof Error ? e.message : String(e)).text;
+      const why = safeReasonText(e);
       return {
         verdict: 'failed', exitCode: HARNESS_EXIT_CODE.failed, dryRunDeclared,
         reasonsKo: [...reasonsKo, `시나리오 모듈을 불러오지 못했습니다: ${why}`],
@@ -324,7 +340,7 @@ export async function runHarness(opts: RunHarnessOptions): Promise<HarnessResult
       reportsComponents: opts.reportsComponents,
     });
   } catch (e) {
-    const why = maskPii(e instanceof Error ? e.message : String(e)).text;
+    const why = safeReasonText(e);
     return {
       verdict: 'failed',
       exitCode: HARNESS_EXIT_CODE.failed,
@@ -421,5 +437,6 @@ export const HARNESS_USAGE_KO = [
   '  --json               기계용 JSON 출력.',
   '',
   '종료코드: 0=통과, 1=실패, 2=판정보류(판정보류를 통과로 넘기지 마세요).',
+  '검사를 건너뛴 항목이 있으면 통과로 적지 않고 판정보류가 됩니다 — --timeout-ms 와 --flows 를 채우세요.',
   '이 하네스는 드라이런 포트만 검사합니다. 실회선·실메신저 연결은 [승인 필요].',
 ].join('\n');

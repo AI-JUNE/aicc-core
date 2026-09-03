@@ -4,7 +4,8 @@
 // 여기서 하는 일은 셋뿐이다: argv 를 넘기고, 동적 import 로 모듈을 불러오고, 종료코드를 세운다.
 //
 // 사용: node scripts/channel-conformance.mjs --port <모듈경로> [--export 이름] [--adapter callbot]
-//                                            [--timeout-ms 1500] [--strict-warnings] [--json]
+//                                            [--flows <모듈경로>] [--timeout-ms 1500]
+//                                            [--strict-warnings] [--json]
 // 종료코드: 0=통과, 1=실패, 2=판정보류 (CI에서 그대로 게이트로 쓴다)
 //
 // 실회선·실메신저에 붙지 않는다. 드라이런 선언이 없는 포트는 통과로 적지 않는다 — 실연동은 [승인 필요].

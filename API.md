@@ -50,6 +50,21 @@ const report = await runChannelConformance({ port, timeoutMs: 3000 });
 if (!report.passed) throw new Error(formatConformanceReport(report));
 ```
 
+3번을 코드로 쓰기 싫다면 실행기를 그대로 부른다. 저장소는 포트를 export 하는 모듈 하나만 만들면 된다:
+
+```bash
+# 저장소 CI. 종료코드 0=통과, 1=실패, 2=판정보류 — 판정보류를 통과로 넘기지 말 것.
+node <core>/scripts/channel-conformance.mjs \
+  --port ./ci/aicc-port.mjs \
+  --flows ./ci/aicc-flows.mjs \
+  --adapter chatbot \
+  --timeout-ms 3000
+```
+
+`--timeout-ms` 나 `--flows` 를 빼면 해당 검사를 건너뛰고 **판정보류**가 된다. 건너뛴 검사는 통과의
+근거가 아니기 때문이다(§13-3). 실행기는 드라이런 포트만 검사한다 — `live` 포트는 멈춘다 **[승인 필요]**.
+복사해 갈 최소 예시는 `fixtures/reference-port.mjs` · `fixtures/reference-flows.mjs` 에 있다.
+
 Core 런타임 배선:
 
 ```ts
@@ -113,6 +128,7 @@ const next  = await core.send(first.interactionId, { input: { kind: 'text', text
 | `channels/contract.ts` | 양방향 포트 정의 | `ConversationCorePort`, `ChannelPort`, `ChannelCapabilities`, `validateRegistration` |
 | `channels/basePort.ts` | 계약을 지키는 포트 베이스 | `createChannelPort`, `ChannelTransport`, `createChannelPortSet` |
 | `channels/conformance.ts` | 저장소 CI용 적합성 스위트 10종 + 참조 드라이런 포트 | `runChannelConformance`, `formatConformanceReport`, `createDryRunPort` |
+| `channels/harness.ts` | 적합성 스위트를 CLI 로 돌리는 실행기 로직(설정 해석·포트/시나리오 해석·판정·출력) | `parseHarnessArgs`, `runHarness`, `resolvePortFromModule`, `resolveFlowsFromModule`, `formatHarnessResult`, `harnessResultToJson`, `safeReasonText`, `HARNESS_EXIT_CODE` |
 | `channels/profiles.ts` | 채널 3종 능력 기본값 | `CHANNEL_PROFILES`, `profileFor` |
 | `channels/runtime.ts` | Core 측 실구현 | `createConversationCore`, `createMemoryFlowRegistry`, `createMemorySessionStore` |
 
@@ -133,6 +149,7 @@ const next  = await core.send(first.interactionId, { input: { kind: 'text', text
 | `events/store.ts` | 추가 전용 원장·JSONL·부분손상 복구·재전송 | `createMemoryEventLog`, `serializeJsonl`, `parseJsonl`, `replayUndelivered`, `verifyLogIntegrity` |
 | `billing/usage.ts` | 사용량 집계·반올림·외부 명세 대조(§11.2) | `aggregateUsage`, `applyRounding`, `reconcile` |
 | `billing/reconcile.ts` | 대사 시나리오. 과다청구 방향 미해소 차이는 `blocked` | `runReconciliationScenario`, `formatReconciliationReport` |
+| `partner/attribution.ts` | 파트너(채널) 귀속·정산 근거. 수수료율은 설정값, 청구는 하지 않는다 **[승인 필요]** | `validateAttribution`, `buildAttribution`, `partnerScopedFilter`, `visibleToPartner`, `currentAttribution`, `findAttributionConflicts`, `rollupByPartner`, `buildSettlementLines`, `settlementBlockers` |
 | `reports/aggregate.ts` | 기간·채널별 집계와 완결성 표시 | `aggregateReport`, `latencyReport`, `topIntents`, `completeness` |
 
 ### 운영·관측·감사
@@ -142,6 +159,7 @@ const next  = await core.send(first.interactionId, { input: { kind: 'text', text
 | `ops/fallback.ts` | 컴포넌트 건강도 → 폴백 모드(§9.3) | `createHealthRegistry`, `decideFallbackMode`, `resolveRuntimeAction` |
 | `ops/health.ts` | liveness/readiness 분리, 프로브 병렬·개별 예산 | `checkHealth`, `livenessReport`, `approvalPendingProbe` |
 | `ops/backup.ts` | 백업·복구와 **복구 리허설**(RUNBOOK.md 참조) | `createSnapshot`, `verifySnapshot`, `serializeSnapshot`, `parseSnapshot`, `restoreSnapshot`, `runRecoveryDrill` |
+| `ops/coverage.ts` | 커버리지 실측 요약·임계값 판정. 목표치를 코드에 두지 않는다(§13-3) | `summarizeCoverage`, `evaluateCoverage`, `thresholdsFromEnv`, `percentOf`, `weakestFiles`, `formatCoverageReport`, `coverageToJson`, `COVERAGE_EXIT_CODE` |
 | `obs/logger.ts` | 고정 필드 구조화 로깅·차단 키·마스킹 경유 | `createLogger`, `createRequestIdFactory`, `createMemorySink` |
 | `obs/errorMonitor.ts` | 던져진 값 정규화·fingerprint·중복 억제 | `createErrorMonitor`, `normalizeError`, `installGlobalCapture`, `resolveDsnConfig` |
 | `audit/log.ts` | 해시 체인 감사 원장·무결성 검증 | `appendAudit`, `verifyChain`, `queryAudit`, `maskIp` |
