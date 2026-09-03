@@ -92,8 +92,16 @@
         오류 텍스트는 개인정보·자격증명·배포 경로를 모두 지운 뒤 로그에 남는다(§10.3).
         복사용 최소 예시: `fixtures/reference-port.mjs`·`fixtures/reference-flows.mjs`(CI 자체점검에도 쓰인다).
         근거: `tests/channels.harness.test.mjs`(30건) · CI `channel conformance runner (self-check)` 단계
+      · Core 측 완료(5): **소비 경로 고정** — 채널이 부르는 import 경로를 package.json 의 exports 맵에
+        명시했다. 지금까지는 `<core>/src/channels/basePort.ts` 같은 소스 상대경로였고, 그 방식은 파일을
+        옮기는 순간 저장소 3곳이 동시에 깨지면서 **Core CI 는 초록으로 남는다**. 이제 채널 계약 경로는
+        `aicc-core/channels/*`·`aicc-core/flow/types`·`aicc-core/conformance-runner` 로 이름이 고정되고,
+        호스트용은 `aicc-core/internal/*` 로만 열린다 — 안정 계약이 아니라는 사실이 import 문에 보이게 했다.
+        와일드카드로 채널 경로를 여는 것(내부 모듈까지 계약이 된다), 허용 목록 밖 경로를 여는 것,
+        승인 근거 없이 `private` 을 푸는 것(=레지스트리 배포)은 모두 검사에서 막힌다 **[배포는 승인 필요]**.
+        근거: `src/ops/packageSurface.ts` · `package.json` exports · `tests/ops.packageSurface.test.mjs`(20건)
       · 남은 것: 채널 저장소 3곳이 `ChannelTransport` 를 구현해 basePort 에 끼우고 위 실행기를 자기 CI에 추가
-        (실회선·실메신저 연결은 **[승인 필요]**)
+        (`"aicc-core": "file:../6. AICC-Core"` 로 걸면 된다. 실회선·실메신저 연결은 **[승인 필요]**)
 - [x] **이벤트 버스 영속화 어댑터** — 추가 전용 이벤트 원장(`EventLog`)·원장 기반 멱등 저장소·
       JSONL 직렬화/부분손상 복구·커서 기반 재전송·무결성 점검.
       근거: `src/events/store.ts` · `tests/events.store.test.mjs`(16건).
@@ -102,7 +110,15 @@
       시나리오로 묶고, 차이를 원인 가설(중복·유실·반올림·단위환산·실측누락·미설명)로 분류.
       **과다청구 방향 미해소 차이가 있으면 `blocked` 판정으로 청구를 막는다.**
       근거: `src/billing/reconcile.ts` · `tests/billing.reconcile.test.mjs`(17건)
-- [ ] 관리 포털 IA 타입과 실제 화면 매핑 문서
+- [x] **관리 포털 IA 타입과 실제 화면 매핑 문서** — 문서가 아니라 **자료구조 + 검사**로 만들었다.
+      손으로 적은 매핑표는 반드시 썩고, 썩은 표는 없느니만 못하기 때문이다. 검사는 무게를 나눠 둔다:
+      **IA 에 없는 화면**(권한 검사·감사 기록을 안 거치는 화면이 된다)과 **감사 대상 화면의 배선 누락**(§10.2)은
+      오류, 빈 상태·오류 상태 누락은 경고다. "구현 완료"로 적으려면 화면 위치가 있어야 하고, 보류에는 사유가
+      있어야 한다 — 사유 없는 보류는 누락과 구분되지 않는다. 진행률(%)은 만들지 않고 건수만 적는다(§13-3).
+      문서 `PORTAL_SCREEN_MAP.md` 는 생성물이며, 손으로 고치면 CI 가 잡는다.
+      **현재 실측**: 라우트 25건 전부 미착수(포털 저장소는 정적 소개 페이지 한 장) · 감사 대상 15건 중 배선 0건.
+      근거: `src/portal/screenMap.ts` · `scripts/screen-map.mjs` · `PORTAL_SCREEN_MAP.md` ·
+      `tests/portal.screenMap.test.mjs`(18건) · CI `portal screen map (doc freshness)` 단계
 - [x] 공개 API 문서 — 채널 저장소가 만질 것을 **두 인터페이스로 좁혀** 앞에 두고(그 외 모듈 직접 호출 금지),
       전 모듈의 계약·주요 export·공통 규약(활성화 승인·시계 미주입 시 공백·기본값 금지·마스킹·스코프·오류
       비은폐)을 한 문서에 모았다. 문서가 썩지 않도록 **테스트가 문서와 소스를 대조**한다 —
@@ -124,12 +140,29 @@
       같은 고객사에 다른 파트너가 기록된 충돌은 **자동으로 고르지 않고 드러낸다** — 사람이 확정한다 **[승인 필요]**.
       시계 미주입 시 기록 시각을 만들어 넣지 않는다(§13-3).
       근거: `src/partner/attribution.ts`(`buildAttribution`·`currentAttribution`·`findAttributionConflicts`)
-- [ ] **파트너 역할 권한** — 파트너 담당자는 자기가 유치한 고객사만 조회. 기존 RBAC에 `partner_admin` 역할 추가(활성화는 승인)
+- [x] **파트너 역할 권한** — `partner_admin` 역할을 도입하되 **세 겹으로 잠갔다**. 파트너에게 포털을 여는
+      순간 나는 사고는 대개 코드가 틀려서가 아니라 조건이 **빠져서** 나기 때문이다.
+      (1) **기본 거부** — `partner_admin` 은 IA 라우트에서 어떤 권한도 얻지 못한다. 접근 근거는
+      `PARTNER_ROUTE_ALLOWLIST` 하나뿐이라 **새 화면을 추가해도 자동으로 열리지 않는다**.
+      (2) **미결속 거부** — `partnerId` 가 없는 계정은 "전체 조회"가 아니라 거부다. 이 한 줄이 없으면
+      값이 안 들어간 계정 하나로 전 고객사가 노출된다. 조회 조건도 만들어 주지 않고 던진다.
+      (3) **역할 혼용 거부** — 내부 역할과 동시 보유는 설정 오류로 본다(어느 쪽으로 판정했는지가 화면마다 달라진다).
+      조회는 `partnerActorFilter` 가 `partnerId` 를 강제 주입하고(호출자가 덮어쓸 수 없다),
+      결과는 `filterForPartnerActor` 가 한 번 더 거른다 — 판정 실패는 빈 목록이지 전체가 아니다.
+      거부는 빠짐없이 감사 체인에 남고(외부 인력의 접근 시도는 조사에서 가장 먼저 본다),
+      다른 테넌트 시도는 행위자 테넌트 체인에 남긴다(§11.1). 행위자 역할은 실제 값 그대로 기록한다.
+      지금 열린 화면은 정산 근거 조회(`reports.settlement`) 하나이며 읽기 전용·비 PII 다 —
+      허용 목록을 잘못 늘려도 PII·상태변경 화면은 마지막 방어선에서 막힌다.
+      **활성화 기본 OFF** — `activation: 'enabled'` + `approvalRef` 가 둘 다 있어야 켜진다 **[승인 필요]**.
+      근거: `src/partner/rbac.ts` · `src/portal/ia.ts`(`partner_admin`·`reports.settlement`) ·
+      `tests/partner.rbac.test.mjs`(27건)
 - [ ] **정산 리포트** — 산출 근거까지 완료(`rollupByPartner`·`buildSettlementLines`·`settlementBlockers`):
       고객사는 **현재 유효 귀속으로 한 번만** 집계되고(이력 전체를 세면 중복된다), 수수료율은 설정에서 오며
       실적·요율이 **둘 다 있을 때만** 금액을 산출한다 — 없으면 0원으로 채우지 않고 이유를 남긴다.
       0원과 "모른다"를 같게 적는 것이 정산 분쟁을 만들기 때문이다(§13-3).
-      유입 경로 미확정·귀속 충돌이 있으면 정산을 막는다. 남은 것: **조회·내보내기 화면**과 실제 청구 연결 **[승인 필요]**
+      유입 경로 미확정·귀속 충돌이 있으면 정산을 막는다.
+      조회 라우트(`reports.settlement`, 읽기 전용·비 PII)와 파트너 담당자 접근 판정은 확보됐다(위 파트너 역할 권한).
+      남은 것: **화면 구현과 내보내기**(대량 반출 임계·감사 기록 경유), 실제 청구 연결 **[승인 필요]**
 - [x] **2계층 확장 여지 확보** — 파트너 필터가 들어갈 조회 경로를 `partnerScopedFilter` 한 곳으로 모으고,
       테넌트 조건은 기존 `scopedFilter` 가 강제 주입해 호출자가 덮어쓸 수 없게 했다(§11.1).
       `partnerId` **생략(전체)** 과 `null`(직접 계약만)을 타입에서 갈라 둔 것이 핵심이다 —

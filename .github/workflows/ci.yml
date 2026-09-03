@@ -57,6 +57,11 @@ jobs:
       - name: channel conformance runner (self-check)
         run: node scripts/channel-conformance.mjs --port ./fixtures/reference-port.mjs --flows ./fixtures/reference-flows.mjs --adapter chatbot --timeout-ms 2000
 
+      # 관리 포털 IA ↔ 화면 매핑 문서는 자료(src/portal/screenMap.ts)에서 생성된다.
+      # 손으로 고친 표는 반드시 썩으므로, 생성 결과와 다르면 여기서 멈춘다.
+      - name: portal screen map (doc freshness)
+        run: node scripts/screen-map.mjs --check
+
       # 커버리지는 **측정**이다. 임계값(AICC_COVERAGE_MIN_*)을 주지 않으면 게이트로 쓰지 않는다 —
       # 근거 없는 목표치를 CI에 박지 않기 위해서다(§13-3). 실측 추이를 보고 사람이 임계값을 정하면
       # 그때 환경변수로 켜면 된다. 테스트가 깨진 상태의 수치는 근거가 아니므로 무조건 실패로 끝난다.

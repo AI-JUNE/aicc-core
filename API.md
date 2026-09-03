@@ -5,7 +5,14 @@ Core 는 **순수 라이브러리**다. 서버를 띄우지 않고, 엔진·회�
 
 - 소비 대상: `2. Callbot`(voice) · `3. Chatbot`(chat) · `4. D-ARS`(visual IVR) · 관리 포털
 - 런타임: Node 22+ (테스트가 `.ts` 를 타입 스트리핑으로 직접 import 한다)
-- import 경로는 소스 상대경로다: `import { createConversationCore } from '<core>/src/channels/runtime.ts'`
+- import 경로는 **package.json 의 exports 맵**으로 고정돼 있다(소스 파일을 옮겨도 채널이 깨지지 않는다):
+  `import { createConversationCore } from 'aicc-core/channels/runtime'`
+  - 채널 계약 경로(안정): `aicc-core/channels/{contract,basePort,conformance,profiles,runtime}` ·
+    `aicc-core/flow/types` · `aicc-core/conformance-runner`
+  - 호스트(관리 포털·배치)용: `aicc-core/internal/<경로>` — **안정 계약이 아니다.** 이름에 그렇게 적어 뒀다.
+  - 저장소를 직접 참조해 쓸 때는(레지스트리 배포는 **[승인 필요]**) `file:` 의존성으로 건다:
+    `"aicc-core": "file:../6. AICC-Core"`
+  - 이 맵이 실제 파일과 어긋나면 Core CI 가 잡는다(`src/ops/packageSurface.ts`)
 
 ---
 
@@ -22,8 +29,8 @@ Core 는 **순수 라이브러리**다. 서버를 띄우지 않고, 엔진·회�
 마스킹·실패 보고를 이미 처리한다. 저장소가 쓸 것은 **`ChannelTransport.deliver` 하나**다.
 
 ```ts
-import { createChannelPort, type ChannelTransport } from '<core>/src/channels/basePort.ts';
-import { runChannelConformance, formatConformanceReport } from '<core>/src/channels/conformance.ts';
+import { createChannelPort, type ChannelTransport } from 'aicc-core/channels/basePort';
+import { runChannelConformance, formatConformanceReport } from 'aicc-core/channels/conformance';
 
 // 1) 매체로 내보내는 부분만 구현한다. 실패는 던진다 — 베이스가 마스킹·기록·보고로 바꾼다.
 const transport: ChannelTransport = {
@@ -68,7 +75,7 @@ node <core>/scripts/channel-conformance.mjs \
 Core 런타임 배선:
 
 ```ts
-import { createConversationCore, createMemoryFlowRegistry } from '<core>/src/channels/runtime.ts';
+import { createConversationCore, createMemoryFlowRegistry } from 'aicc-core/channels/runtime';
 
 const core = createConversationCore({
   scope: { tenantId },                 // §11.1 — 스코프 없는 진입 경로를 만들지 않는다
@@ -149,6 +156,7 @@ const next  = await core.send(first.interactionId, { input: { kind: 'text', text
 | `events/store.ts` | 추가 전용 원장·JSONL·부분손상 복구·재전송 | `createMemoryEventLog`, `serializeJsonl`, `parseJsonl`, `replayUndelivered`, `verifyLogIntegrity` |
 | `billing/usage.ts` | 사용량 집계·반올림·외부 명세 대조(§11.2) | `aggregateUsage`, `applyRounding`, `reconcile` |
 | `billing/reconcile.ts` | 대사 시나리오. 과다청구 방향 미해소 차이는 `blocked` | `runReconciliationScenario`, `formatReconciliationReport` |
+| `partner/rbac.ts` | 파트너 담당자 권한. 기본 거부·미결속 거부·역할 혼용 거부, 활성화는 **[승인 필요]** | `PARTNER_ROUTE_ALLOWLIST`, `partnerRbacEnabled`, `decidePartnerAccess`, `partnerActorFilter`, `filterForPartnerActor`, `recordPartnerAccess`, `partnerRbacSelfCheck` |
 | `partner/attribution.ts` | 파트너(채널) 귀속·정산 근거. 수수료율은 설정값, 청구는 하지 않는다 **[승인 필요]** | `validateAttribution`, `buildAttribution`, `partnerScopedFilter`, `visibleToPartner`, `currentAttribution`, `findAttributionConflicts`, `rollupByPartner`, `buildSettlementLines`, `settlementBlockers` |
 | `reports/aggregate.ts` | 기간·채널별 집계와 완결성 표시 | `aggregateReport`, `latencyReport`, `topIntents`, `completeness` |
 
@@ -159,6 +167,7 @@ const next  = await core.send(first.interactionId, { input: { kind: 'text', text
 | `ops/fallback.ts` | 컴포넌트 건강도 → 폴백 모드(§9.3) | `createHealthRegistry`, `decideFallbackMode`, `resolveRuntimeAction` |
 | `ops/health.ts` | liveness/readiness 분리, 프로브 병렬·개별 예산 | `checkHealth`, `livenessReport`, `approvalPendingProbe` |
 | `ops/backup.ts` | 백업·복구와 **복구 리허설**(RUNBOOK.md 참조) | `createSnapshot`, `verifySnapshot`, `serializeSnapshot`, `parseSnapshot`, `restoreSnapshot`, `runRecoveryDrill` |
+| `ops/packageSurface.ts` | 채널이 부르는 import 경로(package.json exports) 고정·검증. 배포는 **[승인 필요]** | `CHANNEL_SUBPATHS`, `expectedExports`, `validatePackageSurface`, `surfaceOk`, `formatSurfaceReport` |
 | `ops/coverage.ts` | 커버리지 실측 요약·임계값 판정. 목표치를 코드에 두지 않는다(§13-3) | `summarizeCoverage`, `evaluateCoverage`, `thresholdsFromEnv`, `percentOf`, `weakestFiles`, `formatCoverageReport`, `coverageToJson`, `COVERAGE_EXIT_CODE` |
 | `obs/logger.ts` | 고정 필드 구조화 로깅·차단 키·마스킹 경유 | `createLogger`, `createRequestIdFactory`, `createMemorySink` |
 | `obs/errorMonitor.ts` | 던져진 값 정규화·fingerprint·중복 억제 | `createErrorMonitor`, `normalizeError`, `installGlobalCapture`, `resolveDsnConfig` |
@@ -173,6 +182,7 @@ const next  = await core.send(first.interactionId, { input: { kind: 'text', text
 | `api/errors.ts` | 코드→HTTP상태·재시도 매핑, 항목 단위 검증 | `apiError`, `toErrorResponse`, `validate`, `validationResponse` |
 | `api/rateLimit.ts` | 테넌트 경계 포함 토큰버킷 | `createRateLimiter`, `enforceRateLimit`, `rateLimitKey` |
 | `portal/ia.ts` | 관리 포털 정보구조·역할별 접근 | `PORTAL_SECTIONS`, `PORTAL_ROUTES`, `canAccess`, `buildNav` |
+| `portal/screenMap.ts` | IA 라우트 ↔ 실제 화면 매핑·감사 배선 점검. 문서(`PORTAL_SCREEN_MAP.md`)를 생성한다 | `PORTAL_SCREEN_MAP`, `validateScreenMap`, `screenMapOk`, `screenMapCoverage`, `renderScreenMapMarkdown`, `formatScreenMapReport` |
 | `portal/aiDisclosure.ts` | AI 고지 문구·노출 위치 | `resolveDisclosure`, `validateDisclosureConfig` |
 | `portal/interactionQuery.ts` | 상호작용 조회 검증·정규화·감사 기록 | `validateQuery`, `normalizeQuery`, `runQuery`, `buildQueryAudit` |
 
