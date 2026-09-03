@@ -4,11 +4,29 @@
   "private": true,
   "type": "module",
   "description": "AICC Conversation Core — 세션·컨텍스트·의도·정책·핸드오프 공통 엔진 (설계서 §1.2/§13-7)",
+  "exports": {
+    "./channels/contract": "./src/channels/contract.ts",
+    "./channels/basePort": "./src/channels/basePort.ts",
+    "./channels/conformance": "./src/channels/conformance.ts",
+    "./channels/profiles": "./src/channels/profiles.ts",
+    "./channels/runtime": "./src/channels/runtime.ts",
+    "./flow/types": "./src/flow/types.ts",
+    "./conformance-runner": "./scripts/channel-conformance.mjs",
+    "./internal/*": "./src/*.ts"
+  },
+  "files": [
+    "src",
+    "scripts",
+    "fixtures",
+    "API.md",
+    "README.md"
+  ],
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "node --test \"tests/*.test.mjs\"",
     "coverage": "node scripts/coverage.mjs",
-    "conformance": "node scripts/channel-conformance.mjs"
+    "conformance": "node scripts/channel-conformance.mjs",
+    "surface": "node --test \"tests/ops.packageSurface.test.mjs\""
   },
   "devDependencies": {
     "typescript": "^5.6.3",

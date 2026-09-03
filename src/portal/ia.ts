@@ -18,7 +18,14 @@ export type PortalRole =
   | 'supervisor'
   | 'agent'
   | 'analyst'
-  | 'auditor';
+  | 'auditor'
+  /**
+   * 파트너(채널) 담당자. 고원 내부 사용자가 **아니다**.
+   * 이 역할은 여기서 어떤 라우트도 얻지 못한다 — 접근은 `partner/rbac.ts` 의 허용 목록이 유일한 근거다.
+   * 기본 거부로 두는 이유: 라우트 표에 파트너를 섞기 시작하면, 새 화면을 추가할 때
+   * "파트너에게도 보이는가"를 매번 판단해야 하고 언젠가 반드시 틀린다.
+   */
+  | 'partner_admin';
 
 /** 역할이 실제로 보유하는 역할 집합(명시적 포함). 게이트웨이 인가 판정의 유일한 근거다. */
 export const ROLE_IMPLIES: Record<PortalRole, PortalRole[]> = {
@@ -28,6 +35,8 @@ export const ROLE_IMPLIES: Record<PortalRole, PortalRole[]> = {
   agent: ['agent'],
   analyst: ['analyst'],
   auditor: ['auditor'],
+  // 내부 역할을 하나도 함의하지 않는다. 파트너가 내부 화면을 얻는 경로를 만들지 않는다.
+  partner_admin: ['partner_admin'],
 };
 
 export interface PortalSection {
@@ -96,6 +105,8 @@ export const PORTAL_ROUTES: PortalRoute[] = [
   { id: 'reports.builder', section: 'reports', path: '/reports', titleKo: '리포트', roles: ['tenant_owner', 'admin', 'analyst', 'auditor'], pii: false, mutates: false },
   { id: 'reports.export', section: 'reports', path: '/reports/export', titleKo: '내보내기', roles: ['tenant_owner', 'admin', 'analyst'], pii: false, mutates: true },
   { id: 'reports.audit', section: 'reports', path: '/reports/audit-log', titleKo: '감사로그', roles: ['tenant_owner', 'auditor'], pii: false, mutates: false },
+  // 파트너 정산 근거 조회. 내부 역할에만 열어 두고, 파트너 담당자 접근은 partner/rbac.ts 가 따로 판정한다.
+  { id: 'reports.settlement', section: 'reports', path: '/reports/settlement', titleKo: '파트너 정산', roles: ['tenant_owner', 'admin', 'analyst'], pii: false, mutates: false },
 
   // 7.7 설정
   { id: 'settings.tenant', section: 'settings', path: '/settings/tenant', titleKo: '테넌트', roles: ['tenant_owner', 'admin'], pii: false, mutates: true },
