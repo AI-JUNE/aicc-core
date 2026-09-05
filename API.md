@@ -158,6 +158,7 @@ const next  = await core.send(first.interactionId, { input: { kind: 'text', text
 | `billing/reconcile.ts` | 대사 시나리오. 과다청구 방향 미해소 차이는 `blocked` | `runReconciliationScenario`, `formatReconciliationReport` |
 | `partner/rbac.ts` | 파트너 담당자 권한. 기본 거부·미결속 거부·역할 혼용 거부, 활성화는 **[승인 필요]** | `PARTNER_ROUTE_ALLOWLIST`, `partnerRbacEnabled`, `decidePartnerAccess`, `partnerActorFilter`, `filterForPartnerActor`, `recordPartnerAccess`, `partnerRbacSelfCheck` |
 | `partner/attribution.ts` | 파트너(채널) 귀속·정산 근거. 수수료율은 설정값, 청구는 하지 않는다 **[승인 필요]** | `validateAttribution`, `buildAttribution`, `partnerScopedFilter`, `visibleToPartner`, `currentAttribution`, `findAttributionConflicts`, `rollupByPartner`, `buildSettlementLines`, `settlementBlockers` |
+| `partner/settlementExport.ts` | 정산 리포트 반출. 차단·권한 필터·대량 반출 감사·CSV 수식 무력화. 청구는 하지 않는다 **[승인 필요]** | `exportSettlement`, `serializeSettlement`, `settlementFilename`, `csvCell`, `SETTLEMENT_ROUTE_ID`, `SETTLEMENT_CSV_HEADER` |
 | `reports/aggregate.ts` | 기간·채널별 집계와 완결성 표시 | `aggregateReport`, `latencyReport`, `topIntents`, `completeness` |
 
 ### 운영·관측·감사

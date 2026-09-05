@@ -100,8 +100,23 @@
         와일드카드로 채널 경로를 여는 것(내부 모듈까지 계약이 된다), 허용 목록 밖 경로를 여는 것,
         승인 근거 없이 `private` 을 푸는 것(=레지스트리 배포)은 모두 검사에서 막힌다 **[배포는 승인 필요]**.
         근거: `src/ops/packageSurface.ts` · `package.json` exports · `tests/ops.packageSurface.test.mjs`(20건)
-      · 남은 것: 채널 저장소 3곳이 `ChannelTransport` 를 구현해 basePort 에 끼우고 위 실행기를 자기 CI에 추가
-        (`"aicc-core": "file:../6. AICC-Core"` 로 걸면 된다. 실회선·실메신저 연결은 **[승인 필요]**)
+      · **채널 저장소 적용(2026-09-05)**: 챗봇·D-ARS 두 저장소가 실제로 Core 를 소비하기 시작했다.
+        각 저장소는 `renderEnvelope`(지시→매체 표현)와 `createAiccTransport`(deliver 하나)만 구현하고,
+        세션·시나리오·이벤트·폴백·마스킹·종료 멱등은 Core 가 그대로 책임진다.
+        - 챗봇: `src/lib/aiccTransport.ts` · `ci/aicc-port.mjs` · `ci/aicc-flows.mjs` ·
+          `scripts/aicc-conformance.mjs` · `tests/aicc.test.mjs`(16건) · CI `채널 계약 적합성` 단계
+        - D-ARS: `dars/lib/aiccTransport.js` · `dars/ci/*` · `dars/scripts/aicc-conformance.mjs` ·
+          `dars/tests/aicc.test.mjs`(14건)
+        적합성 실행기 실측(도구 출력 그대로): `[chatbot/chat] 통과 (오류 0 · 경고 0)` ·
+        `[dars/visual] 통과 (오류 0 · 경고 0)` — 둘 다 드라이런 선언·시나리오·응답 예산을 갖춘 상태의 판정이다.
+        **의존을 `file:` 로 박지 않은 이유**: Core 는 별도 저장소라 단독 체크아웃에서 `npm ci` 가 통째로
+        실패한다. 대신 호출부가 Core 위치(`AICC_CORE`)를 찾고, 못 찾으면 **판정보류(종료코드 2)** 로 끝낸다 —
+        검사를 못 돌린 것을 통과로 적지 않는다. import 경로는 안정 계약 경로(`aicc-core/channels/*`) 그대로다.
+        고객 노출 경로에서 **상담사용 요약(summaryMasked)은 렌더하지 않는다**(§2·§10.3) — 테스트로 고정.
+        활성화는 각 저장소에서 기본 dry_run 이며 플래그+승인 근거가 **둘 다** 있어야 live 다 **[승인 필요]**.
+      · 남은 것: **Callbot 저장소**(현재 node 프로젝트 형태가 아니라 zip·문서 중심) 적용,
+        D-ARS 루트 CI 워크플로에 적합성 단계 추가(저장소 루트 `.github/workflows` 접근 필요),
+        챗봇 CI 게이트 활성화를 위한 `AICC_CORE_TOKEN` 등록 **[승인 필요]**, 실회선·실메신저 연결 **[승인 필요]**
 - [x] **이벤트 버스 영속화 어댑터** — 추가 전용 이벤트 원장(`EventLog`)·원장 기반 멱등 저장소·
       JSONL 직렬화/부분손상 복구·커서 기반 재전송·무결성 점검.
       근거: `src/events/store.ts` · `tests/events.store.test.mjs`(16건).
@@ -156,13 +171,22 @@
       **활성화 기본 OFF** — `activation: 'enabled'` + `approvalRef` 가 둘 다 있어야 켜진다 **[승인 필요]**.
       근거: `src/partner/rbac.ts` · `src/portal/ia.ts`(`partner_admin`·`reports.settlement`) ·
       `tests/partner.rbac.test.mjs`(27건)
-- [ ] **정산 리포트** — 산출 근거까지 완료(`rollupByPartner`·`buildSettlementLines`·`settlementBlockers`):
+- [ ] **정산 리포트** — 산출 근거 + **반출**까지 완료(`rollupByPartner`·`buildSettlementLines`·`settlementBlockers`):
       고객사는 **현재 유효 귀속으로 한 번만** 집계되고(이력 전체를 세면 중복된다), 수수료율은 설정에서 오며
       실적·요율이 **둘 다 있을 때만** 금액을 산출한다 — 없으면 0원으로 채우지 않고 이유를 남긴다.
       0원과 "모른다"를 같게 적는 것이 정산 분쟁을 만들기 때문이다(§13-3).
       유입 경로 미확정·귀속 충돌이 있으면 정산을 막는다.
       조회 라우트(`reports.settlement`, 읽기 전용·비 PII)와 파트너 담당자 접근 판정은 확보됐다(위 파트너 역할 권한).
-      남은 것: **화면 구현과 내보내기**(대량 반출 임계·감사 기록 경유), 실제 청구 연결 **[승인 필요]**
+      **내보내기(2026-09-05)**: 사고는 계산이 아니라 반출 시점에 난다 — 그래서 반출 경로를 함수 하나로 좁혔다.
+      순서가 곧 안전장치다(격리 → 권한 → 행 필터 → 차단 판정 → 기록 → 본문): 본문을 마지막에 만들어
+      어느 단계에서 걸려도 표가 남지 않는다. 막힌 정산(`settlementBlockers`)은 **본문을 만들지 않고**,
+      파트너 담당자에게는 판정과 별개로 행을 한 번 더 걸러 제외 건수를 드러낸다(조용히 줄이지 않는다).
+      `reports.settlement` 은 감사 대상 화면이 아니지만 **반출은 성공·거부·차단 모두 기록**하고,
+      임계값(설정값)을 넘으면 대량 반출로 표시한다. 0건은 "0건짜리 CSV"가 아니라 빈 상태 안내다 —
+      받는 쪽에서 실적 0 으로 읽히기 때문이다. CSV 는 엑셀에서 열리므로 `=`·`+`·`-`·`@` 로 시작하는 값을
+      무력화하고, 사유 문구는 maskPii 를 지난다(§10.3).
+      근거: `src/partner/settlementExport.ts` · `tests/partner.settlementExport.test.mjs`(20건)
+      남은 것: **화면 구현**(포털 저장소), 실제 청구 연결 **[승인 필요]**
 - [x] **2계층 확장 여지 확보** — 파트너 필터가 들어갈 조회 경로를 `partnerScopedFilter` 한 곳으로 모으고,
       테넌트 조건은 기존 `scopedFilter` 가 강제 주입해 호출자가 덮어쓸 수 없게 했다(§11.1).
       `partnerId` **생략(전체)** 과 `null`(직접 계약만)을 타입에서 갈라 둔 것이 핵심이다 —
