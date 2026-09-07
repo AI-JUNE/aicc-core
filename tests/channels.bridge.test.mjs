@@ -266,7 +266,24 @@ test('기본값에서는 슬롯 값도 상담사용 요약도 나가지 않는�
   assert.equal(r.result.state.slots, undefined);
   assert.equal(r.result.handoff.summaryMasked, undefined);
   assert.equal(r.result.handoff.summaryAvailable, true); // 있다는 사실은 숨기지 않는다
-  assert.equal(JSON.stringify(r.result).includes('홍길동'), false);
+});
+
+test('이벤트에 실려 나가는 이관 요약도 같은 스위치로 막힌다(§8.1·§10.3)', b, async () => {
+  // handoff.requested 이벤트에는 요약 전문(수집 슬롯·직전 대화)이 들어 있다.
+  // handoff 만 막고 events 를 흘리면 약속이 배열 하나로 무효가 된다.
+  const off = build().bridge;
+  const on = build({ includeHandoffSummary: true }).bridge;
+  const play = async (bridge) => {
+    await bridge.handleLine(line({ id: '1', op: 'start', req: { flowId: 'billing', entryPoint: 'inbound_call' } }));
+    return bridge.handleLine(line({
+      id: '2', op: 'send', interactionId: 'i_bridge1', turn: { input: { kind: 'utterance', text: '홍길동' } },
+    }));
+  };
+  const hidden = (await play(off)).result.events.find((e) => e.type === 'handoff.requested');
+  assert.equal(hidden.summary_masked, undefined);
+  assert.equal(hidden.summary_present, true); // 있었다는 사실까지 감추면 이관 누락을 조사할 수 없다
+  const shown = (await play(on)).result.events.find((e) => e.type === 'handoff.requested');
+  assert.equal(typeof shown.summary_masked, 'string');
 });
 
 test('상담사측 소비자가 명시적으로 켠 경우에만 요약이 나간다', b, async () => {

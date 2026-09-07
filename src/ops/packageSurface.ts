@@ -52,8 +52,11 @@ export const CHANNEL_SUBPATHS: Readonly<Record<string, string>> = Object.freeze(
   './channels/conformance': './src/channels/conformance.ts',
   './channels/profiles': './src/channels/profiles.ts',
   './channels/runtime': './src/channels/runtime.ts',
+  // 비-Node 호스트(Callbot 파이썬 에이전트 등)가 JSONL 로 Core 를 소비하는 경로.
+  './channels/bridge': './src/channels/bridge.ts',
   './flow/types': './src/flow/types.ts',
   './conformance-runner': './scripts/channel-conformance.mjs',
+  './bridge-runner': './scripts/channel-bridge.mjs',
 });
 
 /** 호스트(관리 포털·배치)용. 안정 계약이 아니며 이름으로 그 사실을 알린다. */

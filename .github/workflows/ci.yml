@@ -57,6 +57,21 @@ jobs:
       - name: channel conformance runner (self-check)
         run: node scripts/channel-conformance.mjs --port ./fixtures/reference-port.mjs --flows ./fixtures/reference-flows.mjs --adapter chatbot --timeout-ms 2000
 
+      # 비-Node 호스트(Callbot 파이썬 에이전트)가 쓰는 JSONL 브리지가 실제로 도는지 확인한다.
+      # 한 통화(hello→start→send→end)와 **깨진 줄**을 함께 흘려서, 잘못된 줄이 프로세스를 죽이지
+      # 않는지까지 본다 — 회선 하나의 이상한 바이트로 통화가 끊기면 안 되기 때문이다.
+      # 실회선에 붙지 않는다(참조 픽스처는 dry_run 이다).
+      - name: channel bridge runner (self-check)
+        run: |
+          printf '%s\n' \
+            '{"id":"1","op":"hello"}' \
+            '{"id":"2","op":"start","req":{"flowId":"f_reference_voice","entryPoint":"inbound_call"}}' \
+            'not-json' \
+            | node scripts/channel-bridge.mjs --core ./fixtures/reference-core.mjs --adapter callbot > /tmp/bridge.out
+          grep -q '"id":"1","ok":true' /tmp/bridge.out
+          grep -q '"id":"2","ok":true' /tmp/bridge.out
+          grep -q 'E_BAD_JSON' /tmp/bridge.out
+
       # 관리 포털 IA ↔ 화면 매핑 문서는 자료(src/portal/screenMap.ts)에서 생성된다.
       # 손으로 고친 표는 반드시 썩으므로, 생성 결과와 다르면 여기서 멈춘다.
       - name: portal screen map (doc freshness)

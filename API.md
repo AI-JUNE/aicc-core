@@ -7,8 +7,8 @@ Core 는 **순수 라이브러리**다. 서버를 띄우지 않고, 엔진·회�
 - 런타임: Node 22+ (테스트가 `.ts` 를 타입 스트리핑으로 직접 import 한다)
 - import 경로는 **package.json 의 exports 맵**으로 고정돼 있다(소스 파일을 옮겨도 채널이 깨지지 않는다):
   `import { createConversationCore } from 'aicc-core/channels/runtime'`
-  - 채널 계약 경로(안정): `aicc-core/channels/{contract,basePort,conformance,profiles,runtime}` ·
-    `aicc-core/flow/types` · `aicc-core/conformance-runner`
+  - 채널 계약 경로(안정): `aicc-core/channels/{contract,basePort,conformance,profiles,runtime,bridge}` ·
+    `aicc-core/flow/types` · `aicc-core/conformance-runner` · `aicc-core/bridge-runner`
   - 호스트(관리 포털·배치)용: `aicc-core/internal/<경로>` — **안정 계약이 아니다.** 이름에 그렇게 적어 뒀다.
   - 저장소를 직접 참조해 쓸 때는(레지스트리 배포는 **[승인 필요]**) `file:` 의존성으로 건다:
     `"aicc-core": "file:../6. AICC-Core"`
@@ -71,6 +71,40 @@ node <core>/scripts/channel-conformance.mjs \
 `--timeout-ms` 나 `--flows` 를 빼면 해당 검사를 건너뛰고 **판정보류**가 된다. 건너뛴 검사는 통과의
 근거가 아니기 때문이다(§13-3). 실행기는 드라이런 포트만 검사한다 — `live` 포트는 멈춘다 **[승인 필요]**.
 복사해 갈 최소 예시는 `fixtures/reference-port.mjs` · `fixtures/reference-flows.mjs` 에 있다.
+
+### 1-1. Node 가 아닌 호스트 — JSONL 브리지
+
+Callbot 음성 에이전트처럼 **Node 프로젝트가 아닌 호스트**는 위의 import 를 쓸 수 없다.
+그런 호스트를 위해 언어에 묶이지 않는 소비 경로를 하나 더 연다: **한 줄 = 한 요청(JSONL)**.
+표준입력으로 요청 한 줄을 쓰고 표준출력에서 응답 한 줄을 읽으면 되므로, 파이썬·자바·Go 어디서든
+붙고 Core 내부 타입을 알 필요가 없다.
+
+```bash
+node <core>/scripts/channel-bridge.mjs --core ./ci/aicc-core.mjs --adapter callbot
+```
+
+```jsonl
+→ {"id":"1","op":"hello"}
+→ {"id":"2","op":"start","req":{"flowId":"f_x","entryPoint":"inbound_call"}}
+← {"id":"2","ok":true,"result":{"interactionId":"...","steps":[...],"events":[...]}}
+→ {"id":"3","op":"send","interactionId":"...","turn":{"input":{"kind":"dtmf","digits":"1"}}}
+→ {"id":"4","op":"end","interactionId":"...","reasonKo":"고객 종료"}
+```
+
+지켜지는 경계(전부 테스트로 고정):
+
+- **테넌트는 호스트가 주장하지 않는다.** `scope` 는 브리지 설정에서 강제 주입되고, 요청이 다른
+  테넌트를 주장하면 조용히 덮어쓰지 않고 `E_TENANT_SCOPE` 로 거부한다(§11.1).
+- **어댑터도 고정이다.** 브리지 하나가 채널 하나다.
+- **슬롯 값과 상담사용 요약은 기본적으로 나가지 않는다.** 슬롯은 키 목록만 나가고, 요약은
+  `--include-handoff-summary` 를 켠 소비자에게만 준다 — `handoff.summaryMasked` 와
+  `handoff.requested` **이벤트의 `summary_masked` 를 같은 스위치로 함께** 막는다(§2·§10.3).
+- **어떤 잘못된 줄도 프로세스를 죽이지 않는다.** 빈 줄·깨진 JSON·모르는 op 는 오류 응답이지 예외가
+  아니며, 깨진 줄의 원문은 되돌려주지 않는다(발신번호가 섞여 있을 수 있다).
+- 줄 길이 상한은 `--max-line-bytes` 를 준 경우에만 검사한다 — 기본값을 만들어 넣지 않는다(§13-3).
+- 기본 `dry_run` 이고 `live` 는 승인 근거가 있어야 만들어진다 **[승인 필요]**.
+
+복사해 갈 최소 예시는 `fixtures/reference-core.mjs` 다.
 
 Core 런타임 배선:
 
@@ -135,6 +169,7 @@ const next  = await core.send(first.interactionId, { input: { kind: 'text', text
 | `channels/contract.ts` | 양방향 포트 정의 | `ConversationCorePort`, `ChannelPort`, `ChannelCapabilities`, `validateRegistration` |
 | `channels/basePort.ts` | 계약을 지키는 포트 베이스 | `createChannelPort`, `ChannelTransport`, `createChannelPortSet` |
 | `channels/conformance.ts` | 저장소 CI용 적합성 스위트 10종 + 참조 드라이런 포트 | `runChannelConformance`, `formatConformanceReport`, `createDryRunPort` |
+| `channels/bridge.ts` | 비-Node 호스트용 JSONL 소비 경로(줄 해석·검증·디스패치·노출 경계) | `createBridge`, `parseBridgeLine`, `encodeResponse`, `runBridgeLines`, `BRIDGE_PROTOCOL_VERSION`, `BridgeConfigError` |
 | `channels/harness.ts` | 적합성 스위트를 CLI 로 돌리는 실행기 로직(설정 해석·포트/시나리오 해석·판정·출력) | `parseHarnessArgs`, `runHarness`, `resolvePortFromModule`, `resolveFlowsFromModule`, `formatHarnessResult`, `harnessResultToJson`, `safeReasonText`, `HARNESS_EXIT_CODE` |
 | `channels/profiles.ts` | 채널 3종 능력 기본값 | `CHANNEL_PROFILES`, `profileFor` |
 | `channels/runtime.ts` | Core 측 실구현 | `createConversationCore`, `createMemoryFlowRegistry`, `createMemorySessionStore` |

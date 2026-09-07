@@ -167,10 +167,12 @@ function nonEmptyString(v: unknown): v is string {
   return typeof v === 'string' && v.trim() !== '';
 }
 
+/** 스코프는 부분 일치로 넘기지 않는다 — 키 하나가 빠진 채 통과하면 격리가 반만 걸린다(§11.1). */
 function sameScope(a: TenantScope, b: unknown): boolean {
   if (!isPlainObject(b)) return false;
-  return Object.entries(a).every(([k, val]) => b[k] === val)
-    && Object.keys(b).every((k) => (a as Record<string, unknown>)[k] === b[k]);
+  const mine = a as unknown as Record<string, unknown>;
+  return Object.keys(mine).every((k) => b[k] === mine[k])
+    && Object.keys(b).every((k) => mine[k] === b[k]);
 }
 
 /**
@@ -379,6 +381,23 @@ function toHealthSamples(body: Record<string, unknown>): { samples: HealthSample
   return { samples, observedAt: report.observedAt };
 }
 
+/**
+ * 이벤트도 같은 노출 규칙을 받는다.
+ *
+ * 여기서 한 번 데인 지점이다: handoff.requested 이벤트(§8.1)에는 상담사용 요약 전문이 들어 있고,
+ * 그 안에는 수집 슬롯 값과 직전 대화가 통째로 있다. handoff.summaryMasked 만 막고 events 를 그대로
+ * 흘리면, "요약은 안 나간다"는 약속이 이벤트 배열 하나로 무효가 된다. 그래서 같은 스위치로 함께 막고,
+ * 요약이 있었다는 사실(summary_present)은 남긴다 — 있었는지조차 감추면 이관 누락을 조사할 수 없다.
+ */
+function projectEvents(events: readonly unknown[], opts: BridgeOptions): unknown[] {
+  if (opts.includeHandoffSummary) return events as unknown[];
+  return events.map((e) => {
+    if (!isPlainObject(e) || e.summary_masked === undefined) return e;
+    const { summary_masked: _dropped, ...rest } = e;
+    return rest;
+  });
+}
+
 function projectTurn(r: ChannelTurnResult, opts: BridgeOptions): BridgeTurnPayload {
   const slots = r.state.slots ?? {};
   const payload: BridgeTurnPayload = {
@@ -395,7 +414,7 @@ function projectTurn(r: ChannelTurnResult, opts: BridgeOptions): BridgeTurnPaylo
       failCount: r.state.failCount,
       slotKeys: Object.keys(slots),
     },
-    events: r.events as unknown[],
+    events: projectEvents(r.events as unknown[], opts),
   };
   if (opts.includeSlots) payload.state.slots = { ...slots };
   if (r.fallback !== undefined) payload.fallback = r.fallback;
