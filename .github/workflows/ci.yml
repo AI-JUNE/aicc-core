@@ -72,6 +72,16 @@ jobs:
           grep -q '"id":"2","ok":true' /tmp/bridge.out
           grep -q 'E_BAD_JSON' /tmp/bridge.out
 
+      # 파이썬 참조 클라이언트가 실제로 브리지를 소비하는지 확인한다. Callbot 이 붙을 경로라서,
+      # "Core 쪽은 맞는데 클라이언트가 틀린" 상황을 여기서 잡는다. 판정은 자기 채점이 되지 않게
+      # 별도 실행기(bridge-transcript)가 하며, 기대(--adapter·--max-line-bytes)를 빼면 판정보류(2)다.
+      # 실회선·실 STT/TTS 에 붙지 않는다(참조 픽스처는 dry_run 이다).
+      - name: python bridge client (self-check)
+        run: |
+          AICC_CORE="$PWD" python3 clients/python/selfcheck.py > /tmp/transcript.json
+          node scripts/bridge-transcript.mjs --transcript /tmp/transcript.json \
+            --adapter callbot --max-line-bytes 65536
+
       # 관리 포털 IA ↔ 화면 매핑 문서는 자료(src/portal/screenMap.ts)에서 생성된다.
       # 손으로 고친 표는 반드시 썩으므로, 생성 결과와 다르면 여기서 멈춘다.
       - name: portal screen map (doc freshness)

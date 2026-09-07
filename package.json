@@ -11,15 +11,18 @@
     "./channels/profiles": "./src/channels/profiles.ts",
     "./channels/runtime": "./src/channels/runtime.ts",
     "./channels/bridge": "./src/channels/bridge.ts",
+    "./channels/bridgeTranscript": "./src/channels/bridgeTranscript.ts",
     "./flow/types": "./src/flow/types.ts",
     "./conformance-runner": "./scripts/channel-conformance.mjs",
     "./bridge-runner": "./scripts/channel-bridge.mjs",
+    "./transcript-runner": "./scripts/bridge-transcript.mjs",
     "./internal/*": "./src/*.ts"
   },
   "files": [
     "src",
     "scripts",
     "fixtures",
+    "clients",
     "API.md",
     "README.md"
   ],
@@ -29,6 +32,7 @@
     "coverage": "node scripts/coverage.mjs",
     "conformance": "node scripts/channel-conformance.mjs",
     "bridge": "node scripts/channel-bridge.mjs",
+    "transcript": "node scripts/bridge-transcript.mjs",
     "surface": "node --test \"tests/ops.packageSurface.test.mjs\""
   },
   "devDependencies": {

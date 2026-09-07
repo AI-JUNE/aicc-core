@@ -134,8 +134,34 @@
         근거: `src/channels/bridge.ts` · `scripts/channel-bridge.mjs` · `fixtures/reference-core.mjs` ·
         `tests/channels.bridge.test.mjs`(25건) · CI `channel bridge runner (self-check)` 단계 ·
         안정 계약 경로 `aicc-core/channels/bridge`·`aicc-core/bridge-runner` 등록(`src/ops/packageSurface.ts`)
-      · 남은 것: **Callbot 저장소 쪽 배선**(파이썬 측 30줄 클라이언트 + CI 단계. 저장소가 zip·문서 중심이라
-        node 프로젝트 신설 여부를 사람이 정해야 한다),
+      · Core 측 완료(7): **파이썬 참조 클라이언트 + 기록 판정기(2026-09-07)** — 브리지를 열어 둔 것만으로는
+        Callbot 이 붙지 않는다. 열린 경로 앞에 아무도 쓰지 않은 30줄이 남아 있으면, 각 저장소가 각자
+        해석해서 짜고 **각자 다르게 틀린다**. 실제로 30줄짜리 JSONL 클라이언트에서 조용히 빠지는 것은
+        정해져 있다: `end` 누락(세션이 안 닫히고 장애가 아니라 **요금**으로 먼저 나타난다) · `hello` 생략
+        (버전 불일치가 조용히 지나간다) · 요청에 자기 테넌트 동봉(§11.1 — 지금은 브리지가 막지만 **보내려
+        했다는 사실 자체**가 결함이다) · 응답을 그대로 로그·화면에 흘림(상담사용 요약·슬롯 값 유출, §2·§10.3).
+        그래서 두 개를 같이 넣었다 — **참조 구현**과 **그 구현을 채점하는 별도 판정기**다.
+        - 클라이언트(`clients/python/aicc_bridge.py`, 표준 라이브러리만): 테넌트·어댑터를 싣지 않고,
+          응답을 **순서가 아니라 id 로 상관**지으며(어긋나면 조용히 넘기지 않는다 — 다른 통화 상태를 읽게 된다),
+          개별 요청 실패를 예외로 바꾸지 않고(회선 하나가 통화 전체를 끊으면 안 된다), `session()`
+          컨텍스트 매니저가 **예외 경로에서도 end 를 부른다**. 어떤 것도 print 하지 않는다(§10.3).
+          타임아웃·줄 상한은 주지 않으면 검사하지 않는다(§13-3).
+        - 판정기(`src/channels/bridgeTranscript.ts` + `scripts/bridge-transcript.mjs`): 보낸 줄과 받은 줄만
+          넘기면 판정이 나온다 — **Core 타입을 몰라도 되므로 언어를 가리지 않는다**. 자기 채점이 되지 않게
+          클라이언트와 프로세스를 분리했다. `--adapter`·`--max-line-bytes` 를 빼면 그 검사를 건너뛴 것이므로
+          통과가 아니라 **판정보류(종료코드 2)** 다(§13-3).
+        검증은 목이 아니라 **실제 python3 프로세스**를 띄워 한 통화(발화·DTMF·무음)를 끝까지 돌린 뒤
+        판정기에 넣는다. python3 이 없으면 건너뛰며 통과로 적지 않는다.
+        적합성 실행기 실측(도구 출력 그대로): `브리지 기록 검증: 통과 (오류 0 · 경고 0)` ·
+        `요청 7줄 · 응답 7줄 · 성공 7 · 오류응답 0` · `세션 시작 1 · 종료 1`.
+        근거: `clients/python/aicc_bridge.py` · `clients/python/selfcheck.py` ·
+        `src/channels/bridgeTranscript.ts` · `scripts/bridge-transcript.mjs` ·
+        `tests/channels.bridgeTranscript.test.mjs`(19건) · `tests/clients.python.test.mjs`(7건) ·
+        CI `python bridge client (self-check)` 단계 ·
+        안정 계약 경로 `aicc-core/channels/bridgeTranscript`·`aicc-core/transcript-runner` 등록
+      · 남은 것: **Callbot 저장소 쪽 배선** — 클라이언트 코드는 더 이상 쓸 것이 없다(위 참조 구현을 복사한다).
+        남은 것은 저장소 결정 사항이다: 저장소가 zip·문서 중심이라 `voice-agent/agent.py` 가 이 클라이언트를
+        어느 지점에서 부를지(현행 시나리오 코드 대체 범위)와 CI 단계를 둘 곳을 **사람이 정해야 한다**,
         D-ARS 루트 CI 워크플로에 적합성 단계 추가(저장소 루트 `.github/workflows` 접근 필요),
         챗봇 CI 게이트 활성화를 위한 `AICC_CORE_TOKEN` 등록 **[승인 필요]**, 실회선·실메신저 연결 **[승인 필요]**
 - [x] **이벤트 버스 영속화 어댑터** — 추가 전용 이벤트 원장(`EventLog`)·원장 기반 멱등 저장소·

@@ -170,6 +170,7 @@ const next  = await core.send(first.interactionId, { input: { kind: 'text', text
 | `channels/basePort.ts` | 계약을 지키는 포트 베이스 | `createChannelPort`, `ChannelTransport`, `createChannelPortSet` |
 | `channels/conformance.ts` | 저장소 CI용 적합성 스위트 10종 + 참조 드라이런 포트 | `runChannelConformance`, `formatConformanceReport`, `createDryRunPort` |
 | `channels/bridge.ts` | 비-Node 호스트용 JSONL 소비 경로(줄 해석·검증·디스패치·노출 경계) | `createBridge`, `parseBridgeLine`, `encodeResponse`, `runBridgeLines`, `BRIDGE_PROTOCOL_VERSION`, `BridgeConfigError` |
+| `channels/bridgeTranscript.ts` | 비-Node 클라이언트가 프로토콜을 지켰는지 기록으로 판정(세션 누수·요약/슬롯 유출·테넌트 주장·상관 어긋남) | `verifyBridgeTranscript`, `formatTranscriptReport`, `TRANSCRIPT_EXIT_CODE` |
 | `channels/harness.ts` | 적합성 스위트를 CLI 로 돌리는 실행기 로직(설정 해석·포트/시나리오 해석·판정·출력) | `parseHarnessArgs`, `runHarness`, `resolvePortFromModule`, `resolveFlowsFromModule`, `formatHarnessResult`, `harnessResultToJson`, `safeReasonText`, `HARNESS_EXIT_CODE` |
 | `channels/profiles.ts` | 채널 3종 능력 기본값 | `CHANNEL_PROFILES`, `profileFor` |
 | `channels/runtime.ts` | Core 측 실구현 | `createConversationCore`, `createMemoryFlowRegistry`, `createMemorySessionStore` |
