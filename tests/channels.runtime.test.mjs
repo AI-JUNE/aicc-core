@@ -48,7 +48,7 @@ function fakePort(id = 'callbot', capsOver = {}, over = {}) {
   };
 }
 
-function build({ flows = [flowBilling], port = fakePort(), samples = [], policy = {}, components } = {}) {
+function build({ flows = [flowBilling], port = fakePort(), samples = [], policy = {}, components, reprompt } = {}) {
   const collector = B.createCollectorSink('t');
   const bus = B.createEventBus({
     scope: SCOPE, sinks: [collector],
@@ -65,6 +65,7 @@ function build({ flows = [flowBilling], port = fakePort(), samples = [], policy 
     },
     health, bus, now: () => NOW,
     newInteractionId: () => 'i_test1',
+    ...(reprompt !== undefined ? { reprompt } : {}),
   });
   return { core, port, collector, health };
 }
@@ -219,4 +220,39 @@ test('시나리오 레지스트리는 버전을 지정하지 않으면 최신을
   assert.equal(reg.get('billing', 2).version, 2);
   assert.equal(reg.get('billing', 9), undefined);
   assert.equal(reg.get('none'), undefined);
+});
+
+
+// ── 재프롬프트 정책 배선 (§5.1·§5.3·§13-3) ──────────────────────────────────
+// 채널 저장소가 각자 재프롬프트를 짜면 §2 의 시나리오 이중 관리가 재발한다 — Core 에서 한 번만 준다.
+test('재프롬프트 정책을 주면 실패 시 원문 대신 선언된 문장이 채널로 나간다', b, async () => {
+  const { core, port } = build({
+    flows: [flowRetry],
+    reprompt: { byReason: { no_input: [{ text: '잘 안 들리셨나요? 다시 말씀해 주세요.', offerDtmf: true }] } },
+  });
+  await core.start(req({ flowId: 'retry' }));
+  const r = await core.send('i_test1', { input: { kind: 'timeout' } });
+  assert.equal(r.steps.at(-1).text, '잘 안 들리셨나요? 다시 말씀해 주세요.');
+  assert.equal(r.steps.at(-1).acceptDtmf, true);
+  assert.deepEqual(r.steps.at(-1).reprompt, { reason: 'no_input', attempt: 1, exhausted: false });
+  assert.equal(port.log.at(-1)[0], 'present');
+});
+
+test('정책을 주지 않으면 종전대로 원문이 재생된다(기본 문안 금지 §13-3)', b, async () => {
+  const { core } = build({ flows: [flowRetry] });
+  await core.start(req({ flowId: 'retry' }));
+  const r = await core.send('i_test1', { input: { kind: 'timeout' } });
+  assert.equal(r.steps.at(-1).text, '고객번호를 말씀해 주세요.');
+});
+
+test('빈 대본이 섞인 정책은 등록 자체를 거부한다 — 무음이 통화 중에 발견되면 늦다', b, () => {
+  assert.throws(
+    () => build({ flows: [flowRetry], reprompt: { byReason: { no_input: [{ text: '' }] } } }),
+    /재프롬프트 정책 거부/,
+  );
+});
+
+test('선언이 비어 있는 정책은 거부가 아니라 경고로 운영에 드러난다', b, () => {
+  const { core } = build({ flows: [flowRetry], reprompt: { sharedLines: [] } });
+  assert.ok(core.warnings().some((w) => w.code === 'W_REPROMPT_POLICY'));
 });

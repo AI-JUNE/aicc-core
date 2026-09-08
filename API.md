@@ -150,6 +150,7 @@ const next  = await core.send(first.interactionId, { input: { kind: 'text', text
 |---|---|---|
 | `flow/types.ts` | 노드 정의와 채널별 렌더(§5.3) | `Flow`, `FlowNode`, `RenderedStep`, `renderNode` |
 | `flow/runner.ts` | 하나의 Flow 를 채널 무관하게 실행 | `start`, `send`, `FlowState`, `RunStatus` |
+| `flow/reprompt.ts` | 실패 원인 분류(무입력·저신뢰·불일치)와 원인별·시도별 재프롬프트 사다리(§5.1). **기본 문안을 만들지 않는다** — 정책 미주입 시 노드 원문이 그대로 재생된다(§13-3) | `RepromptReason`, `RepromptPolicy`, `RepromptPlan`, `classifyFailure`, `buildReprompt`, `validateRepromptPolicy`, `repromptPolicyOk` |
 | `flow/validate.ts` | 배포 전 정적 검증 | `validateFlow`, `validateFlowConnectors`, `canPublish` |
 | `flow/lifecycle.ts` | 초안→검토→승인→배포→롤백 | `createDraft`, `submitForReview`, `approve`, `publish`, `rollback`, `deploymentStatus` |
 

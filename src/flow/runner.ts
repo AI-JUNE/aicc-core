@@ -5,6 +5,7 @@ import type { ChannelKind, Handoff, Outcome } from '../domain/types.ts';
 import type { Flow, FlowNode, RenderedStep } from './types.ts';
 import { renderNode } from './types.ts';
 import { decideFallback, type FallbackAction } from '../core/session.ts';
+import { buildReprompt, classifyFailure, type FailureSignal, type RepromptPolicy, type RepromptReason } from './reprompt.ts';
 import {
   sessionStarted, turnCompleted, handoffRequested, sessionEnded,
   type EntryPoint, type EventMeta, type InteractionEvent, type LatencyMs,
@@ -36,6 +37,8 @@ export interface FlowState {
   status: RunStatus;
   visited: string[];
   lastFallback?: FallbackAction;
+  /** 직전 입력이 실패한 원인(§5.1). 성공하면 지워진다 — 남겨두면 이관 요약이 지난 실패를 말한다. */
+  lastFailureReason?: RepromptReason;
   handoff?: { reason: Handoff['reason']; queue?: string };
   /** Api 노드에서 대기 중인 커넥터 id. 값이 있으면 호스트의 호출 결과를 기다리는 상태다(§6.1). */
   pendingConnectorId?: string;
@@ -51,6 +54,11 @@ export interface RunnerContext {
   /** 신뢰도 임계값. 테넌트 설정값이며 미지정 시 신뢰도 게이팅을 하지 않는다(임의 수치 금지 §13-3). */
   minConfidence?: number;
   entryPoint?: EntryPoint;
+  /**
+   * 재프롬프트 정책(§5.1). 주지 않으면 종전대로 노드 원문을 그대로 재생한다 —
+   * Core 가 기본 문안을 지어내지 않기 때문이다(§13-3).
+   */
+  reprompt?: RepromptPolicy;
   /** 시각 주입 — 테스트 결정성을 위해 교체 가능 */
   now?: () => string;
 }
@@ -93,6 +101,17 @@ function inputText(input: FlowInput): string {
 
 function inputLatency(input: FlowInput): LatencyMs {
   return input.kind === 'timeout' || input.kind === 'connectorResult' ? {} : (input.latency ?? {});
+}
+
+/** 실패 원인 분류에 필요한 최소 신호만 뽑는다. connectorResult 는 이 경로에 오지 않는다(상위에서 처리). */
+function failureSignal(input: FlowInput): FailureSignal {
+  if (input.kind === 'utterance') {
+    return input.confidence === undefined
+      ? { kind: 'utterance', text: input.text }
+      : { kind: 'utterance', text: input.text, confidence: input.confidence };
+  }
+  if (input.kind === 'dtmf') return { kind: 'dtmf', text: input.digits };
+  return { kind: 'timeout' };
 }
 
 /** 신뢰도 임계값이 설정된 테넌트에서만 게이팅한다 */
@@ -220,6 +239,7 @@ export function send(flow: Flow, prev: FlowState, input: FlowInput, ctx: RunnerC
       }
       s.failCount = 0;
       delete s.lastFallback;
+      delete s.lastFailureReason;
       s.currentNodeId = node.next ?? null;
       advance(flow, s, ctx, steps, events);
       return { state: s, steps, events };
@@ -253,6 +273,7 @@ export function send(flow: Flow, prev: FlowState, input: FlowInput, ctx: RunnerC
     if (r.slot) s.slots[r.slot.key] = r.slot.value;
     s.failCount = 0;
     delete s.lastFallback;
+    delete s.lastFailureReason;
     s.currentNodeId = r.next ?? null;
     advance(flow, s, ctx, steps, events);
     return { state: s, steps, events };
@@ -260,6 +281,11 @@ export function send(flow: Flow, prev: FlowState, input: FlowInput, ctx: RunnerC
 
   // 실패 — §5.1 폴백 사다리
   s.failCount += 1;
+  // 원인을 먼저 정한다. 무입력·저신뢰·불일치는 필요한 다음 말이 서로 다르다.
+  const reason = classifyFailure(failureSignal(input), ctx.minConfidence);
+  s.lastFailureReason = reason;
+  // 이관 요약·후속 분석이 "왜 못 알아들었는가"를 알 수 있게 남긴다. 원인 코드일 뿐 개인정보가 아니다.
+  s.slots['__last_failure_reason__'] = reason;
   const capped = node.kind === 'Collect' && node.maxRetry !== undefined && s.failCount > node.maxRetry;
   const action: FallbackAction = capped ? 'handoff_agent' : decideFallback(s.failCount, ctx.visualAvailable);
   s.lastFallback = action;
@@ -273,6 +299,13 @@ export function send(flow: Flow, prev: FlowState, input: FlowInput, ctx: RunnerC
   if (action === 'switch_to_visual') s.channel = 'visual';   // §5.2 같은 Interaction 유지, 렌더러만 교체
 
   const retryStep = renderNode(node, s.channel);
+  // 채널 전환이 일어났으면 전환된 채널 기준으로 고른다 — 화면으로 넘어간 뒤 DTMF 안내를 내면 안 된다.
+  const plan = buildReprompt(ctx.reprompt, reason, s.failCount, s.channel);
+  if (plan) {
+    retryStep.text = plan.text;
+    if (plan.acceptDtmf) retryStep.acceptDtmf = true;
+  }
+  retryStep.reprompt = { reason, attempt: s.failCount, exhausted: plan?.exhausted ?? false };
   steps.push(retryStep);
   events.push(turnCompleted(meta(s, ctx), {
     turnId: `t_${++s.turnCount}`, speaker: 'bot', utterance: retryStep.text, nodeId: node.id, retryCount: s.failCount,

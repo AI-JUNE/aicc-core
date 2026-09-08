@@ -141,7 +141,9 @@ export type ContractIssueCode =
   | 'E_CHANNEL_MISMATCH'
   | 'E_MISSING_CAPABILITY_IMPL'
   | 'E_UNDECLARED_COMPONENT'
-  | 'W_NO_FALLBACK_PATH';
+  | 'W_NO_FALLBACK_PATH'
+  /** 재프롬프트 정책이 비어 있어 실패 시 원문이 그대로 재생된다(§5.1). 금지는 아니지만 운영이 알아야 한다. */
+  | 'W_REPROMPT_POLICY';
 
 export interface ContractIssue {
   code: ContractIssueCode;

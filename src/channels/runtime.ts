@@ -15,6 +15,8 @@ import type { Flow, RenderedStep } from '../flow/types.ts';
 import { renderNode } from '../flow/types.ts';
 import type { FlowState, RunStatus, RunnerContext } from '../flow/runner.ts';
 import { start as runnerStart, send as runnerSend } from '../flow/runner.ts';
+import type { RepromptPolicy } from '../flow/reprompt.ts';
+import { repromptPolicyOk, validateRepromptPolicy } from '../flow/reprompt.ts';
 import type { TenantScope } from '../core/tenancy.ts';
 import { assertTenantScope } from '../core/tenancy.ts';
 import type { EventMeta, InteractionEvent, TurnCompletedEvent, HandoffRequestedEvent } from '../events/schema.ts';
@@ -95,6 +97,12 @@ export interface ConversationCoreOptions {
   sessions?: SessionStore;
   /** 신뢰도 임계값(테넌트 설정). 미지정 시 게이팅하지 않는다(§13-3). */
   minConfidence?: number;
+  /**
+   * 재프롬프트 정책(§5.1). 여기 한 곳에서 주입해야 세 채널이 같은 문안을 쓴다 —
+   * 채널 저장소가 각자 재프롬프트를 짜면 §2 의 시나리오 이중 관리가 그대로 재발한다.
+   * 미지정 시 노드 원문이 그대로 재생된다(기본 문안 금지, §13-3).
+   */
+  reprompt?: RepromptPolicy;
   summary?: SummaryOptions;
   now?: () => string;
   newInteractionId?: (req: ChannelSessionRequest) => string;
@@ -129,6 +137,16 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
   const warnings: ContractIssue[] = [];
   const regs = new Map<ChannelAdapterId, ChannelRegistration>();
   const declared = new Map<ChannelAdapterId, Set<ComponentId>>();
+
+  // 잘못된 재프롬프트 정책은 통화 중이 아니라 여기서 걸러야 한다 —
+  // 빈 대본은 고객에게 무음으로 나가고, 무음은 장애와 구분되지 않는다.
+  if (opts.reprompt !== undefined) {
+    const rIssues = validateRepromptPolicy(opts.reprompt);
+    if (!repromptPolicyOk(rIssues)) {
+      throw new Error(`재프롬프트 정책 거부: ${rIssues.filter((i) => i.severity === 'error').map((i) => i.messageKo).join(' / ')}`);
+    }
+    for (const i of rIssues) warnings.push({ severity: 'warning', code: 'W_REPROMPT_POLICY', messageKo: i.messageKo });
+  }
 
   for (const reg of opts.channels) {
     const issues = validateRegistration(reg);
@@ -221,6 +239,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       now,
     };
     if (opts.minConfidence !== undefined) ctx.minConfidence = opts.minConfidence;
+    if (opts.reprompt !== undefined) ctx.reprompt = opts.reprompt;
     if (entryPoint !== undefined) ctx.entryPoint = entryPoint;
     return ctx;
   }

@@ -1,6 +1,7 @@
 // Flow — 설계서 §5.3. 하나의 Flow를 채널 렌더러만 바꿔 실행한다.
 // 이것이 "시나리오 이중 관리"(§2 운영비용 최대 항목)를 구조적으로 제거한다.
 import type { ChannelKind } from '../domain/types.ts';
+import type { RepromptReason } from './reprompt.ts';
 
 export type NodeKind = 'Say' | 'Collect' | 'Choice' | 'Confirm' | 'Transfer' | 'Api';
 
@@ -37,6 +38,12 @@ export interface RenderedStep {
   silent?: boolean;
   /** Api 노드 — 호출해야 할 커넥터 id. 채널이 아니라 호스트가 처리한다(§6.1·§6.2). */
   awaitConnectorId?: string;
+  /**
+   * 재시도로 다시 낸 단계라는 표시(§5.1). 첫 제시에는 없다.
+   * 채널은 이 값으로 표현을 달리할 수 있다(음성: 속도·안내 문구, 화면: 오류 강조).
+   * `exhausted` 는 선언된 사다리를 다 쓰고 마지막 문장을 반복하는 중이라는 뜻이다.
+   */
+  reprompt?: { reason: RepromptReason; attempt: number; exhausted: boolean };
 }
 
 export function renderNode(node: FlowNode, channel: ChannelKind): RenderedStep {
