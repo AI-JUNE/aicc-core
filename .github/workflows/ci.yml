@@ -82,6 +82,12 @@ jobs:
           node scripts/bridge-transcript.mjs --transcript /tmp/transcript.json \
             --adapter callbot --max-line-bytes 65536
 
+      # Callbot 훅 어댑터(call_start·transcript·call_end → Core)가 실제 python3 로 도는지 확인한다.
+      # 격리(call_id)·봇 발화 미전송·브리지 사망 시 무예외·종료 멱등을 여기서 잡는다.
+      # python3 이 없으면 건너뛰며 통과로 적지 않는다(§13-3). 회선·STT/TTS 에 붙지 않는다.
+      - name: python callbot hooks (self-check)
+        run: node --test tests/clients.callbot.test.mjs
+
       # 관리 포털 IA ↔ 화면 매핑 문서는 자료(src/portal/screenMap.ts)에서 생성된다.
       # 손으로 고친 표는 반드시 썩으므로, 생성 결과와 다르면 여기서 멈춘다.
       - name: portal screen map (doc freshness)
