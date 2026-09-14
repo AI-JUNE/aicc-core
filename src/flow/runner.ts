@@ -6,6 +6,7 @@ import type { Flow, FlowNode, RenderedStep } from './types.ts';
 import { renderNode } from './types.ts';
 import { decideFallback, type FallbackAction } from '../core/session.ts';
 import { buildReprompt, classifyFailure, type FailureSignal, type RepromptPolicy, type RepromptReason } from './reprompt.ts';
+import { resolveTurnTiming, type TurnTimingPolicy } from './timing.ts';
 import {
   sessionStarted, turnCompleted, handoffRequested, sessionEnded,
   type EntryPoint, type EventMeta, type InteractionEvent, type LatencyMs,
@@ -59,6 +60,10 @@ export interface RunnerContext {
    * Core 가 기본 문안을 지어내지 않기 때문이다(§13-3).
    */
   reprompt?: RepromptPolicy;
+  /**
+   * 턴 타이밍 정책(§5.1). 주지 않으면 어떤 대기 값도 실리지 않고 채널이 종전 값을 쓴다(§13-3).
+   */
+  timing?: TurnTimingPolicy;
   /** 시각 주입 — 테스트 결정성을 위해 교체 가능 */
   now?: () => string;
 }
@@ -87,6 +92,13 @@ function meta(s: FlowState, ctx: RunnerContext): EventMeta {
     flowId: s.flowId,
     flowVersion: s.flowVersion,
   };
+}
+
+/** 입력 대기 노드에만 타이밍 힌트를 찍는다. attempt 는 1부터 세며 첫 제시가 1 이다. */
+function stampTiming(step: RenderedStep, s: FlowState, ctx: RunnerContext, attempt: number): void {
+  const t = resolveTurnTiming(ctx.timing, { kind: step.kind, attempt, channel: s.channel });
+  if (t.inputTimeoutMs !== undefined) step.inputTimeoutMs = t.inputTimeoutMs;
+  if (t.bargeIn !== undefined) step.bargeIn = t.bargeIn;
 }
 
 function clone(s: FlowState): FlowState {
@@ -146,6 +158,7 @@ function advance(flow: Flow, s: FlowState, ctx: RunnerContext, steps: RenderedSt
     }
     if (!s.visited.includes(node.id)) s.visited.push(node.id);
     const step = renderNode(node, s.channel);
+    stampTiming(step, s, ctx, 1);
     steps.push(step);
     // 무음 단계(Api 대기)는 발화가 없으므로 턴으로 집계하지 않는다 — 없는 발화가 통계에 잡히면 §8.1 신뢰도가 깨진다.
     if (step.silent !== true) {
@@ -306,6 +319,8 @@ export function send(flow: Flow, prev: FlowState, input: FlowInput, ctx: RunnerC
     if (plan.acceptDtmf) retryStep.acceptDtmf = true;
   }
   retryStep.reprompt = { reason, attempt: s.failCount, exhausted: plan?.exhausted ?? false };
+  // 재시도는 첫 제시 다음이므로 회차가 하나 올라간다 — §5.1 의 "조금 더 기다린다"가 여기서 적용된다.
+  stampTiming(retryStep, s, ctx, s.failCount + 1);
   steps.push(retryStep);
   events.push(turnCompleted(meta(s, ctx), {
     turnId: `t_${++s.turnCount}`, speaker: 'bot', utterance: retryStep.text, nodeId: node.id, retryCount: s.failCount,

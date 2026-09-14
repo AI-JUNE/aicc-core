@@ -17,6 +17,8 @@ import type { FlowState, RunStatus, RunnerContext } from '../flow/runner.ts';
 import { start as runnerStart, send as runnerSend } from '../flow/runner.ts';
 import type { RepromptPolicy } from '../flow/reprompt.ts';
 import { repromptPolicyOk, validateRepromptPolicy } from '../flow/reprompt.ts';
+import type { TurnTimingPolicy } from '../flow/timing.ts';
+import { turnTimingPolicyOk, validateTurnTimingPolicy } from '../flow/timing.ts';
 import type { TenantScope } from '../core/tenancy.ts';
 import { assertTenantScope } from '../core/tenancy.ts';
 import type { EventMeta, InteractionEvent, TurnCompletedEvent, HandoffRequestedEvent } from '../events/schema.ts';
@@ -103,6 +105,11 @@ export interface ConversationCoreOptions {
    * 미지정 시 노드 원문이 그대로 재생된다(기본 문안 금지, §13-3).
    */
   reprompt?: RepromptPolicy;
+  /**
+   * 턴 타이밍 정책(§5.1). 대기 시간을 채널이 각자 정하면 같은 시나리오가 채널마다 다른 순간에
+   * 무입력으로 떨어진다. 미지정 시 Core 는 어떤 값도 싣지 않는다(§13-3).
+   */
+  timing?: TurnTimingPolicy;
   summary?: SummaryOptions;
   now?: () => string;
   newInteractionId?: (req: ChannelSessionRequest) => string;
@@ -146,6 +153,14 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       throw new Error(`재프롬프트 정책 거부: ${rIssues.filter((i) => i.severity === 'error').map((i) => i.messageKo).join(' / ')}`);
     }
     for (const i of rIssues) warnings.push({ severity: 'warning', code: 'W_REPROMPT_POLICY', messageKo: i.messageKo });
+  }
+
+  if (opts.timing !== undefined) {
+    const tIssues = validateTurnTimingPolicy(opts.timing);
+    if (!turnTimingPolicyOk(tIssues)) {
+      throw new Error(`턴 타이밍 정책 거부: ${tIssues.filter((i) => i.severity === 'error').map((i) => i.messageKo).join(' / ')}`);
+    }
+    for (const i of tIssues) warnings.push({ severity: 'warning', code: 'W_TURN_TIMING', messageKo: i.messageKo });
   }
 
   for (const reg of opts.channels) {
@@ -240,6 +255,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     };
     if (opts.minConfidence !== undefined) ctx.minConfidence = opts.minConfidence;
     if (opts.reprompt !== undefined) ctx.reprompt = opts.reprompt;
+    if (opts.timing !== undefined) ctx.timing = opts.timing;
     if (entryPoint !== undefined) ctx.entryPoint = entryPoint;
     return ctx;
   }

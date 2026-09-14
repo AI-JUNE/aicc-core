@@ -143,7 +143,9 @@ export type ContractIssueCode =
   | 'E_UNDECLARED_COMPONENT'
   | 'W_NO_FALLBACK_PATH'
   /** 재프롬프트 정책이 비어 있어 실패 시 원문이 그대로 재생된다(§5.1). 금지는 아니지만 운영이 알아야 한다. */
-  | 'W_REPROMPT_POLICY';
+  | 'W_REPROMPT_POLICY'
+  /** 턴 타이밍이 선언되지 않아 채널이 각자의 대기 시간을 쓴다(§5.1). */
+  | 'W_TURN_TIMING';
 
 export interface ContractIssue {
   code: ContractIssueCode;

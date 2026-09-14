@@ -44,6 +44,13 @@ export interface RenderedStep {
    * `exhausted` 는 선언된 사다리를 다 쓰고 마지막 문장을 반복하는 중이라는 뜻이다.
    */
   reprompt?: { reason: RepromptReason; attempt: number; exhausted: boolean };
+  /**
+   * 입력 대기(ms). 선언된 테넌트에서만 실린다 — Core 는 기본 대기 시간을 만들지 않는다(§13-3).
+   * 값이 없으면 채널이 종전대로 자기 값을 쓴다.
+   */
+  inputTimeoutMs?: number;
+  /** 안내 도중 끼어들기 허용 여부. 음성 채널에만 실린다. */
+  bargeIn?: boolean;
 }
 
 export function renderNode(node: FlowNode, channel: ChannelKind): RenderedStep {

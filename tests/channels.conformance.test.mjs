@@ -186,3 +186,35 @@ test('리포트 포맷은 실패·건너뜀 항목만 이유와 함께 남긴다
   assert.match(text, /실패/);
   assert.match(text, /EMPTY_STEPS/);
 });
+
+// ── 재시도·타이밍 힌트 (§5.1) ───────────────────────────────────────────────
+// 정책을 켜는 것은 코드 배포가 아니라 설정 변경이다. 그 순간 전 통화가 깨지면 안 된다.
+
+test('힌트가 붙은 단계를 흡수하는 구현은 TURN_HINTS 를 통과한다', b, async () => {
+  for (const id of ['callbot', 'chatbot', 'dars']) {
+    const port = m.createDryRunPort({ id });
+    const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+    const c = r.checks.find((x) => x.id === 'TURN_HINTS');
+    assert.equal(c.passed, true, `${id}: ${c.messageKo}`);
+    assert.notEqual(c.skipped, true);
+  }
+});
+
+test('모르는 필드가 있다고 예외를 던지는 구현을 잡는다', b, async () => {
+  const port = m.createDryRunPort({ id: 'callbot' });
+  port.present = async (_id, steps) => {
+    for (const s of steps) {
+      if ('reprompt' in s || 'inputTimeoutMs' in s) throw new Error('알 수 없는 필드입니다');
+    }
+  };
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  assert.equal(r.checks.find((c) => c.id === 'TURN_HINTS').passed, false);
+  assert.equal(r.passed, false);
+});
+
+test('힌트가 붙은 단계를 고쳐 쓰는 구현을 잡는다(이벤트·이력 오염)', b, async () => {
+  const port = m.createDryRunPort({ id: 'callbot' });
+  port.present = async (_id, steps) => { for (const s of steps) delete s.reprompt; };
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  assert.equal(r.checks.find((c) => c.id === 'TURN_HINTS').passed, false);
+});

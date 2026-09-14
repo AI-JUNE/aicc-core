@@ -48,7 +48,7 @@ function fakePort(id = 'callbot', capsOver = {}, over = {}) {
   };
 }
 
-function build({ flows = [flowBilling], port = fakePort(), samples = [], policy = {}, components, reprompt } = {}) {
+function build({ flows = [flowBilling], port = fakePort(), samples = [], policy = {}, components, reprompt, timing } = {}) {
   const collector = B.createCollectorSink('t');
   const bus = B.createEventBus({
     scope: SCOPE, sinks: [collector],
@@ -66,6 +66,7 @@ function build({ flows = [flowBilling], port = fakePort(), samples = [], policy 
     health, bus, now: () => NOW,
     newInteractionId: () => 'i_test1',
     ...(reprompt !== undefined ? { reprompt } : {}),
+    ...(timing !== undefined ? { timing } : {}),
   });
   return { core, port, collector, health };
 }
@@ -255,4 +256,44 @@ test('빈 대본이 섞인 정책은 등록 자체를 거부한다 — 무음이
 test('선언이 비어 있는 정책은 거부가 아니라 경고로 운영에 드러난다', b, () => {
   const { core } = build({ flows: [flowRetry], reprompt: { sharedLines: [] } });
   assert.ok(core.warnings().some((w) => w.code === 'W_REPROMPT_POLICY'));
+});
+
+
+// ── 턴 타이밍 정책 배선 (§5.1·§13-3) ────────────────────────────────────────
+// 대기 시간을 채널이 각자 정하면 같은 시나리오가 채널마다 다른 순간에 무입력으로 떨어진다.
+test('타이밍 정책을 주면 입력 대기 단계에 대기·끼어들기 값이 실려 나간다', b, async () => {
+  const { core } = build({
+    flows: [flowRetry],
+    timing: { inputTimeoutMsByKind: { Collect: 5000 }, extraMsByAttempt: [0, 3000], bargeInByKind: { Collect: false } },
+  });
+  const first = await core.start(req({ flowId: 'retry' }));
+  assert.equal(first.steps.at(-1).inputTimeoutMs, 5000);
+  assert.equal(first.steps.at(-1).bargeIn, false);
+  const r = await core.send('i_test1', { input: { kind: 'timeout' } });
+  assert.equal(r.steps.at(-1).inputTimeoutMs, 8000);
+});
+
+test('정책을 주지 않으면 대기 값을 만들지 않는다(§13-3)', b, async () => {
+  const { core } = build({ flows: [flowRetry] });
+  const first = await core.start(req({ flowId: 'retry' }));
+  assert.equal('inputTimeoutMs' in first.steps.at(-1), false);
+});
+
+test('0ms 대기 같은 설정 실수는 등록 자체를 거부한다', b, () => {
+  assert.throws(
+    () => build({ flows: [flowRetry], timing: { inputTimeoutMsByKind: { Collect: 0 } } }),
+    /턴 타이밍 정책 거부/,
+  );
+});
+
+test('적용되지 않는 노드 종류를 선언하면 거부한다 — 적용 안 되는 선언은 오해를 부른다', b, () => {
+  assert.throws(
+    () => build({ flows: [flowRetry], timing: { inputTimeoutMsByKind: { Say: 3000 } } }),
+    /턴 타이밍 정책 거부/,
+  );
+});
+
+test('빈 타이밍 선언은 거부가 아니라 경고로 드러난다', b, () => {
+  const { core } = build({ flows: [flowRetry], timing: {} });
+  assert.ok(core.warnings().some((w) => w.code === 'W_TURN_TIMING'));
 });

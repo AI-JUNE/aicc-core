@@ -34,7 +34,8 @@ export type ConformanceCheckId =
   | 'END_REPEATABLE'      // 종료가 두 번 와도(재시도·중복 이벤트) 되는가
   | 'TIMEOUT_BUDGET'      // 각 호출이 예산 안에 정착하는가
   | 'PII_SAFE_ECHO'       // 오류 메시지에 개인정보 원문을 되뱉지 않는가(§10.3)
-  | 'FLOW_SUPPORT';       // 선언한 능력으로 대상 Flow 를 렌더할 수 있는가(§5.3)
+  | 'FLOW_SUPPORT'        // 선언한 능력으로 대상 Flow 를 렌더할 수 있는가(§5.3)
+  | 'TURN_HINTS';         // 재시도·타이밍 힌트가 붙은 단계를 흡수하는가(§5.1)
 
 export interface ConformanceCheck {
   id: ConformanceCheckId;
@@ -73,6 +74,19 @@ const PII_PROBE = '010-1234-5678';
 
 function step(channel: ChannelKind, text: string): RenderedStep {
   return { channel, nodeId: 'n_probe', kind: 'Say', text };
+}
+
+/**
+ * §5.1 재시도·타이밍 힌트가 붙은 입력 대기 단계. Core 는 정책이 선언된 테넌트에서
+ * 이 필드들을 실어 보낸다 — 단계 모양을 엄격히 검사하는 포트는 여기서 깨진다.
+ */
+function hintedStep(channel: ChannelKind): RenderedStep {
+  return {
+    channel, nodeId: 'n_probe_retry', kind: 'Collect', text: '다시 말씀해 주세요.',
+    reprompt: { reason: 'no_input', attempt: 2, exhausted: false },
+    inputTimeoutMs: 7000,
+    ...(channel === 'voice' ? { bargeIn: true, acceptDtmf: true } : {}),
+  };
 }
 
 type BudgetOutcome<T> = { ok: true; value: T } | { ok: false; error: unknown } | { ok: false; timeout: true };
@@ -288,7 +302,27 @@ export async function runChannelConformance(opts: ConformanceOptions): Promise<C
     });
   }
 
-  // 10) 시나리오 렌더 가능성(§5.3) — 능력 선언과 실제 시나리오가 어긋나면 배포 후에야 드러난다.
+  // 10) 재시도·타이밍 힌트(§5.1) — 정책이 선언된 테넌트에서는 단계에 필드가 더 붙는다.
+  //     힌트를 모르는 포트는 무시해도 되지만, 모양이 다르다고 예외를 던지거나 입력을 고치면
+  //     정책을 켜는 순간(코드 배포 없이 설정만 바꿔도) 전 통화가 깨진다.
+  {
+    const steps: RenderedStep[] = [hintedStep(channel)];
+    const snapshot = JSON.stringify(steps);
+    const r = await withBudget(() => port.present('i_probe_hint', steps), budget);
+    const unchanged = JSON.stringify(steps) === snapshot;
+    add({
+      id: 'TURN_HINTS',
+      passed: r.ok === true && unchanged,
+      severity: 'error',
+      messageKo: r.ok === true && unchanged
+        ? '재시도·대기시간 힌트가 붙은 단계를 흡수합니다(§5.1).'
+        : !unchanged
+          ? '힌트가 붙은 단계를 present 가 변형했습니다. 같은 배열이 §8.1 이벤트·이력에 쓰입니다.'
+          : `재시도·대기시간 힌트가 붙은 단계에서 실패했습니다: ${'timeout' in r ? '예산 초과' : errText((r as { error: unknown }).error)}. 모르는 필드는 무시하세요 — 정책을 켜는 순간 전 통화가 깨집니다.`,
+    });
+  }
+
+  // 11) 시나리오 렌더 가능성(§5.3) — 능력 선언과 실제 시나리오가 어긋나면 배포 후에야 드러난다.
   if (!opts.flows || opts.flows.length === 0) {
     add({ id: 'FLOW_SUPPORT', passed: true, skipped: true, severity: 'warning', messageKo: 'flows 미지정 — 시나리오 렌더 가능 여부를 검사하지 않았습니다(§5.3).' });
   } else {

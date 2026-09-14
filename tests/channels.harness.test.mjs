@@ -243,7 +243,7 @@ test('JSON 출력: 판정·검사목록을 담고 임의 점수를 만들지 않
   assert.equal(j.adapter, 'callbot');
   assert.equal(j.channel, 'voice');
   assert.equal(j.timeoutMs, 500);
-  assert.equal(j.checks.length, 10);
+  assert.equal(j.checks.length, 11);
   assert.ok(!('score' in j) && !('grade' in j));
 });
 

@@ -159,6 +159,29 @@
         `tests/channels.bridgeTranscript.test.mjs`(19건) · `tests/clients.python.test.mjs`(7건) ·
         CI `python bridge client (self-check)` 단계 ·
         안정 계약 경로 `aicc-core/channels/bridgeTranscript`·`aicc-core/transcript-runner` 등록
+      · Core 측 완료(8): **음성 턴 규칙의 Core 귀속(2026-09-14)** — 세 저장소가 Core 를 소비하기
+        시작했지만, 정작 음성에서 가장 자주 갈라지는 두 가지는 여전히 각 저장소에 있었다:
+        **실패했을 때 무엇을 말할지**와 **얼마나 기다렸다가 실패로 볼지**. 둘 다 시나리오의 일부인데
+        시나리오 밖에 있었다 — §2 가 지적한 이중 관리가 문안과 숫자의 형태로 남아 있던 셈이다.
+        - 재프롬프트(`src/flow/reprompt.ts`): 실패 원인을 **무입력·저신뢰·불일치** 셋으로 가른다.
+          셋을 굳이 나눈 이유는 필요한 다음 말이 서로 다르기 때문이다 — 침묵한 사람에게
+          "잘 못 알아들었습니다"가 나가면 두 번째 시도도 같은 이유로 실패한다. 원인별·시도별
+          사다리를 두되 **사다리를 다 쓰면 `exhausted` 로 드러낸다**(같은 말을 조용히 반복하면
+          잘못된 재시도 설정이 영영 안 보인다). DTMF 안내는 음성 채널에서만 켜지고(§5.1),
+          화면으로 전환된 뒤에는 켜지지 않는다(§5.2).
+        - 턴 타이밍(`src/flow/timing.ts`): 입력 대기(ms)·재시도 가산·끼어들기 허용을 노드 종류별로
+          선언한다. **0ms 대기와 적용되지 않는 노드 종류 선언은 등록 자체를 거부한다** —
+          전자는 모든 턴을 즉시 무입력으로 떨어뜨리고, 후자는 "설정했는데 왜 안 되지"로 끝난다.
+        두 모듈 모두 **기본값을 만들지 않는다**(§13-3): 3초든 8초든, "다시 말씀해 주세요"든
+        Core 가 정할 근거가 없다(회선·상품·연령대·고객사 화법에 따라 다르다). 정책을 주지 않으면
+        동작은 종전과 완전히 같고, 달라지는 것은 **선언하면 한 곳에서 선언된다**는 점뿐이다.
+        채널 경계에는 적합성 검사 `TURN_HINTS` 를 추가했다 — 정책을 켜는 일은 코드 배포가 아니라
+        설정 변경이므로, 모르는 필드를 보고 예외를 던지거나 단계를 고쳐 쓰는 포트는 **설정을 바꾸는
+        순간 전 통화를 깨뜨린다**. 그 구현을 CI에서 미리 잡는다.
+        근거: `src/flow/reprompt.ts` · `src/flow/timing.ts` · `src/flow/runner.ts`(배선) ·
+        `src/channels/runtime.ts`(정책 주입·거부·경고) · `src/channels/conformance.ts`(`TURN_HINTS`) ·
+        `tests/flow.reprompt.test.mjs`(26건) · `tests/flow.timing.test.mjs`(20건) ·
+        `tests/channels.runtime.test.mjs`(24건) · `tests/channels.conformance.test.mjs`(21건)
       · 남은 것: **Callbot 저장소 쪽 배선** — 클라이언트 코드는 더 이상 쓸 것이 없다(위 참조 구현을 복사한다).
         남은 것은 저장소 결정 사항이다: 저장소가 zip·문서 중심이라 `voice-agent/agent.py` 가 이 클라이언트를
         어느 지점에서 부를지(현행 시나리오 코드 대체 범위)와 CI 단계를 둘 곳을 **사람이 정해야 한다**,
