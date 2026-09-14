@@ -182,9 +182,26 @@
         `src/channels/runtime.ts`(정책 주입·거부·경고) · `src/channels/conformance.ts`(`TURN_HINTS`) ·
         `tests/flow.reprompt.test.mjs`(26건) · `tests/flow.timing.test.mjs`(20건) ·
         `tests/channels.runtime.test.mjs`(24건) · `tests/channels.conformance.test.mjs`(21건)
-      · 남은 것: **Callbot 저장소 쪽 배선** — 클라이언트 코드는 더 이상 쓸 것이 없다(위 참조 구현을 복사한다).
-        남은 것은 저장소 결정 사항이다: 저장소가 zip·문서 중심이라 `voice-agent/agent.py` 가 이 클라이언트를
-        어느 지점에서 부를지(현행 시나리오 코드 대체 범위)와 CI 단계를 둘 곳을 **사람이 정해야 한다**,
+      · Core 측 완료(9): **Callbot 훅 어댑터(2026-09-14)** — "어느 지점에서 부를지"의 절반은 사람의
+        결정이 아니라 형태의 문제였다. `agent.py` 가 가진 것은 세션이 아니라 훅 셋(call_start·transcript·
+        call_end)이고, 통화 둘이 겹치면 훅은 섞여서 온다. 참조 클라이언트를 복사해 넣는 것만으로는
+        각 훅에서 "어느 통화의 세션인가·이미 끝났나·브리지가 죽었는데 끊어야 하나"를 저장소가 정하게
+        되고, 그 판단은 각자 다르게 틀린다. 그래서 훅 모양 그대로 받는 어댑터를 Core 쪽에 두었다
+        (`clients/python/aicc_callbot.py`, 표준 라이브러리만). 지키는 것(전부 실제 python3 로 검증):
+        **기본 OFF** — `AICC_CORE_ENABLED`+Core 경로+모듈+Flow id 가 모두 있어야 켜지고, 빠지면 이유를
+        남기고 꺼진다(Flow id 기본값 없음, §13-3) · **call_id 격리**(전역 "현재 통화" 금지 — 겹친 통화가
+        남의 상태를 읽는다) · **고객 발화만 전송**(봇 발화가 고객 입력으로 시나리오를 밀지 않게) ·
+        **브리지 사망이 통화를 끊지 않는다**(§9.3 — degraded 표시 + on_error 로 코드만 1회 보고, 이후 훅은
+        즉시 None) · **종료 멱등 + close() 가 열린 통화를 먼저 닫는다**(누수는 요금으로 나타난다) ·
+        끝난 통화의 지연 전사·모르는 통화·빈 발화는 보내지 않고 건수로만 남긴다 · print·logging 없음(§10.3) ·
+        asyncio 래퍼는 같은 통화의 훅을 도착 순서대로 처리한다(겹치면 상태가 갈라진다).
+        Callbot 저장소에는 `voice-agent/aicc/` 로 복사하고 배선 예시를 `README_AICC_CORE_연동.md` 에
+        적었다 — `agent.py` 는 건드리지 않았다(아래 결정 사항).
+        근거: `clients/python/aicc_callbot.py` · `tests/clients.callbot.test.mjs`(9건) ·
+        CI `python callbot hooks (self-check)` 단계
+      · 남은 것: **Callbot 저장소 쪽 배선** — 코드는 훅마다 한 줄(README 참조)이며 더 쓸 것이 없다.
+        남은 것은 저장소 결정 사항이다: 현행 LLM 툴(welfare_apply 등)과 Core 시나리오의 역할 분담
+        (어느 쪽이 화면 노드를 밀 것인가)·실운영 Core 모듈·Flow id 를 **사람이 정해야 한다**,
         D-ARS 루트 CI 워크플로에 적합성 단계 추가(저장소 루트 `.github/workflows` 접근 필요),
         챗봇 CI 게이트 활성화를 위한 `AICC_CORE_TOKEN` 등록 **[승인 필요]**, 실회선·실메신저 연결 **[승인 필요]**
 - [x] **이벤트 버스 영속화 어댑터** — 추가 전용 이벤트 원장(`EventLog`)·원장 기반 멱등 저장소·
