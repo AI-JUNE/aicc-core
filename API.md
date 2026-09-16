@@ -160,7 +160,8 @@ const next  = await core.send(first.interactionId, { input: { kind: 'text', text
 | 모듈 | 계약 | 주요 export |
 |---|---|---|
 | `adapters/index.ts` | STT·TTS·LLM·임베딩 인터페이스 + 국외이전 가드 | `EngineSet`, `SttAdapter`, `LlmAdapter`, `assertResidency` |
-| `adapters/http.ts` | HTTP 실엔진 어댑터. 기본 `dry_run`, live 는 approvalRef+비밀값 주입 필요 **[승인 필요]** | `createHttpEngineSet`, `HttpEngineConfig`, `activationFromEnv` |
+| `adapters/http.ts` | HTTP 실엔진 어댑터. 기본 `dry_run`, live 는 approvalRef+비밀값 주입 필요 **[승인 필요]** | `createHttpEngineSet`, `createEngineTransport`, `HttpEngineConfig`, `activationFromEnv`, `EngineError` |
+| `adapters/openaiCompat.ts` | OpenAI 호환 규격(`chat/completions`·`embeddings`) 흡수. 게이트·비밀값·타임아웃은 `http.ts` 전송 계층이 책임지고, 여기서는 요청 조립·응답 해석만 한다. 모델 id 기본값 없음(§13-3), tool_calls·스트리밍은 `E_PROTOCOL` 로 드러낸다. 기본 `dry_run` **[실호출은 승인]** | `createOpenAiCompatEngines`, `parseChatCompletion`, `parseEmbeddings`, `OPENAI_COMPAT_PATHS`, `OpenAiCompatConfig` |
 | `adapters/sim.ts` | 개발·테스트용 시뮬레이터 | `simStt`, `simTts`, `simLlm`, `simEmbedding` |
 | `integration/connector.ts` | 외부 업무 시스템 커넥터 정의·요청 조립·실패 판정 | `validateConnector`, `buildRequest`, `redactRequest`, `applyResponse`, `decideOnFailure` |
 
@@ -207,6 +208,7 @@ const next  = await core.send(first.interactionId, { input: { kind: 'text', text
 | `ops/health.ts` | liveness/readiness 분리, 프로브 병렬·개별 예산 | `checkHealth`, `livenessReport`, `approvalPendingProbe` |
 | `ops/backup.ts` | 백업·복구와 **복구 리허설**(RUNBOOK.md 참조) | `createSnapshot`, `verifySnapshot`, `serializeSnapshot`, `parseSnapshot`, `restoreSnapshot`, `runRecoveryDrill` |
 | `ops/packageSurface.ts` | 채널이 부르는 import 경로(package.json exports) 고정·검증. 배포는 **[승인 필요]** | `CHANNEL_SUBPATHS`, `expectedExports`, `validatePackageSurface`, `surfaceOk`, `formatSurfaceReport` |
+| `ops/clientDrift.ts` | 파이썬 참조 클라이언트 복사본(Callbot `voice-agent/aicc/`) 드리프트 판정. 줄끝 차이는 경고, 내용 차이·누락은 실패, 대상을 못 읽으면 판정보류(§13-3). 실행기 `scripts/client-drift.mjs` | `compareClientCopies`, `parseDriftArgs`, `formatDriftReport`, `DRIFT_USAGE_KO` |
 | `ops/coverage.ts` | 커버리지 실측 요약·임계값 판정. 목표치를 코드에 두지 않는다(§13-3) | `summarizeCoverage`, `evaluateCoverage`, `thresholdsFromEnv`, `percentOf`, `weakestFiles`, `formatCoverageReport`, `coverageToJson`, `COVERAGE_EXIT_CODE` |
 | `obs/logger.ts` | 고정 필드 구조화 로깅·차단 키·마스킹 경유 | `createLogger`, `createRequestIdFactory`, `createMemorySink` |
 | `obs/errorMonitor.ts` | 던져진 값 정규화·fingerprint·중복 억제 | `createErrorMonitor`, `normalizeError`, `installGlobalCapture`, `resolveDsnConfig` |
