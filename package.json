@@ -33,6 +33,7 @@
     "conformance": "node scripts/channel-conformance.mjs",
     "bridge": "node scripts/channel-bridge.mjs",
     "transcript": "node scripts/bridge-transcript.mjs",
+    "drift": "node scripts/client-drift.mjs",
     "surface": "node --test \"tests/ops.packageSurface.test.mjs\""
   },
   "devDependencies": {

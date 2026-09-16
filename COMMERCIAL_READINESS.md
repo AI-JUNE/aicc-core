@@ -50,7 +50,21 @@
       근거: `src/ops/backup.ts` · `scripts/recovery-drill.mjs` · `RUNBOOK.md`(리허설 기록은 스크립트 실행
       결과를 그대로 붙인 것 — 사람이 적은 수치가 아니다, §13-3) · `tests/ops.backup.test.mjs`(36건).
       운영 DB·오브젝트 스토리지 연결과 운영 데이터 리허설은 **[승인 필요]**
-- [ ] **약관·개인정보 처리방침 확정본 반영** (현재 초안, 문안은 사람이 확정)
+- [ ] **약관·개인정보 처리방침 확정본 반영** (현재 초안, 문안은 사람이 확정 **[승인 필요]**)
+      · Core 측 완료(2026-09-16): 문안이 오기 전에 코드가 막아야 할 것은 **초안이 확정본 자리에 나가는 일**이다 —
+        사고는 문안이 틀려서가 아니라 "초안인 줄 몰랐다"에서 나고, 그 문서로 받은 동의는 동의가 아니다.
+        `src/legal/documents.ts`: 문서는 (종류·테넌트·언어·버전)으로 식별되는 추가 전용 등록부에 쌓이고,
+        **확정(final)은 승인 근거+시행일+본문+본문 해시가 모두 있어야** 한다(하나라도 없으면 초안). 확정 뒤
+        본문이 바뀌면 해시 불일치로 거부되고, 자리표시자(`{{…}}`·`[TODO]`·`[확인 필요]`·`____`)가 남은 문서는
+        확정할 수 없다. 조회는 **확정본만** 돌려준다 — 초안·시행일 전·다른 언어·다른 테넌트 문서는 어떤 조건에서도
+        나가지 않고(§11.1), 없으면 이유(초안만 N건 [승인 필요])를 돌려준다. 수락 기록은 버전·해시를 함께 남겨
+        **개정되면 이전 수락은 `stale`** 로 판정된다("예전에 동의했으니 됐다"를 코드가 허용하지 않는다).
+        주체 참조에 원문 개인정보가 오면 거부, 승인자·증빙 참조는 저장 경로에서 한 번 마스킹(§10.3).
+        기본 언어·기본 시행일·기본 문안을 만들지 않는다(§13-3). `legalReadiness` 가 종류×언어별 확정 여부를
+        그대로 적어 이 항목의 근거가 된다 — 초안만 있는 종류는 준비됨이 아니다.
+        근거: `src/legal/documents.ts` · `tests/legal.documents.test.mjs`(22건)
+      · 남은 것: 약관·처리방침 **문안 확정 + 승인 근거(approvalRef)·시행일** — 사람이 정한다 **[승인 필요]**,
+        포털 화면(문서 표시·수락 UI)은 포털 저장소 과제
 - [x] **테스트 CI 실행** — 타입 검증 + 테스트 전량 + 복구 리허설 + 채널 적합성 스위트를 push·PR마다 실행.
       리허설 종료코드(0/1/2)를 그대로 게이트로 쓰며 판정보류도 통과로 넘기지 않는다.
       근거: `.github/workflows/ci.yml`. 실엔진·실회선·실 DB 에 붙지 않는다(모두 dry_run 기본값)
@@ -199,11 +213,28 @@
         적었다 — `agent.py` 는 건드리지 않았다(아래 결정 사항).
         근거: `clients/python/aicc_callbot.py` · `tests/clients.callbot.test.mjs`(9건) ·
         CI `python callbot hooks (self-check)` 단계
+      · Core 측 완료(10): **OpenAI 호환 규격 어댑터 + 복사본 드리프트 검사(2026-09-16)** —
+        `http.ts` 의 중립 JSON 규약을 말하는 엔진은 세상에 없다. 실제로 붙을 온프렘 sLLM 서빙(vLLM·Ollama·TGI)과
+        LLM API 대부분이 말하는 것은 `chat/completions`·`embeddings` 형태이므로, 그 형태를
+        `src/adapters/openaiCompat.ts` 한 곳에서 흡수한다 — 채널 저장소가 각자 `choices[0].message.content` 를
+        파고 각자 다르게 틀리는 일을 막는다. 게이트·비밀값·타임아웃·오류 분류는 `createEngineTransport` 가
+        책임지고 여기서 복사하지 않는다. 모델 id·온도·토큰 상한 기본값 없음(§13-3), tool_calls·스트리밍 응답은
+        빈 문자열이 아니라 `E_PROTOCOL` 로 드러낸다(§9.3). STT/TTS(멀티파트·바이너리)는 범위 밖.
+        기본 `dry_run`, `plan()` 으로 실호출 없이 요청을 확인한다 **[실호출은 승인]**.
+        파이썬 참조 클라이언트는 Callbot 에 **복사**되어 살므로 Core 가 고쳐도 저쪽은 그대로다 — 그 어긋남은
+        컴파일 오류가 아니라 통화 중 다른 동작으로 나타난다. `src/ops/clientDrift.ts` + `scripts/client-drift.mjs`
+        가 두 쪽을 대조한다(줄끝 차이는 경고, 내용 차이·누락은 실패, 대상을 못 읽으면 판정보류 §13-3).
+        **2026-09-16 실측(도구 출력 그대로)**: `참조 클라이언트 복사본 대조: 통과` ·
+        `aicc_bridge.py: 동일 [a24c2431b747 → a24c2431b747]` · `aicc_callbot.py: 동일 [18f308445966 → 18f308445966]`.
+        CI 에는 게이트 규약 자체점검(같은 디렉터리 0 · 대상 미존재 2)만 있다 — Callbot 저장소가 CI 에 없기 때문이다.
+        근거: `src/adapters/openaiCompat.ts` · `tests/adapters.openaiCompat.test.mjs` · `src/ops/clientDrift.ts` ·
+        `tests/ops.clientDrift.test.mjs` · CI `client drift runner (self-check)` 단계 · `API.md` 반영
+      · D-ARS 루트 CI 워크플로 적합성 단계: **완료** — `4. D-ARS/.github/workflows/ci.yml` 에 Core 체크아웃 +
+        `conformance:aicc` 단계가 있다(토큰 없으면 건너뛰며 통과로 적지 않음)
       · 남은 것: **Callbot 저장소 쪽 배선** — 코드는 훅마다 한 줄(README 참조)이며 더 쓸 것이 없다.
         남은 것은 저장소 결정 사항이다: 현행 LLM 툴(welfare_apply 등)과 Core 시나리오의 역할 분담
         (어느 쪽이 화면 노드를 밀 것인가)·실운영 Core 모듈·Flow id 를 **사람이 정해야 한다**,
-        D-ARS 루트 CI 워크플로에 적합성 단계 추가(저장소 루트 `.github/workflows` 접근 필요),
-        챗봇 CI 게이트 활성화를 위한 `AICC_CORE_TOKEN` 등록 **[승인 필요]**, 실회선·실메신저 연결 **[승인 필요]**
+        챗봇·D-ARS CI 게이트 활성화를 위한 `AICC_CORE_TOKEN` 등록 **[승인 필요]**, 실회선·실메신저 연결 **[승인 필요]**
 - [x] **이벤트 버스 영속화 어댑터** — 추가 전용 이벤트 원장(`EventLog`)·원장 기반 멱등 저장소·
       JSONL 직렬화/부분손상 복구·커서 기반 재전송·무결성 점검.
       근거: `src/events/store.ts` · `tests/events.store.test.mjs`(16건).

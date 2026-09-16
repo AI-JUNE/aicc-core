@@ -143,6 +143,7 @@ const next  = await core.send(first.interactionId, { input: { kind: 'text', text
 | `core/handoffSummary.ts` | 상담사 이관 요약(§2). 마스킹 완료본만 나간다 | `buildHandoffSummary`, `renderSummaryText`, `attachHandoffSummary` |
 | `core/channelSwitch.ts` | 채널 전환 초대·상환(§5.2) | `issueInvite`, `checkRedeem`, `applyInvite`, `canSwitchToVisual` |
 | `consent/consent.ts` | 동의 상태와 행위 게이팅 | `evaluateConsents`, `gateAction`, `grant`/`deny`/`withdraw` |
+| `legal/documents.ts` | 약관·개인정보 처리방침 버전 관리(§10.1). 확정본은 승인 근거+시행일+본문 해시가 모두 있어야 하고, 조회는 확정본만 돌려준다(초안·미시행·다른 테넌트 문서는 나가지 않음). 수락 기록은 버전·해시를 남겨 개정 시 `stale`. 문안 확정은 **[승인 필요]** | `validateLegalDocument`, `finalizeDocument`, `createLegalRegistry`, `currentDocument`, `recordAcceptance`, `acceptanceStatus`, `legalReadiness`, `formatLegalReadiness`, `PLACEHOLDER_RE` |
 
 ### 시나리오(Flow)
 

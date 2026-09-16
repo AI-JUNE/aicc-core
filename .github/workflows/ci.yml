@@ -88,6 +88,19 @@ jobs:
       - name: python callbot hooks (self-check)
         run: node --test tests/clients.callbot.test.mjs
 
+      # 참조 클라이언트 복사본 드리프트 실행기가 게이트 규약을 지키는지 확인한다.
+      # Callbot 저장소는 이 CI 에 없으므로 실제 대조는 야간 작업(로컬)에서 돌고, 여기서는
+      # (1) 같은 디렉터리끼리는 0, (2) 대상이 없으면 **판정보류(2)** 로 끝나는지만 본다 —
+      # 대조를 못 한 것이 0 으로 새는 순간 이 검사는 없는 것과 같다(§13-3).
+      - name: client drift runner (self-check)
+        run: |
+          node scripts/client-drift.mjs --source clients/python --target clients/python --files aicc_bridge.py,aicc_callbot.py
+          set +e
+          node scripts/client-drift.mjs --source clients/python --target ./.no-such-dir --files aicc_bridge.py,aicc_callbot.py
+          code=$?
+          set -e
+          test "$code" -eq 2 || { echo "대상 미존재가 판정보류(2)가 아니라 $code 로 끝났다"; exit 1; }
+
       # 관리 포털 IA ↔ 화면 매핑 문서는 자료(src/portal/screenMap.ts)에서 생성된다.
       # 손으로 고친 표는 반드시 썩으므로, 생성 결과와 다르면 여기서 멈춘다.
       - name: portal screen map (doc freshness)
