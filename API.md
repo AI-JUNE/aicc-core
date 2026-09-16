@@ -161,8 +161,9 @@ const next  = await core.send(first.interactionId, { input: { kind: 'text', text
 | 모듈 | 계약 | 주요 export |
 |---|---|---|
 | `adapters/index.ts` | STT·TTS·LLM·임베딩 인터페이스 + 국외이전 가드 | `EngineSet`, `SttAdapter`, `LlmAdapter`, `assertResidency` |
-| `adapters/http.ts` | HTTP 실엔진 어댑터. 기본 `dry_run`, live 는 approvalRef+비밀값 주입 필요 **[승인 필요]** | `createHttpEngineSet`, `createEngineTransport`, `HttpEngineConfig`, `activationFromEnv`, `EngineError` |
+| `adapters/http.ts` | HTTP 실엔진 어댑터. 기본 `dry_run`, live 는 approvalRef+비밀값 주입 필요 **[승인 필요]** | `createHttpEngineSet`, `createEngineTransport`, `collectAudio`, `HttpEngineConfig`, `activationFromEnv`, `EngineError` |
 | `adapters/openaiCompat.ts` | OpenAI 호환 규격(`chat/completions`·`embeddings`) 흡수. 게이트·비밀값·타임아웃은 `http.ts` 전송 계층이 책임지고, 여기서는 요청 조립·응답 해석만 한다. 모델 id 기본값 없음(§13-3), tool_calls·스트리밍은 `E_PROTOCOL` 로 드러낸다. 기본 `dry_run` **[실호출은 승인]** | `createOpenAiCompatEngines`, `parseChatCompletion`, `parseEmbeddings`, `OPENAI_COMPAT_PATHS`, `OpenAiCompatConfig` |
+| `adapters/openaiAudio.ts` | OpenAI 호환 **음성** 규격(`audio/transcriptions` 멀티파트 업로드 → JSON, `audio/speech` JSON → 오디오 바이트) 흡수. 멀티파트 조립·바이너리 수신·200 으로 싸인 오류 JSON 거부를 한 곳에서 한다. 모델·음성·언어·포맷 기본값 없음(§13-3), TTS 문장은 마스킹 경유, STT 파일명은 확장자만(§10.3). `duration` 이 올 때만 `stt_audio_ms`(§11.2). 기본 `dry_run` **[실호출은 승인]** | `createOpenAiAudioEngines`, `parseTranscription`, `encodeMultipart`, `audioExtensionOf`, `OPENAI_AUDIO_PATHS`, `OpenAiAudioConfig` |
 | `adapters/sim.ts` | 개발·테스트용 시뮬레이터 | `simStt`, `simTts`, `simLlm`, `simEmbedding` |
 | `integration/connector.ts` | 외부 업무 시스템 커넥터 정의·요청 조립·실패 판정 | `validateConnector`, `buildRequest`, `redactRequest`, `applyResponse`, `decideOnFailure` |
 

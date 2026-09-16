@@ -9,6 +9,9 @@
 | `src/domain/types.ts` | §4·§4.1 | Interaction·Turn·Outcome 판정(24h 재문의 반영) |
 | `src/adapters/index.ts` | §6.2·§13-8 | STT/TTS/LLM 어댑터 인터페이스 + 국외이전 차단 가드(§10.3) |
 | `src/adapters/sim.ts` | — | 시뮬 어댑터(외부 호출 없음). **실엔진 연동은 [승인 필요]** |
+| `src/adapters/http.ts` | §6.2·§9.3·§10.3·§11.2 | 실엔진 전송 계층(승인 게이트·비밀값 참조·타임아웃·오류 분류) + 중립 JSON 규약 어댑터. 기본 `dry_run` **[실호출은 승인 필요]** |
+| `src/adapters/openaiCompat.ts` | §6.2·§13-3 | OpenAI 호환 텍스트 규격(`chat/completions`·`embeddings`) — 온프렘 sLLM 서빙(vLLM·Ollama 등) 연결용 |
+| `src/adapters/openaiAudio.ts` | §6.2·§10.3·§11.2·§13-3 | OpenAI 호환 음성 규격(`audio/transcriptions` 멀티파트·`audio/speech` 바이너리) — 온프렘 Whisper·TTS 서빙 연결용 |
 | `src/flow/types.ts` | §5.3·§6.1 | Flow 노드 6종(Say·Collect·Choice·Confirm·Transfer·Api) + 채널별 렌더러(시나리오 이중 관리 제거) |
 | `src/core/policyGuard.ts` | §10.3 | 주민·카드·계좌·전화 자동 마스킹 |
 | `src/core/session.ts` | §1.2·§5.1 | 세션 생성·채널 합류·턴 기록·폴백 정책 |

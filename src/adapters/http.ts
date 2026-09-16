@@ -51,9 +51,37 @@ export class EngineError extends Error {
 }
 
 // ── 전송 계층 추상 (테스트·다른 런타임에서 교체 가능) ─────────────────────────
-export interface HttpResponseLike { ok: boolean; status: number; text(): Promise<string> }
-export interface HttpRequestInitLike { method: string; headers: Record<string, string>; body: string; signal?: AbortSignal }
+export interface HttpResponseLike {
+  ok: boolean;
+  status: number;
+  text(): Promise<string>;
+  /** 바이너리 응답(TTS 오디오) 수신용. 없으면 바이너리 요청은 E_PROTOCOL 로 끝난다. */
+  arrayBuffer?(): Promise<ArrayBuffer>;
+  /** 응답 content-type 판정용. 없으면 형식을 검사하지 않고 넘기지 않는다 — 바이너리 요청은 헤더가 있어야 통과한다. */
+  headers?: { get(name: string): string | null };
+}
+export interface HttpRequestInitLike {
+  method: string;
+  headers: Record<string, string>;
+  /** JSON 규약은 문자열, 멀티파트(STT 오디오)는 바이트다. */
+  body: string | Uint8Array;
+  signal?: AbortSignal;
+}
 export type FetchLike = (url: string, init: HttpRequestInitLike) => Promise<HttpResponseLike>;
+
+/** 전송 본문의 형태. JSON 이 기본이며, 오디오 업로드는 멀티파트, 오디오 수신은 바이너리다. */
+export interface RawRequest {
+  contentType: string;
+  body: string | Uint8Array;
+  /** 기대 응답 형태. `json` 이면 JSON 으로 해석하고, `binary` 면 바이트 그대로 돌려준다. */
+  accept: 'json' | 'binary';
+}
+export interface RawResponse {
+  json?: unknown;
+  bytes?: Uint8Array;
+  contentType?: string;
+  elapsedMs: number;
+}
 
 export interface HttpEnginePaths { stt?: string; tts?: string; llm?: string; embedding?: string }
 
@@ -97,6 +125,7 @@ export interface RequestPlan {
   method: 'POST';
   url: string;
   headers: Record<string, string>;
+  /** JSON 요약. 멀티파트 요청은 바이트 대신 크기·mime 같은 **서술**만 담는다(오디오는 계획에 싣지 않는다). */
   body: Record<string, unknown>;
   activation: Activation;
   residency: HttpEngineConfig['residency'];
@@ -215,9 +244,15 @@ export function parseEmbeddingResponse(raw: unknown, expected: number): number[]
 export interface EngineTransport {
   readonly activation: Activation;
   /** 검토용 요청 계획 — 실호출 없이 "무엇을 보낼 것인가"를 그대로 보여준다. 인증 값은 담기지 않는다. */
-  plan(component: EngineComponent, path: string, body: Record<string, unknown>): RequestPlan;
-  /** 실제 전송. dry_run 에서는 네트워크에 닿기 전에 [승인 필요]로 거절한다. */
+  plan(component: EngineComponent, path: string, body: Record<string, unknown>, contentType?: string): RequestPlan;
+  /** 실제 전송(JSON 규약). dry_run 에서는 네트워크에 닿기 전에 [승인 필요]로 거절한다. */
   post(component: EngineComponent, path: string, body: Record<string, unknown>): Promise<{ json: unknown; elapsedMs: number }>;
+  /**
+   * 실제 전송(임의 본문·임의 응답). 멀티파트 업로드·바이너리 수신이 필요한 음성 규격용이다.
+   * 게이트·비밀값·타임아웃·오류 분류는 post 와 완전히 같다 — 한 함수(`send`)가 둘 다 처리한다.
+   * `planBody` 는 dry_run 거절 사유에 실리는 요약이다(바이트가 아니라 서술).
+   */
+  send(component: EngineComponent, path: string, req: RawRequest, planBody: Record<string, unknown>): Promise<RawResponse>;
 }
 
 /** 어댑터 공통 설정 검증 + 전송기. 어댑터는 여기서 나온 plan/post 만 쓴다. */
@@ -240,27 +275,30 @@ export function createEngineTransport(cfg: EngineTransportConfig): EngineTranspo
   }
   const clock = cfg.clock ?? (() => Date.now());
 
-  const plan = (component: EngineComponent, path: string, body: Record<string, unknown>): RequestPlan => ({
+  const plan = (
+    component: EngineComponent, path: string, body: Record<string, unknown>, contentType = 'application/json',
+  ): RequestPlan => ({
     method: 'POST',
     url: joinUrl(cfg.baseUrl, path),
-    headers: { 'content-type': 'application/json', authorization: AUTH_PLACEHOLDER(cfg.apiKeyEnv) },
+    headers: { 'content-type': contentType, authorization: AUTH_PLACEHOLDER(cfg.apiKeyEnv) },
     body,
     activation: cfg.activation,
     residency: cfg.residency,
   });
 
-  async function post(
+  async function send(
     component: EngineComponent,
     path: string,
-    body: Record<string, unknown>,
-  ): Promise<{ json: unknown; elapsedMs: number }> {
+    req: RawRequest,
+    planBody: Record<string, unknown>,
+  ): Promise<RawResponse> {
     if (cfg.activation !== 'live') {
       throw new EngineError('E_APPROVAL_REQUIRED', component,
         `[승인 필요] ${cfg.name} 엔진 실호출은 승인 전까지 비활성입니다. 계획만 확인하세요(plan()).`,
-        { plan: plan(component, path, body) });
+        { plan: plan(component, path, planBody, req.contentType) });
     }
-    const send = fetchImpl as FetchLike;
-    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    const doFetch = fetchImpl as FetchLike;
+    const headers: Record<string, string> = { 'content-type': req.contentType };
     if (cfg.apiKeyEnv) {
       const secret = cfg.resolveSecret?.(cfg.apiKeyEnv);
       if (!secret) {
@@ -272,19 +310,37 @@ export function createEngineTransport(cfg: EngineTransportConfig): EngineTranspo
     const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
     const startedMs = clock();
     try {
-      const res = await send(joinUrl(cfg.baseUrl, path), {
-        method: 'POST', headers, body: JSON.stringify(body), signal: controller.signal,
+      const res = await doFetch(joinUrl(cfg.baseUrl, path), {
+        method: 'POST', headers, body: req.body, signal: controller.signal,
       });
       const elapsedMs = clock() - startedMs;
-      const raw = await res.text();
       if (!res.ok) {
         // 본문을 그대로 싣지 않는다 — 엔진 오류 본문에 발화가 되돌아오는 사례가 있다(§10.3).
         // 429·5xx 는 재시도 가능으로 표시한다(상위 폴백 §9.3 이 분기할 근거).
         const retryable = res.status === 429 || res.status >= 500;
         throw new EngineError('E_HTTP', component, `엔진 응답 오류(status ${res.status})`, { status: res.status, elapsedMs, retryable });
       }
+      const contentType = res.headers?.get('content-type') ?? undefined;
+      if (req.accept === 'binary') {
+        // 2xx 인데 JSON 이 오는 경우(오류를 200 으로 싸는 서버)를 오디오로 재생하면 안 된다 — 형식으로 거른다.
+        if (!contentType) {
+          throw new EngineError('E_PROTOCOL', component, '바이너리 응답에 content-type 이 없어 형식을 확인할 수 없습니다.', { elapsedMs });
+        }
+        if (/^(application\/json|text\/)/i.test(contentType)) {
+          throw new EngineError('E_PROTOCOL', component, `바이너리를 기대했으나 ${contentType.split(';')[0]} 이 왔습니다.`, { elapsedMs, contentType });
+        }
+        if (typeof res.arrayBuffer !== 'function') {
+          throw new EngineError('E_PROTOCOL', component, '전송 구현이 바이너리 응답(arrayBuffer)을 지원하지 않습니다.', { elapsedMs });
+        }
+        const bytes = new Uint8Array(await res.arrayBuffer());
+        if (bytes.length === 0) throw new EngineError('E_PROTOCOL', component, '바이너리 응답이 비어 있습니다.', { elapsedMs });
+        return { bytes, contentType, elapsedMs };
+      }
+      const raw = await res.text();
       try {
-        return { json: JSON.parse(raw), elapsedMs };
+        const out: RawResponse = { json: JSON.parse(raw), elapsedMs };
+        if (contentType) out.contentType = contentType;
+        return out;
       } catch {
         throw new EngineError('E_PROTOCOL', component, '엔진 응답을 JSON으로 해석할 수 없습니다.', { elapsedMs });
       }
@@ -299,7 +355,48 @@ export function createEngineTransport(cfg: EngineTransportConfig): EngineTranspo
     }
   }
 
-  return { activation: cfg.activation, plan, post };
+  async function post(
+    component: EngineComponent,
+    path: string,
+    body: Record<string, unknown>,
+  ): Promise<{ json: unknown; elapsedMs: number }> {
+    const r = await send(component, path, { contentType: 'application/json', body: JSON.stringify(body), accept: 'json' }, body);
+    return { json: r.json, elapsedMs: r.elapsedMs };
+  }
+
+  return { activation: cfg.activation, plan, post, send };
+}
+
+// ── 오디오 수집 (STT 어댑터 공통) ─────────────────────────────────────────────
+/**
+ * 스트림 청크를 한 덩어리로 모은다. 상한은 **모으는 도중** 검사해 초과분을 메모리에 쌓지 않는다.
+ * 빈 오디오는 보내지 않고(무입력은 Flow 의 재프롬프트가 다룬다, §5.1), 청크 간 mime 이 섞이면 거절한다 —
+ * 섞인 채 보내면 엔진이 앞 형식으로 뒤 청크를 해석해 조용히 틀린 전사가 나온다.
+ */
+export async function collectAudio(
+  audio: AsyncIterable<AudioChunk>,
+  maxAudioBytes?: number,
+): Promise<{ bytes: Uint8Array; mime: string }> {
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  let mime = '';
+  for await (const c of audio) {
+    if (c.data.length === 0) continue;
+    if (mime === '') mime = c.mime;
+    else if (c.mime !== mime) {
+      throw new EngineError('E_INPUT', 'stt', `청크 mime 이 섞였습니다: ${mime} 와 ${c.mime}`);
+    }
+    total += c.data.length;
+    if (maxAudioBytes !== undefined && total > maxAudioBytes) {
+      throw new EngineError('E_LIMIT', 'stt', `오디오 상한 초과: ${total} > ${maxAudioBytes} byte`);
+    }
+    parts.push(c.data);
+  }
+  if (total === 0) throw new EngineError('E_INPUT', 'stt', '빈 오디오는 STT로 보내지 않습니다.');
+  const bytes = new Uint8Array(total);
+  let o = 0;
+  for (const p of parts) { bytes.set(p, o); o += p.length; }
+  return { bytes, mime };
 }
 
 // ── 어댑터 본체 ───────────────────────────────────────────────────────────────
@@ -337,30 +434,11 @@ export function createHttpEngineSet(cfg: HttpEngineConfig): HttpEngineSet {
   const post = (component: EngineComponent, body: Record<string, unknown>) =>
     transport.post(component, requirePath(cfg, component), body);
 
-  async function collectAudio(audio: AsyncIterable<AudioChunk>): Promise<{ bytes: Uint8Array; mime: string }> {
-    const parts: Uint8Array[] = [];
-    let total = 0;
-    let mime = '';
-    for await (const c of audio) {
-      if (mime === '') mime = c.mime;
-      total += c.data.length;
-      if (cfg.maxAudioBytes !== undefined && total > cfg.maxAudioBytes) {
-        throw new EngineError('E_LIMIT', 'stt', `오디오 상한 초과: ${total} > ${cfg.maxAudioBytes} byte`);
-      }
-      parts.push(c.data);
-    }
-    if (total === 0) throw new EngineError('E_INPUT', 'stt', '빈 오디오는 STT로 보내지 않습니다.');
-    const bytes = new Uint8Array(total);
-    let o = 0;
-    for (const p of parts) { bytes.set(p, o); o += p.length; }
-    return { bytes, mime };
-  }
-
   const stt: SttAdapter = {
     name: `${cfg.name}-stt`,
     residency: cfg.residency,
     async *stream(audio: AsyncIterable<AudioChunk>): AsyncIterable<SttResult> {
-      const { bytes, mime } = await collectAudio(audio);
+      const { bytes, mime } = await collectAudio(audio, cfg.maxAudioBytes);
       const { json } = await post('stt', { audio_base64: toBase64(bytes), mime });
       const parsed = parseSttResponse(json);
       if (parsed.usage) lastUsage = parsed.usage;

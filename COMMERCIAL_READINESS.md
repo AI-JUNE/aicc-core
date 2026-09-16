@@ -229,6 +229,21 @@
         CI 에는 게이트 규약 자체점검(같은 디렉터리 0 · 대상 미존재 2)만 있다 — Callbot 저장소가 CI 에 없기 때문이다.
         근거: `src/adapters/openaiCompat.ts` · `tests/adapters.openaiCompat.test.mjs` · `src/ops/clientDrift.ts` ·
         `tests/ops.clientDrift.test.mjs` · CI `client drift runner (self-check)` 단계 · `API.md` 반영
+      · Core 측 완료(11): **OpenAI 호환 음성 규격 어댑터(2026-09-16)** — (10)은 텍스트만 흡수했고 음성은
+        "범위 밖"으로 남겼다. 그런데 Callbot 이 실제로 붙어야 하는 엔진은 음성이고, 온프렘 Whisper 서빙·TTS 서버
+        상당수가 말하는 형태는 `audio/transcriptions`(멀티파트 → JSON)·`audio/speech`(JSON → 오디오 바이트)다.
+        JSON 왕복이 아니라 그대로 두면 음성 저장소가 멀티파트 조립과 바이너리 수신을 각자 짜게 되고, 사고는
+        정확히 그 자리에서 난다 — 경계 문자열 충돌, 빈 응답을 재생, **200 으로 싸인 오류 JSON 을 오디오로 재생**.
+        그래서 전송 계층(`http.ts`)에 `send`(임의 본문·JSON/바이너리 수신)를 열고, 그 위에
+        `src/adapters/openaiAudio.ts` 를 얹었다. 게이트·비밀값·타임아웃·오류 분류는 여전히 전송 계층 한 곳이다.
+        지키는 것(전부 테스트로 고정): 모델·음성(voice)·언어·응답 포맷 **기본값 없음**(§13-3) · TTS 문장은 마스킹
+        경유, STT 파일명은 `audio.<ext>` 고정(통화 id·번호가 파일명으로 새지 않게, §10.3) · 오디오 바이트는 계획
+        (plan)·거절 사유에 싣지 않고 크기·mime 만 서술 · 빈 오디오·상한 초과·모르는 mime·**섞인 mime** 은 호출 전
+        거절 · TTS 응답은 content-type 이 오디오일 때만 통과(JSON·텍스트·빈 본문·헤더 부재는 `E_PROTOCOL`) ·
+        `tts_audio_ms` 는 응답에 없으므로 만들지 않고, STT 는 엔진이 `duration` 을 줄 때만 `stt_audio_ms`(§11.2).
+        스트리밍 STT(웹소켓)·실시간 TTS 청크는 범위 밖(한 발화 = 한 요청). 기본 `dry_run` **[실호출은 승인]**.
+        근거: `src/adapters/openaiAudio.ts` · `src/adapters/http.ts`(`send`·`collectAudio`) ·
+        `tests/adapters.openaiAudio.test.mjs`(15건) · `API.md` 반영
       · D-ARS 루트 CI 워크플로 적합성 단계: **완료** — `4. D-ARS/.github/workflows/ci.yml` 에 Core 체크아웃 +
         `conformance:aicc` 단계가 있다(토큰 없으면 건너뛰며 통과로 적지 않음)
       · 남은 것: **Callbot 저장소 쪽 배선** — 코드는 훅마다 한 줄(README 참조)이며 더 쓸 것이 없다.
