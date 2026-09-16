@@ -46,6 +46,8 @@ import type {
 import { CHANNEL_CONTRACT_VERSION } from './contract.ts';
 import { profileFor } from './profiles.ts';
 import type { ChannelActivation } from './basePort.ts';
+import type { RateLimiter } from '../api/rateLimit.ts';
+import { rateLimitKey } from '../api/rateLimit.ts';
 
 /** 프로토콜 버전. 호스트는 hello 응답에서 이 값을 보고 자기 구현과 맞는지 판단한다. */
 export const BRIDGE_PROTOCOL_VERSION = 1;
@@ -60,12 +62,18 @@ export type BridgeErrorCode =
   | 'E_BAD_REQUEST'    // 형태·필수값 위반
   | 'E_UNKNOWN_OP'     // 모르는 op
   | 'E_TENANT_SCOPE'   // 호스트가 다른 테넌트를 주장했다(§11.1)
+  | 'E_RATE_LIMITED'   // 한도 초과 — 재시도 가능 시각을 함께 준다(§9.3·§11.2)
   | 'E_INTERNAL';      // Core 실행 중 예외 — 원문·스택을 노출하지 않는다
 
 export interface BridgeError {
   code: BridgeErrorCode;
   messageKo: string;
+  /** E_RATE_LIMITED 에서만. 계산된 실제 값이며 추정치가 아니다(§13-3). 호스트는 이 시간 전에 재시도하지 않는다. */
+  retryAfterMs?: number;
 }
+
+/** 한도 적용 대상 op. `hello`(버전 협상)와 `end`(세션 정리)는 **절대 막지 않는다** — end 가 막히면 세션이 새고 요금으로 나타난다. */
+export const RATE_LIMITED_OPS: ReadonlySet<BridgeOp> = new Set<BridgeOp>(['start', 'send', 'health']);
 
 export interface BridgeResponse {
   /** 요청 id 그대로. id 를 읽지 못한 줄은 null 이다(호스트가 상관을 못 짓는 대신 무응답은 아니다). */
@@ -129,6 +137,14 @@ export interface BridgeOptions {
   onRecord?: (r: BridgeRecord) => void;
   /** 보관 기록 상한. 장시간 통화에서 메모리가 무한히 늘지 않게 한다. */
   maxRecords?: number;
+  /**
+   * 요청 제한(§9.3·§11.2). 주지 않으면 제한하지 않는다 — 한도 기본값을 코드에 두지 않는다(§13-3).
+   * 키는 테넌트 스코프 + op 로 고정되어 호스트가 바꿀 수 없다(§11.1). 폭주는 악의보다 사고로 온다 —
+   * 호스트의 재시도 루프·잘못 설정된 헬스 샘플 주기가 Core 와 엔진 과금을 함께 끌어내리는 것을 여기서 막는다.
+   */
+  rateLimiter?: RateLimiter;
+  /** op 별 비용. 주지 않으면 전부 1. `send` 는 엔진 호출을 동반하므로 무겁게 셀 수 있다. */
+  rateLimitCost?: Partial<Record<BridgeOp, number>>;
 }
 
 export class BridgeConfigError extends Error {
@@ -204,10 +220,12 @@ const ENTRY_POINTS: ReadonlySet<string> = new Set<EntryPoint>([
 
 class RequestError extends Error {
   readonly code: BridgeErrorCode;
-  constructor(code: BridgeErrorCode, messageKo: string) {
+  readonly retryAfterMs?: number;
+  constructor(code: BridgeErrorCode, messageKo: string, retryAfterMs?: number) {
     super(messageKo);
     this.name = 'RequestError';
     this.code = code;
+    if (retryAfterMs !== undefined) this.retryAfterMs = retryAfterMs;
   }
 }
 
@@ -448,6 +466,30 @@ export function createBridge(opts: BridgeOptions): Bridge {
   if (capabilities.adapter !== opts.adapter) {
     throw new BridgeConfigError(`능력 선언이 어댑터(${opts.adapter})와 어긋납니다.`);
   }
+  if (opts.rateLimitCost) {
+    for (const [op, cost] of Object.entries(opts.rateLimitCost)) {
+      if (!BRIDGE_OPS.has(op)) throw new BridgeConfigError(`rateLimitCost 에 모르는 op 가 있습니다: ${op}`);
+      if (typeof cost !== 'number' || !Number.isFinite(cost) || cost <= 0) {
+        throw new BridgeConfigError(`rateLimitCost.${op} 는 양수여야 합니다.`);
+      }
+    }
+    if (!opts.rateLimiter) throw new BridgeConfigError('rateLimitCost 를 주려면 rateLimiter 도 주어야 합니다.');
+  }
+
+  /** 한도 판정. 제한기가 없으면 통과. 제한기 자체의 예외는 잠그는 쪽이 아니라 통과로 둔다 — 제한기 장애로 통화가 끊기면 안 된다(§9.3). */
+  function enforceLimit(op: BridgeOp): void {
+    if (!opts.rateLimiter || !RATE_LIMITED_OPS.has(op)) return;
+    let decision;
+    try {
+      decision = opts.rateLimiter.check(rateLimitKey(opts.scope, `bridge.${op}`), opts.rateLimitCost?.[op] ?? 1);
+    } catch {
+      return;
+    }
+    if (!decision.allowed) {
+      throw new RequestError('E_RATE_LIMITED',
+        `요청 한도 초과(${op}). ${decision.retryAfterMs}ms 후 재시도하세요.`, decision.retryAfterMs);
+    }
+  }
 
   const records: BridgeRecord[] = [];
   const maxRecords = opts.maxRecords ?? DEFAULT_MAX_RECORDS;
@@ -503,6 +545,7 @@ export function createBridge(opts: BridgeOptions): Bridge {
       const parsed = parseBridgeLine(line, opts.maxLineBytes);
       id = parsed.id;
       op = parsed.op;
+      enforceLimit(parsed.op);
       const result = await dispatch(parsed.op, parsed.body);
       push({ id, op, ok: true, durationMs: finish() });
       return { id, ok: true, result };
@@ -515,7 +558,9 @@ export function createBridge(opts: BridgeOptions): Bridge {
         ? e.message
         : `Core 처리 중 오류가 발생했습니다: ${safeText(e)}`;
       push({ id, op, ok: false, errorCode: code, durationMs: finish() });
-      return { id, ok: false, error: { code, messageKo } };
+      const error: BridgeError = { code, messageKo };
+      if (e instanceof RequestError && e.retryAfterMs !== undefined) error.retryAfterMs = e.retryAfterMs;
+      return { id, ok: false, error };
     }
   }
 
