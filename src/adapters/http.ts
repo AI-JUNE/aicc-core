@@ -12,6 +12,7 @@
 //
 // 프로토콜은 벤더 중립 JSON 규약이다. 벤더 차이는 이 어댑터의 설정·파서에서 흡수하고
 // Core 상위 계층은 §6.2 인터페이스(SttAdapter/TtsAdapter/LlmAdapter/EmbeddingAdapter)만 본다.
+// 실제 벤더 규격(OpenAI 호환 등)은 같은 전송 계층(createEngineTransport) 위에 파서만 바꿔 얹는다 — openaiCompat.ts.
 import type {
   AudioChunk, EmbeddingAdapter, LlmAdapter, LlmMessage, SttAdapter, SttResult, TtsAdapter,
 } from './index.ts';
@@ -27,7 +28,8 @@ export type EngineErrorCode =
   | 'E_LIMIT'               // 입력 상한 초과
   | 'E_TIMEOUT'             // 응답 지연
   | 'E_HTTP'                // 비2xx 응답
-  | 'E_PROTOCOL';           // 응답 형식 위반
+  | 'E_PROTOCOL'            // 응답 형식 위반
+  | 'E_FILTERED';           // 엔진 측 콘텐츠 필터로 응답이 비워짐(삼키지 않고 드러낸다, §9.3)
 
 /** 엔진 오류는 삼키지 않는다(§9.3). 상위 계층이 코드로 분기할 수 있게 코드와 컴포넌트를 함께 싣는다. */
 export class EngineError extends Error {
@@ -55,12 +57,18 @@ export type FetchLike = (url: string, init: HttpRequestInitLike) => Promise<Http
 
 export interface HttpEnginePaths { stt?: string; tts?: string; llm?: string; embedding?: string }
 
-export interface HttpEngineConfig {
+export type EngineComponent = 'stt' | 'tts' | 'llm' | 'embedding';
+
+/**
+ * 전송 계층 설정 — 승인·비밀값·타임아웃·지연 실측처럼 **어느 벤더 규격이든 같아야 하는 것**만 담는다.
+ * 벤더별 어댑터(http.ts 의 중립 규약, openaiCompat.ts 의 OpenAI 호환 규격)는 이 위에 파서만 얹는다.
+ * 이렇게 나눈 이유: 승인 게이트를 어댑터마다 복사하면 언젠가 한 곳이 빠진다.
+ */
+export interface EngineTransportConfig {
   name: string;
   residency: 'domestic' | 'onprem' | 'overseas';
-  /** 예: https://engine.example.co.kr — 경로는 paths 로 분리한다. */
+  /** 예: https://engine.example.co.kr — 경로는 어댑터가 정한다. */
   baseUrl: string;
-  paths: HttpEnginePaths;
   /** 응답 대기 상한(ms). 계약·운영 합의값을 넣는다 — 권장 기본값을 코드에 박지 않는다(§13-3). */
   timeoutMs: number;
   /** 기본 dry_run. live 는 사람이 명시적으로 켠다. */
@@ -72,12 +80,16 @@ export interface HttpEngineConfig {
   /** 이름으로 실제 비밀값을 가져오는 함수. 주입하지 않으면 live 로 만들 수 없다. */
   resolveSecret?: (envName: string) => string | undefined;
   fetchImpl?: FetchLike;
+  /** 지연 실측용 시계(ms). 테스트 결정성을 위해 주입 가능. */
+  clock?: () => number;
+}
+
+export interface HttpEngineConfig extends EngineTransportConfig {
+  paths: HttpEnginePaths;
   /** 외부 엔진으로 나가는 텍스트에 §10.3 마스킹을 적용한다. 기본 true — 끄려면 명시해야 한다. */
   maskOutbound?: boolean;
   /** STT 1회 요청 오디오 상한(byte). 초과 시 호출 전에 거절한다. */
   maxAudioBytes?: number;
-  /** 지연 실측용 시계(ms). 테스트 결정성을 위해 주입 가능. */
-  clock?: () => number;
 }
 
 /** 로그·검토용 요청 계획. 인증 값은 절대 담기지 않는다 — 참조 이름만 남는다(§10.3). */
@@ -198,32 +210,18 @@ export function parseEmbeddingResponse(raw: unknown, expected: number): number[]
   });
 }
 
-// ── 어댑터 본체 ───────────────────────────────────────────────────────────────
+// ── 전송 계층 (승인 게이트·비밀값·타임아웃·오류 분류를 한 곳에) ─────────────────
 
-export type HttpLlmAdapter = LlmAdapter & {
-  completeOnce(messages: LlmMessage[]): Promise<{ text: string; usage?: UsageMetrics; latency: LatencyMs }>;
-};
-
-export interface HttpEngineSet {
-  readonly config: Readonly<HttpEngineConfig>;
+export interface EngineTransport {
   readonly activation: Activation;
-  stt: SttAdapter;
-  tts: TtsAdapter;
-  llm: HttpLlmAdapter;
-  embedding?: EmbeddingAdapter;
-  /** 검토용 요청 계획 — 실호출 없이 "무엇을 보낼 것인가"를 그대로 보여준다. */
-  plan(component: 'stt' | 'tts' | 'llm' | 'embedding', body: Record<string, unknown>): RequestPlan;
-  /** 마지막 호출의 실측 사용량(§11.2). 호출 전에는 undefined. */
-  lastUsage(): UsageMetrics | undefined;
+  /** 검토용 요청 계획 — 실호출 없이 "무엇을 보낼 것인가"를 그대로 보여준다. 인증 값은 담기지 않는다. */
+  plan(component: EngineComponent, path: string, body: Record<string, unknown>): RequestPlan;
+  /** 실제 전송. dry_run 에서는 네트워크에 닿기 전에 [승인 필요]로 거절한다. */
+  post(component: EngineComponent, path: string, body: Record<string, unknown>): Promise<{ json: unknown; elapsedMs: number }>;
 }
 
-function requirePath(cfg: HttpEngineConfig, component: 'stt' | 'tts' | 'llm' | 'embedding'): string {
-  const p = cfg.paths[component];
-  if (!p) throw new EngineError('E_CONFIG', component, `${component} 경로가 설정되지 않았습니다.`);
-  return p;
-}
-
-export function createHttpEngineSet(cfg: HttpEngineConfig): HttpEngineSet {
+/** 어댑터 공통 설정 검증 + 전송기. 어댑터는 여기서 나온 plan/post 만 쓴다. */
+export function createEngineTransport(cfg: EngineTransportConfig): EngineTransport {
   if (!/^https?:\/\/./.test(cfg.baseUrl)) {
     throw new EngineError('E_CONFIG', 'config', `baseUrl 형식 위반: ${JSON.stringify(cfg.baseUrl)}`);
   }
@@ -240,28 +238,26 @@ export function createHttpEngineSet(cfg: HttpEngineConfig): HttpEngineSet {
     }
     if (!fetchImpl) throw new EngineError('E_CONFIG', 'config', '전송 구현(fetchImpl)이 없습니다.');
   }
-  const maskOutbound = cfg.maskOutbound !== false;
   const clock = cfg.clock ?? (() => Date.now());
-  let lastUsage: UsageMetrics | undefined;
 
-  const plan = (component: 'stt' | 'tts' | 'llm' | 'embedding', body: Record<string, unknown>): RequestPlan => ({
+  const plan = (component: EngineComponent, path: string, body: Record<string, unknown>): RequestPlan => ({
     method: 'POST',
-    url: joinUrl(cfg.baseUrl, requirePath(cfg, component)),
+    url: joinUrl(cfg.baseUrl, path),
     headers: { 'content-type': 'application/json', authorization: AUTH_PLACEHOLDER(cfg.apiKeyEnv) },
     body,
     activation: cfg.activation,
     residency: cfg.residency,
   });
 
-  /** 실제 전송. dry_run 에서는 여기까지 오지 못한다. */
   async function post(
-    component: 'stt' | 'tts' | 'llm' | 'embedding',
+    component: EngineComponent,
+    path: string,
     body: Record<string, unknown>,
   ): Promise<{ json: unknown; elapsedMs: number }> {
     if (cfg.activation !== 'live') {
       throw new EngineError('E_APPROVAL_REQUIRED', component,
         `[승인 필요] ${cfg.name} 엔진 실호출은 승인 전까지 비활성입니다. 계획만 확인하세요(plan()).`,
-        { plan: plan(component, body) });
+        { plan: plan(component, path, body) });
     }
     const send = fetchImpl as FetchLike;
     const headers: Record<string, string> = { 'content-type': 'application/json' };
@@ -276,14 +272,16 @@ export function createHttpEngineSet(cfg: HttpEngineConfig): HttpEngineSet {
     const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
     const startedMs = clock();
     try {
-      const res = await send(joinUrl(cfg.baseUrl, requirePath(cfg, component)), {
+      const res = await send(joinUrl(cfg.baseUrl, path), {
         method: 'POST', headers, body: JSON.stringify(body), signal: controller.signal,
       });
       const elapsedMs = clock() - startedMs;
       const raw = await res.text();
       if (!res.ok) {
         // 본문을 그대로 싣지 않는다 — 엔진 오류 본문에 발화가 되돌아오는 사례가 있다(§10.3).
-        throw new EngineError('E_HTTP', component, `엔진 응답 오류(status ${res.status})`, { status: res.status, elapsedMs });
+        // 429·5xx 는 재시도 가능으로 표시한다(상위 폴백 §9.3 이 분기할 근거).
+        const retryable = res.status === 429 || res.status >= 500;
+        throw new EngineError('E_HTTP', component, `엔진 응답 오류(status ${res.status})`, { status: res.status, elapsedMs, retryable });
       }
       try {
         return { json: JSON.parse(raw), elapsedMs };
@@ -295,11 +293,49 @@ export function createHttpEngineSet(cfg: HttpEngineConfig): HttpEngineSet {
       const aborted = controller.signal.aborted;
       throw new EngineError(aborted ? 'E_TIMEOUT' : 'E_HTTP', component,
         aborted ? `엔진 응답 시간 초과(${cfg.timeoutMs}ms)` : '엔진 전송 실패',
-        { cause: err instanceof Error ? err.message : String(err) });
+        { cause: err instanceof Error ? err.message : String(err), retryable: true });
     } finally {
       clearTimeout(timer);
     }
   }
+
+  return { activation: cfg.activation, plan, post };
+}
+
+// ── 어댑터 본체 ───────────────────────────────────────────────────────────────
+
+export type HttpLlmAdapter = LlmAdapter & {
+  completeOnce(messages: LlmMessage[]): Promise<{ text: string; usage?: UsageMetrics; latency: LatencyMs }>;
+};
+
+export interface HttpEngineSet {
+  readonly config: Readonly<HttpEngineConfig>;
+  readonly activation: Activation;
+  stt: SttAdapter;
+  tts: TtsAdapter;
+  llm: HttpLlmAdapter;
+  embedding?: EmbeddingAdapter;
+  /** 검토용 요청 계획 — 실호출 없이 "무엇을 보낼 것인가"를 그대로 보여준다. */
+  plan(component: EngineComponent, body: Record<string, unknown>): RequestPlan;
+  /** 마지막 호출의 실측 사용량(§11.2). 호출 전에는 undefined. */
+  lastUsage(): UsageMetrics | undefined;
+}
+
+function requirePath(cfg: HttpEngineConfig, component: EngineComponent): string {
+  const p = cfg.paths[component];
+  if (!p) throw new EngineError('E_CONFIG', component, `${component} 경로가 설정되지 않았습니다.`);
+  return p;
+}
+
+export function createHttpEngineSet(cfg: HttpEngineConfig): HttpEngineSet {
+  const transport = createEngineTransport(cfg);
+  const maskOutbound = cfg.maskOutbound !== false;
+  let lastUsage: UsageMetrics | undefined;
+
+  const plan = (component: EngineComponent, body: Record<string, unknown>): RequestPlan =>
+    transport.plan(component, requirePath(cfg, component), body);
+  const post = (component: EngineComponent, body: Record<string, unknown>) =>
+    transport.post(component, requirePath(cfg, component), body);
 
   async function collectAudio(audio: AsyncIterable<AudioChunk>): Promise<{ bytes: Uint8Array; mime: string }> {
     const parts: Uint8Array[] = [];
