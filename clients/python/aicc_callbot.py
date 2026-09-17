@@ -35,6 +35,11 @@ agent.py 에 넣을 것은 훅마다 한 줄이다(이 파일은 agent.py 를 im
    열린 통화를 모두 닫은 뒤 브리지를 내린다 — 닫히지 않은 세션은 장애가 아니라 요금으로 나타난다.
 6. **발화·응답을 print 하지 않는다(§10.3).** 이 파일은 어떤 것도 출력하지 않는다.
    결과가 필요하면 `on_turn` 콜백으로 받는다(상담사용 요약·슬롯 값은 기본적으로 들어 있지 않다).
+7. **한도 초과는 장애가 아니다(§9.3).** `E_RATE_LIMITED` 를 브리지 사망과 같게 다루면 통화 전체가
+   Core 를 잃는다. 대신 브리지가 준 `retryAfterMs` 동안 **그 통화의 턴만** 보내지 않는다.
+   대기 시간을 주지 않았으면 대기하지 않는다(없는 근거를 만들지 않는다, §13-3).
+   **종료(`on_call_end`)·`close()` 는 어떤 경우에도 미루지 않는다** — 브리지도 end 를 제한하지 않고,
+   닫히지 않은 세션은 장애가 아니라 요금으로 먼저 나타난다.
 
 무엇을 하지 않는가 (build now, activate on approval)
 ---------------------------------------------------
@@ -46,6 +51,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Mapping, Optional
 
@@ -74,6 +80,12 @@ class HookStats:
     duplicate_ends: int = 0
     late_after_end: int = 0
     degraded_skips: int = 0
+    #: Core 가 한도 초과로 **거절한** 건수. 브리지 사망(degraded)과 다르다 — 기다리면 풀린다.
+    turns_rate_limited: int = 0
+    starts_rate_limited: int = 0
+    #: 한도 대기 중이라 **보내지 않은** 건수. 거절과 나눠 세지 않으면 "한도를 얼마나 밀어붙였는지"를 못 본다.
+    turns_deferred: int = 0
+    starts_deferred: int = 0
 
     def as_dict(self) -> Dict[str, int]:
         return dict(self.__dict__)
@@ -84,6 +96,8 @@ class _Call:
     interaction_id: str
     ended: bool = False
     turns: int = field(default=0)
+    #: 이 시각(단조 시계, 초) 전에는 턴을 보내지 않는다. 0 이면 대기 없음.
+    blocked_until: float = 0.0
 
 
 class CallbotCoreHooks:
@@ -105,8 +119,12 @@ class CallbotCoreHooks:
         on_error: Optional[ErrorHook] = None,
         on_turn: Optional[TurnHook] = None,
         disabled_reason_ko: str = "",
+        monotonic: Optional[Callable[[], float]] = None,
     ) -> None:
         self._factory = client_factory
+        # 한도 대기에만 쓰는 단조 시계. 벽시계를 쓰면 NTP 보정에 대기가 늘어나거나 사라진다.
+        self._now = monotonic if monotonic is not None else time.monotonic
+        self._start_blocked_until = 0.0
         self._flow_id = flow_id
         self._entry_point = entry_point
         self._on_error = on_error
@@ -183,11 +201,19 @@ class CallbotCoreHooks:
         with self._lock:
             if call_id in self._calls and not self._calls[call_id].ended:
                 return self._calls[call_id].interaction_id  # 같은 통화의 중복 시작은 재사용
+            now = self._now()
+            if self._start_blocked_until > now:
+                # 한도에 걸린 직후 밀려드는 통화마다 start 를 다시 던지면 한도를 더 밀어붙인다.
+                self.stats.starts_deferred += 1
+                return None
             res = self._guard(lambda c: c.start(flow_id=self._flow_id, entry_point=self._entry_point,
                                                correlation_id=correlation_id))
             if res is None:
                 return None  # 브리지 끊김은 _guard 가 이미 한 번 보고했다
             if not res.ok or not res.interaction_id:
+                if res.rate_limited:
+                    self.stats.starts_rate_limited += 1
+                    self._start_blocked_until = self._deadline(now, res.retry_after_ms)
                 self._report(res.error.code if res.error else "E_START_FAILED",
                              "Core 세션을 열지 못해 이 통화는 Core 없이 진행합니다.")
                 return None
@@ -299,6 +325,11 @@ class CallbotCoreHooks:
             if call.ended:
                 self.stats.late_after_end += 1  # 끝난 통화의 지연 전사. 보내지 않는다
                 return None
+            now = self._now()
+            if call.blocked_until > now:
+                # 한도가 풀릴 때까지는 보내지 않는다. 통화는 계속되고, 건수로만 남는다.
+                self.stats.turns_deferred += 1
+                return None
             res = self._guard(lambda c: fn(c, call.interaction_id))
             if res is None:
                 return None
@@ -310,11 +341,28 @@ class CallbotCoreHooks:
                         self._on_turn(call_id, res.result)
                     except Exception:  # noqa: BLE001 - 호출자 콜백 오류가 통화를 끊으면 안 된다
                         pass
+            elif res.rate_limited:
+                # 한도 초과는 장애가 아니다. degraded 로 올리면 통화 전체가 Core 를 잃는다(§9.3).
+                self.stats.turns_rate_limited += 1
+                call.blocked_until = self._deadline(now, res.retry_after_ms)
+                self._report("E_RATE_LIMITED",
+                             "Core 요청 한도를 넘어 이 턴은 보내지 않았습니다. 통화는 계속됩니다.")
             else:
                 self.stats.turns_failed += 1
                 self._report(res.error.code if res.error else "E_TURN_FAILED",
                              "Core 가 이 턴을 처리하지 못했습니다. 통화는 계속됩니다.")
             return res
+
+    @staticmethod
+    def _deadline(now: float, retry_after_ms: Optional[float]) -> float:
+        """대기 마감을 구한다. 브리지가 대기 시간을 주지 않았으면 **대기하지 않는다**.
+
+        모르는 값을 임의의 초로 메우면 없는 근거를 만든 것이고(§13-3), 그 숫자만큼
+        멀쩡한 턴이 통째로 사라진다. 다음 턴에서 다시 거절당하는 편이 낫다.
+        """
+        if retry_after_ms is None or retry_after_ms <= 0:
+            return 0.0
+        return now + retry_after_ms / 1000.0
 
     def _report(self, code: str, message_ko: str) -> None:
         if self._on_error is None:
@@ -328,11 +376,16 @@ class CallbotCoreHooks:
 class AsyncCallbotCoreHooks:
     """asyncio 에이전트용. 블로킹 I/O 를 스레드로 보내 이벤트 루프를 막지 않는다.
 
-    같은 통화의 훅은 도착 순서대로 처리된다 — 한 통화에서 두 턴이 겹치면 상태가 갈라지기 때문이다.
+    같은 통화의 훅은 **도착 순서대로** 처리된다 — 한 통화에서 두 턴이 겹치면 상태가 갈라지기 때문이다.
+    순서를 지키는 방법이 핵심이다: 체인의 자리는 **앞 훅을 기다리기 전에, 동기적으로** 잡는다.
+    기다린 뒤에 자리를 잡으면 뒤따라온 훅들이 전부 같은 앞 훅 하나만 보고 동시에 풀려나므로
+    (스레드풀에서 나란히 실행된다) 순서가 무너지고, 가장 흔한 결과가 **end 가 마지막 턴을 앞지르는
+    것**이다 — 턴은 "끝난 통화의 지연 전사"로 조용히 버려진다. 장애로 보이지 않기 때문에 더 나쁘다.
     """
 
     def __init__(self, inner: CallbotCoreHooks) -> None:
         self.inner = inner
+        # call_id → 이 통화에 마지막으로 예약된 훅의 완료 신호. 예약 시점에 즉시 교체된다.
         self._chain: Dict[str, "asyncio.Future[Any]"] = {}
 
     @classmethod
@@ -349,19 +402,31 @@ class AsyncCallbotCoreHooks:
 
     async def _run(self, call_id: str, fn: Callable[[], Any]) -> Any:
         loop = asyncio.get_running_loop()
+        done: "asyncio.Future[None]" = loop.create_future()
         prev = self._chain.get(call_id)
-        if prev is not None:
-            try:
-                await prev
-            except Exception:  # noqa: BLE001 - 앞 훅의 실패가 뒤 훅을 막지 않는다
-                pass
-        fut = loop.run_in_executor(None, fn)
-        self._chain[call_id] = fut
+        # 자리를 먼저 잡는다(여기까지 await 가 없다). 뒤 훅은 앞 훅이 아니라 **바로 앞 훅**을 기다린다.
+        self._chain[call_id] = done
         try:
-            return await fut
+            if prev is not None:
+                try:
+                    await prev
+                except Exception:  # noqa: BLE001 - 앞 훅의 실패가 뒤 훅을 막지 않는다
+                    pass
+            return await loop.run_in_executor(None, fn)
         finally:
-            if self._chain.get(call_id) is fut:
+            if not done.done():
+                done.set_result(None)   # 예외·취소 경로에서도 뒤 훅을 풀어 준다(막히면 통화가 멈춘다)
+            if self._chain.get(call_id) is done:
                 self._chain.pop(call_id, None)
+
+    async def drain(self, call_id: Optional[str] = None) -> None:
+        """예약된 훅이 끝날 때까지 기다린다. 어떤 실패도 던지지 않는다."""
+        pending = [self._chain.get(call_id)] if call_id is not None else list(self._chain.values())
+        for fut in [f for f in pending if f is not None]:
+            try:
+                await fut
+            except Exception:  # noqa: BLE001 - 남의 실패를 기다린 쪽의 실패로 바꾸지 않는다
+                pass
 
     async def on_call_start(self, call_id: str, **kw: Any) -> Optional[str]:
         return await self._run(call_id, lambda: self.inner.on_call_start(call_id, **kw))
@@ -379,5 +444,7 @@ class AsyncCallbotCoreHooks:
         return await self._run(call_id, lambda: self.inner.on_call_end(call_id, reason_ko))
 
     async def close(self) -> None:
+        """예약된 훅을 먼저 비운 뒤 닫는다 — 먼저 닫으면 남은 턴이 "끝난 통화"로 버려진다."""
+        await self.drain()
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self.inner.close)

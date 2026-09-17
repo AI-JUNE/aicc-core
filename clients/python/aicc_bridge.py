@@ -21,6 +21,9 @@ Callbot 의 음성 에이전트는 파이썬 프로세스다. Node 로 된 채�
 5. **세션을 반드시 닫는다.** `session()` 컨텍스트 매니저는 예외 경로에서도 end 를 부른다 —
    닫히지 않은 세션은 장애가 아니라 집계·요금으로 먼저 나타난다.
 6. **기본값을 만들어 넣지 않는다.** 타임아웃·줄 상한을 주지 않으면 그 검사를 하지 않는다(§13-3).
+7. **재시도 대기를 지어내지 않는다.** 한도 초과(`E_RATE_LIMITED`) 응답의 `retryAfterMs` 는 브리지가
+   **계산해서 준** 경우에만 `BridgeError.retry_after_ms` 로 노출한다. 없거나 형태가 틀리면 None 이며,
+   0 으로 읽지 않는다 — 0 으로 읽으면 곧바로 재시도해 한도를 더 밀어붙인다(§13-3).
 
 무엇을 하지 않는가 (build now, activate on approval)
 ---------------------------------------------------
@@ -57,6 +60,23 @@ class BridgeProtocolError(RuntimeError):
 class BridgeError:
     code: str
     message_ko: str
+    #: E_RATE_LIMITED 에서만 채워진다. 브리지가 **계산해서 준** 값이며 추정치가 아니다(§13-3).
+    #: 없으면 None 이다 — 호스트가 임의의 대기 시간을 만들어 쓰지 않게 하려는 것이다.
+    retry_after_ms: Optional[float] = None
+
+
+def _retry_after_ms(raw: Any) -> Optional[float]:
+    """재시도 대기(ms)를 **브리지가 준 경우에만** 받는다.
+
+    모르는 값을 0 으로 읽으면 호스트가 곧바로 재시도해 한도를 더 밀어붙이고,
+    임의의 값으로 메우면 없는 근거를 만든 것이다(§13-3). 둘 다 하지 않고 None 을 돌려준다.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    value = float(raw)
+    if value != value or value in (float("inf"), float("-inf")) or value < 0:
+        return None
+    return value
 
 
 @dataclass(frozen=True)
@@ -65,6 +85,15 @@ class BridgeResponse:
     ok: bool
     result: Any = None
     error: Optional[BridgeError] = None
+
+    @property
+    def rate_limited(self) -> bool:
+        """한도 초과인가. 브리지 사망(끊김)과 구분해야 한다 — 이쪽은 기다리면 풀린다."""
+        return self.error is not None and self.error.code == "E_RATE_LIMITED"
+
+    @property
+    def retry_after_ms(self) -> Optional[float]:
+        return self.error.retry_after_ms if self.error is not None else None
 
     @property
     def interaction_id(self) -> Optional[str]:
@@ -199,7 +228,11 @@ class BridgeClient:
         err = parsed.get("error")
         error = None
         if isinstance(err, dict):
-            error = BridgeError(str(err.get("code", "E_INTERNAL")), str(err.get("messageKo", "")))
+            error = BridgeError(
+                str(err.get("code", "E_INTERNAL")),
+                str(err.get("messageKo", "")),
+                _retry_after_ms(err.get("retryAfterMs")),
+            )
         return BridgeResponse(id=got_id, ok=parsed.get("ok") is True, result=parsed.get("result"), error=error)
 
     # ── 고수준 ────────────────────────────────────────────────────────────

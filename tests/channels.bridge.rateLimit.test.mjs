@@ -122,10 +122,63 @@ test('설정 거부: 모르는 op 비용·0 이하 비용·제한기 없는 비�
   assert.throws(() => build('goone', { rateLimitCost: { send: 1 } }), /rateLimiter/);
 });
 
+test('설정 거부: check 가 없는 제한기 — 형태 오류를 제한기 장애처럼 통과시키지 않는다', b, () => {
+  // 런타임 장애는 통과가 맞지만(아래 검사), **형태**가 틀린 것까지 통과로 두면
+  // 오타 하나로 제한이 조용히 꺼진 채 "적용했다"로 남는다. 둘은 다른 사건이다.
+  assert.throws(() => build('goone', { rateLimiter: {} }), /check/);
+  assert.throws(() => build('goone', { rateLimiter: { check: 1 } }), /check/);
+});
+
 test('제한기 자체가 던지면 잠그지 않고 통과시킨다 — 제한기 장애로 통화가 끊기면 안 된다(§9.3)', b, async () => {
   const broken = { check() { throw new Error('backend down'); }, peek() { throw new Error('x'); }, reset() {}, size: 0 };
   const bridge = build('goone', { rateLimiter: broken });
   const s = await start(bridge);
   assert.equal(s.ok, true);
   assert.equal((await send(bridge, s.result.interactionId, 'a')).ok, true);
+});
+
+// ── 실행기 경유(비-Node 호스트 경로) ───────────────────────────────────────
+// 제한기를 createBridge 가 받는 것만으로는 Callbot 에 닿지 않는다. 파이썬 에이전트가 쓰는 것은
+// CLI 실행기이고, 실행기가 넘기지 않으면 제한은 **아무도 지나가 보지 않은 길**로 남는다.
+test('실행기는 Core 모듈이 내놓은 제한기를 브리지에 넘긴다', b, async () => {
+  const { spawnSync } = await import('node:child_process');
+  const { join, dirname } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+  // send 에는 start 응답의 interactionId 가 필요해 한 줄씩 주고받아야 하므로,
+  // 실행기 전달 여부는 start 버킷(burst 2)으로 확인한다 — 확인하려는 것은 한도 자체가 아니라
+  // "모듈이 내놓은 제한기가 브리지까지 갔는가"다.
+  const input = ['{"id":"1","op":"hello"}',
+    '{"id":"2","op":"start","req":{"flowId":"f_reference_voice","entryPoint":"inbound_call"}}',
+    '{"id":"3","op":"start","req":{"flowId":"f_reference_voice","entryPoint":"inbound_call"}}',
+    '{"id":"4","op":"start","req":{"flowId":"f_reference_voice","entryPoint":"inbound_call"}}',
+    ''].join('\n');
+  const run = spawnSync(process.execPath,
+    [join(ROOT, 'scripts', 'channel-bridge.mjs'), '--core', './fixtures/reference-core-ratelimited.mjs',
+     '--adapter', 'callbot'],
+    { cwd: ROOT, input, encoding: 'utf8', timeout: 60000 });
+  assert.equal(run.status, 0, run.stderr);
+  const out = run.stdout.trim().split('\n').map((l) => JSON.parse(l));
+  assert.equal(out[0].ok, true, 'hello 는 제한 대상이 아니다');
+  assert.equal(out[1].ok, true);
+  assert.equal(out[2].ok, true);
+  assert.equal(out[3].ok, false, '실행기가 제한기를 넘기지 않았다 — 비-Node 호스트에서는 제한이 없다');
+  assert.equal(out[3].error.code, 'E_RATE_LIMITED');
+  assert.ok(out[3].error.retryAfterMs > 0, '계산된 재시도 대기가 실려 나가야 한다');
+});
+
+test('실행기: 제한기를 내놓지 않는 모듈은 종전과 같다(기본 한도 없음, §13-3)', b, async () => {
+  const { spawnSync } = await import('node:child_process');
+  const { join, dirname } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+  const input = Array.from({ length: 5 }, (_, n) =>
+    `{"id":"${n + 1}","op":"start","req":{"flowId":"f_reference_voice","entryPoint":"inbound_call"}}`).join('\n') + '\n';
+  const run = spawnSync(process.execPath,
+    [join(ROOT, 'scripts', 'channel-bridge.mjs'), '--core', './fixtures/reference-core.mjs', '--adapter', 'callbot'],
+    { cwd: ROOT, input, encoding: 'utf8', timeout: 60000 });
+  assert.equal(run.status, 0, run.stderr);
+  const out = run.stdout.trim().split('\n').map((l) => JSON.parse(l));
+  assert.equal(out.length, 5);
+  assert.ok(out.every((r) => r.ok === true), '한도를 주지 않았는데 막혔다');
 });

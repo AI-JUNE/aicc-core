@@ -106,9 +106,29 @@ node <core>/scripts/channel-bridge.mjs --core ./ci/aicc-core.mjs --adapter callb
   고정되어 호스트가 바꿀 수 없고(§11.1), 초과분은 `E_RATE_LIMITED` + 계산된 `retryAfterMs` 로 거절된다.
   `hello`·`end` 는 **절대 막지 않는다** — end 가 막히면 세션이 새고 요금으로 먼저 나타난다. 제한기 자체가
   던지면 잠그지 않고 통과시킨다(§9.3). 다중 인스턴스 공유 저장소 연결은 **[승인 필요]**.
+  제한기를 **실행기에 주는 방법**은 Core 모듈이 `rateLimiter`(선택적으로 `rateLimitCost`)를 함께
+  내놓는 것이다 — 한도는 명령줄 옵션이 아니다. CLI 로 숫자를 받으면 그 값이 곧 정책이 된다(§13-3).
+  `check(key, cost)` 가 없는 값을 주면 **설정 오류로 거부**한다: 런타임 장애(통과)와 형태 오류를
+  같게 다루면 오타 하나로 제한이 조용히 꺼진 채 "적용했다"로 남는다.
 - 기본 `dry_run` 이고 `live` 는 승인 근거가 있어야 만들어진다 **[승인 필요]**.
 
-복사해 갈 최소 예시는 `fixtures/reference-core.mjs` 다.
+복사해 갈 최소 예시는 `fixtures/reference-core.mjs` 다(한도를 켠 예시는
+`fixtures/reference-core-ratelimited.mjs` — 그 숫자는 정책이 아니라 검사용이다).
+
+#### 파이썬 참조 클라이언트·훅 어댑터
+
+`clients/python/aicc_bridge.py`(브리지 클라이언트)와 `clients/python/aicc_callbot.py`(훅 어댑터)는
+Callbot 저장소에 **복사**되어 산다 — 어긋남은 `scripts/client-drift.mjs` 가 잡는다.
+
+- `BridgeError.retry_after_ms` — 한도 초과 응답의 `retryAfterMs` 를 그대로 노출한다. 브리지가 주지
+  않았거나 형태가 틀리면 `None` 이며 **0 으로 읽지 않는다**(0 으로 읽으면 곧바로 재시도해 한도를 더
+  밀어붙인다, §13-3). `BridgeResponse.rate_limited` 로 브리지 사망과 구분한다.
+- 훅 어댑터는 `E_RATE_LIMITED` 를 `degraded` 로 올리지 않고(올리면 통화 전체가 Core 를 잃는다, §9.3),
+  받은 대기 시간 동안 **그 통화의 턴만** 보내지 않는다(`turns_deferred`). 대기 시간을 주지 않았으면
+  대기하지 않는다. 종료(`on_call_end`)·`close()` 는 어떤 경우에도 미루지 않는다.
+- `AsyncCallbotCoreHooks` 는 **같은 통화의 훅을 도착 순서대로** 처리한다. 체인 자리를 앞 훅을
+  기다리기 전에 잡으므로, `await` 없이 훅을 던져도 `end` 가 마지막 턴을 앞지르지 않는다.
+  `close()` 는 예약된 훅을 먼저 비운 뒤 브리지를 내린다(`drain()` 으로 따로 기다릴 수도 있다).
 
 Core 런타임 배선:
 

@@ -7,6 +7,8 @@
 //                                       [--export 이름] [--max-line-bytes 65536]
 //                                       [--include-handoff-summary] [--include-slots]
 // 모듈은 `{ core, scope }` 를 export 하거나, 그것을 돌려주는 함수(default/createCore)를 export 한다.
+// 선택적으로 `rateLimiter`(+`rateLimitCost`)를 함께 내놓을 수 있다 — 브리지는 진입점 제한을
+// 지원하지만 여기서 넘기지 않으면 비-Node 호스트에서는 끝내 닿지 않는다. 내놓지 않으면 제한 없음이다(§13-3).
 //
 // 프로토콜(한 줄 = 한 요청):
 //   → {"id":"1","op":"hello"}
@@ -90,6 +92,9 @@ try {
     includeHandoffSummary: flag('--include-handoff-summary'),
     includeSlots: flag('--include-slots'),
     maxLineBytes,
+    // 한도는 명령줄이 아니라 모듈에서 온다 — 숫자를 CLI 기본값으로 박으면 그 값이 곧 정책이 된다(§13-3).
+    ...(built.rateLimiter !== undefined ? { rateLimiter: built.rateLimiter } : {}),
+    ...(built.rateLimitCost !== undefined ? { rateLimitCost: built.rateLimitCost } : {}),
   });
 } catch (e) {
   console.error(`브리지 설정 오류: ${e instanceof Error ? e.message : String(e)}`);

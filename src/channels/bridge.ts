@@ -466,6 +466,11 @@ export function createBridge(opts: BridgeOptions): Bridge {
   if (capabilities.adapter !== opts.adapter) {
     throw new BridgeConfigError(`능력 선언이 어댑터(${opts.adapter})와 어긋납니다.`);
   }
+  // 제한기 **장애**는 통과로 두지만(§9.3), 제한기 **형태**가 틀린 것은 설정 오류다.
+  // 둘을 같게 다루면 오타 하나로 제한이 조용히 꺼진 채 "적용했다"로 남는다.
+  if (opts.rateLimiter !== undefined && typeof opts.rateLimiter?.check !== 'function') {
+    throw new BridgeConfigError('rateLimiter 는 check(key, cost) 를 가진 제한기여야 합니다.');
+  }
   if (opts.rateLimitCost) {
     for (const [op, cost] of Object.entries(opts.rateLimitCost)) {
       if (!BRIDGE_OPS.has(op)) throw new BridgeConfigError(`rateLimitCost 에 모르는 op 가 있습니다: ${op}`);

@@ -40,8 +40,20 @@
       나타난다. 제한기 장애는 잠금이 아니라 통과다(제한기 때문에 통화가 끊기면 안 된다, §9.3). 한도 기본값 없음 —
       주입하지 않으면 종전과 완전히 같다(§13-3). op 별 비용(`rateLimitCost`)으로 엔진 호출을 동반하는 send 를
       무겁게 셀 수 있다. 근거: `tests/channels.bridge.rateLimit.test.mjs`(7건) · `API.md` 반영.
-      파이썬 참조 클라이언트는 모르는 오류 코드를 그대로 `BridgeError` 로 넘기므로 호환된다(`retryAfterMs` 필드
-      노출은 Callbot 복사본과 함께 바꿔야 하므로 다음 회차).
+      **소비 측 완결(2026-09-17)**: 제한기를 받을 자리는 `createBridge` 에 있었지만 **실행기가 넘기지 않아**
+      비-Node 호스트에서는 끝내 닿지 않았다 — 지원한다고 적힌 기능이 아무도 지나가 보지 않은 길로 남아
+      있던 셈이다. 이제 Core 모듈이 `rateLimiter`(+`rateLimitCost`)를 함께 내놓으면 실행기가 그대로 넘긴다.
+      **한도를 CLI 옵션으로 받지 않은 이유**: 명령줄로 숫자를 받으면 그 값이 곧 정책이 된다(§13-3).
+      `check` 가 없는 값은 **설정 오류로 거부**한다 — 런타임 장애는 통과가 맞지만(§9.3) 형태 오류까지
+      통과로 두면 오타 하나로 제한이 조용히 꺼진 채 "적용했다"로 남는다.
+      파이썬 클라이언트는 `BridgeError.retry_after_ms` 로 계산된 대기를 그대로 노출한다(없거나 형태가
+      틀리면 `None` — **0 으로 읽지 않는다**. 0 으로 읽으면 곧바로 재시도해 한도를 더 밀어붙인다).
+      훅 어댑터는 `E_RATE_LIMITED` 를 `degraded` 로 올리지 않고(올리면 통화 전체가 Core 를 잃는다)
+      받은 대기 동안 **그 통화의 턴만** 보류하며, **종료·close 는 어떤 경우에도 미루지 않는다**.
+      근거: `scripts/channel-bridge.mjs` · `src/channels/bridge.ts`(제한기 형태 검증) ·
+      `fixtures/reference-core-ratelimited.mjs` · `clients/python/aicc_bridge.py` ·
+      `clients/python/aicc_callbot.py` · `tests/channels.bridge.rateLimit.test.mjs`(10건) ·
+      `tests/clients.python.test.mjs`(9건) · `tests/clients.callbot.test.mjs`(15건) · `API.md` 반영
 - [x] **접근·감사 로그** — 관리 기능 접근 판정과 기록을 한 함수로 묶어(`recordAccess`) 화면마다 빠뜨릴 수 없게 함.
       **거부는 화면 성격과 무관하게 항상 기록**(권한 거부·테넌트 위반·미존재 라우트·차단), 성공은 감사 대상
       화면(PII 열람·상태 변경)만 기록해 잡음을 막는다(`recordAllReads` 로 한시 전환 가능).
@@ -254,6 +266,16 @@
         `tests/adapters.openaiAudio.test.mjs`(15건) · `API.md` 반영
       · D-ARS 루트 CI 워크플로 적합성 단계: **완료** — `4. D-ARS/.github/workflows/ci.yml` 에 Core 체크아웃 +
         `conformance:aicc` 단계가 있다(토큰 없으면 건너뛰며 통과로 적지 않음)
+      · Core 측 완료(12): **비동기 훅 순서 보장 결함 수정(2026-09-17)** — `AsyncCallbotCoreHooks` 가
+        같은 통화의 훅을 직렬화한다고 적혀 있었지만 실제로는 **첫 훅에 대해서만** 직렬화했다.
+        체인 자리를 앞 훅을 기다린 **뒤에** 잡았기 때문에, 뒤따라온 훅들이 전부 같은 앞 훅 하나만 보고
+        동시에 풀려나 스레드풀에서 나란히 실행됐다. 가장 흔한 결과가 **end 가 마지막 턴을 앞지르는 것**이고,
+        그러면 그 턴은 "끝난 통화의 지연 전사"로 조용히 버려진다 — 장애로 보이지 않아서 더 나쁘다.
+        이 결함은 기존 테스트에서 **간헐 실패**로만 드러났다(전량 실행 7회 중 2회). 경합으로 우연히
+        통과하는 테스트는 근거가 아니므로, 브리지를 떼어 내고 **fn 진입 순서와 겹침을 직접 재는** 검사로
+        바꿨다 — 구버전에 대고 돌리면 반드시 실패한다(확인함). `close()` 는 예약된 훅을 먼저 비운 뒤
+        내려가고(먼저 닫으면 남은 턴이 통째로 사라진다), 앞 훅이 예외로 끝나도 뒤 훅이 막히지 않는다.
+        근거: `clients/python/aicc_callbot.py`(`_run`·`drain`·`close`) · `tests/clients.callbot.test.mjs`
       · 남은 것: **Callbot 저장소 쪽 배선** — 코드는 훅마다 한 줄(README 참조)이며 더 쓸 것이 없다.
         남은 것은 저장소 결정 사항이다: 현행 LLM 툴(welfare_apply 등)과 Core 시나리오의 역할 분담
         (어느 쪽이 화면 노드를 밀 것인가)·실운영 Core 모듈·Flow id 를 **사람이 정해야 한다**,

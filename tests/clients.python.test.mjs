@@ -184,3 +184,70 @@ test('판정 실행기 CLI: 통과는 0, 기대를 안 주면 판정보류 2 로
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ── 한도 초과(E_RATE_LIMITED) ──────────────────────────────────────────────
+// 브리지는 재시도 가능 시각을 계산해서 준다. 클라이언트가 그 값을 버리면 호스트는 대기 시간을
+// **지어내거나** 곧바로 재시도한다 — 둘 다 한도를 더 밀어붙인다.
+const RL_CORE = `os.path.join(ROOT, "fixtures", "reference-core-ratelimited.mjs")`;
+
+test('한도 초과 응답의 retryAfterMs 가 클라이언트까지 온전히 온다', b, () => {
+  const source = `${PRELUDE}
+c = BridgeClient(core_module=${RL_CORE}, adapter="callbot", core_root=ROOT, cwd=ROOT,
+                 max_line_bytes=65536, keep_transcript=True)
+c.hello()                                   # hello 는 제한 대상이 아니다
+s = c.start(flow_id="f_reference_voice", entry_point="inbound_call")
+i = s.interaction_id
+# 한도 키는 (테넌트 + op) 라 send 는 자기 버킷을 따로 쓴다 — burst 2 를 send 로 다 쓴다.
+first = c.send_utterance(i, "하나")
+c.send_utterance(i, "둘")
+second = c.send_utterance(i, "셋")           # 거절
+ended = c.end(i, "정상 종료")                 # end 는 어떤 경우에도 막히지 않는다
+json.dump({"start_ok": s.ok, "first_ok": first.ok,
+           "second_ok": second.ok, "code": second.error.code if second.error else None,
+           "retry": second.retry_after_ms, "rate_limited": second.rate_limited,
+           "end_ok": ended.ok, "requests": c.transcript.requests,
+           "responses": c.transcript.responses}, sys.stdout, ensure_ascii=False)
+c.close()
+`;
+  const run = withDriver(source, (f) => runPython(f));
+  assert.equal(run.status, 0, run.stderr);
+  const out = JSON.parse(run.stdout);
+  assert.equal(out.start_ok, true);
+  assert.equal(out.first_ok, true);
+  assert.equal(out.second_ok, false);
+  assert.equal(out.code, 'E_RATE_LIMITED');
+  assert.equal(out.rate_limited, true);
+  assert.ok(typeof out.retry === 'number' && out.retry > 0,
+    `retryAfterMs 가 클라이언트까지 오지 않았다: ${out.retry}`);
+  assert.equal(out.end_ok, true, 'end 가 한도에 막혔다 — 세션이 새고 요금으로 나타난다');
+  // 거절당한 줄도 한 줄 = 한 요청 규약을 지켰는지 판정기로 다시 본다.
+  const report = verifyBridgeTranscript({ requests: out.requests, responses: out.responses },
+    { adapter: 'callbot', maxLineBytes: 65536 });
+  assert.equal(report.endedInteractions, 1, JSON.stringify(report.issues));
+});
+
+test('대기 시간이 없거나 형태가 틀리면 0 이 아니라 None 이다(§13-3)', b, () => {
+  const source = `${PRELUDE}
+def decode(err):
+    raw = json.dumps({"id": "1", "ok": False, "error": err}, ensure_ascii=False)
+    return BridgeClient._decode(raw, "1").error.retry_after_ms
+cases = {
+    "없음":      decode({"code": "E_RATE_LIMITED", "messageKo": "x"}),
+    "널":        decode({"code": "E_RATE_LIMITED", "retryAfterMs": None}),
+    "문자열":    decode({"code": "E_RATE_LIMITED", "retryAfterMs": "1500"}),
+    "불리언":    decode({"code": "E_RATE_LIMITED", "retryAfterMs": True}),
+    "음수":      decode({"code": "E_RATE_LIMITED", "retryAfterMs": -1}),
+    "정상":      decode({"code": "E_RATE_LIMITED", "retryAfterMs": 1500}),
+    "0":         decode({"code": "E_RATE_LIMITED", "retryAfterMs": 0}),
+}
+json.dump(cases, sys.stdout, ensure_ascii=False)
+`;
+  const run = withDriver(source, (f) => runPython(f));
+  assert.equal(run.status, 0, run.stderr);
+  const out = JSON.parse(run.stdout);
+  for (const key of ['없음', '널', '문자열', '불리언', '음수']) {
+    assert.equal(out[key], null, `${key}: 모르는 값을 숫자로 읽었다`);
+  }
+  assert.equal(out['정상'], 1500);
+  assert.equal(out['0'], 0, '브리지가 0 을 줬다면 0 이다 — 지어낸 값이 아니다');
+});
