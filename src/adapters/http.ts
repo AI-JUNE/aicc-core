@@ -29,7 +29,8 @@ export type EngineErrorCode =
   | 'E_TIMEOUT'             // 응답 지연
   | 'E_HTTP'                // 비2xx 응답
   | 'E_PROTOCOL'            // 응답 형식 위반
-  | 'E_FILTERED';           // 엔진 측 콘텐츠 필터로 응답이 비워짐(삼키지 않고 드러낸다, §9.3)
+  | 'E_FILTERED'            // 엔진 측 콘텐츠 필터로 응답이 비워짐(삼키지 않고 드러낸다, §9.3)
+  | 'E_UNKNOWN';            // 정체불명 예외(전송 계층 밖에서 던져진 것). **엔진 장애로 집계하지 않는다** — resilience.ts
 
 /** 엔진 오류는 삼키지 않는다(§9.3). 상위 계층이 코드로 분기할 수 있게 코드와 컴포넌트를 함께 싣는다. */
 export class EngineError extends Error {
