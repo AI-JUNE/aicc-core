@@ -154,6 +154,15 @@ export interface ResilienceConfig {
   monotonic?: () => number;
   /** 헬스 레지스트리 기록 훅. 주입하면 샘플이 만들어질 때마다 넘긴다. */
   record?: (sample: HealthSample) => void;
+  /**
+   * **재시도·대체로 되살아난 호출**을 어떤 상태로 적을 것인가.
+   * 선언하지 않으면 `up` 이다. 이유: `degraded` 샘플 하나는 `decideFallbackMode` 에서
+   * 곧바로 `degraded_ai` 가 되고, STT 면 `speech_recognition` 이 꺼진다 — 음성 채널에서
+   * **고객이 말을 못 하게 된다**. 한 번의 복구로 그 대가를 치를지는 테넌트가 정할 일이지
+   * Core 가 정할 일이 아니다(§9.3·§13-3). 복구 사실 자체는 어느 쪽이든 `detail` 과
+   * `attempts` 에 남으므로 신호가 사라지지는 않는다.
+   */
+  recoveryState?: 'up' | 'degraded';
 }
 
 const timerSleep = (ms: number): Promise<void> => new Promise((r) => { setTimeout(r, ms); });
@@ -271,15 +280,28 @@ function finish<T>(
   component: EngineCallComponent,
   cfg: ResilienceConfig,
 ): ResilientOutcome<T> {
-  const health = healthFromOutcome(component, partial, cfg.now, cfg.monotonic !== undefined);
+  const health = healthFromOutcome(component, partial, {
+    ...(cfg.now ? { now: cfg.now } : {}),
+    measured: cfg.monotonic !== undefined,
+    ...(cfg.recoveryState ? { recoveryState: cfg.recoveryState } : {}),
+  });
   if (health && cfg.record) cfg.record(health);
   return health ? { ...partial, health } : { ...partial };
+}
+
+export interface HealthFromOutcomeOptions {
+  /** 관측 시각. 없으면 샘플을 만들지 않는다(§13-3). */
+  now?: () => string;
+  /** 소요를 실제로 쟀는가. 재지 않았으면 latencyMs 를 채우지 않는다. */
+  measured?: boolean;
+  /** 재시도·대체로 복구된 호출의 상태. 선언하지 않으면 `up`(위 ResilienceConfig 주석 참조). */
+  recoveryState?: 'up' | 'degraded';
 }
 
 /**
  * 호출 결과 1건을 §9.3 헬스 샘플로 바꾼다.
  *  - 성공 + 실패 시도 없음 → up
- *  - 성공 + 중간 실패 있음 → degraded (재시도로 살아난 엔진을 up 으로 적으면 악화가 안 보인다)
+ *  - 성공 + 중간 실패 있음 → `recoveryState`(선언 안 하면 up). 복구 사실은 detail 에 남는다.
  *  - 전 시도·전 후보 실패 + 엔진 탓 → down
  *  - 우리 잘못·승인 전·정체불명 → **샘플 없음**
  * `errorRate` 는 만들지 않는다 — 한 번의 호출에서 실패율을 계산할 수 없다(§13-3).
@@ -287,9 +309,9 @@ function finish<T>(
 export function healthFromOutcome<T>(
   component: EngineCallComponent,
   outcome: Omit<ResilientOutcome<T>, 'health'>,
-  now?: () => string,
-  measured = false,
+  opts: HealthFromOutcomeOptions = {},
 ): HealthSample | undefined {
+  const { now, measured = false, recoveryState = 'up' } = opts;
   if (!now) return undefined;
   const failed = outcome.attempts.filter((a) => !a.ok);
   if (outcome.ok) {
@@ -298,7 +320,7 @@ export function healthFromOutcome<T>(
     const latencyMs = measured && last && last.ok ? last.elapsedMs : undefined;
     return {
       component: HEALTH_COMPONENT_OF[component],
-      state: attributableFailures.length > 0 ? 'degraded' : 'up',
+      state: attributableFailures.length > 0 ? recoveryState : 'up',
       observedAt: now(),
       ...(latencyMs === undefined ? {} : { latencyMs }),
       detail: maskPii(

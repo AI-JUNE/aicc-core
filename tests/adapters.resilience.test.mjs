@@ -79,7 +79,7 @@ test('한 번에 성공하면 up 샘플을 남기고 값을 그대로 돌려준�
   assert.deepEqual(h.samples, [out.health]);
 });
 
-test('재시도로 살아나면 up 이 아니라 degraded 로 적는다', b, async () => {
+test('재시도로 살아나면 선언이 없는 한 up 으로 적는다 — 복구 하나로 음성 인식을 끄지 않는다', b, async () => {
   const h = harness({ attemptsPerCandidate: 3, backoffMs: (seq) => seq * 10 });
   const caller = m.createResilientCaller(h.cfg);
   let n = 0;
@@ -90,9 +90,47 @@ test('재시도로 살아나면 up 이 아니라 degraded 로 적는다', b, asy
   });
   assert.equal(out.ok, true);
   assert.equal(out.attempts.length, 3);
-  assert.equal(out.health.state, 'degraded');
+  assert.equal(out.health.state, 'up');
   assert.equal(out.health.component, 'stt');
+  assert.match(out.health.detail, /재시도로 복구 · 실패 2회/); // 신호는 사라지지 않는다
   assert.deepEqual(h.slept, [20, 30]); // 첫 시도 앞에서는 기다리지 않는다
+});
+
+test('복구를 degraded 로 적을지는 선언해야 바뀐다', b, async () => {
+  const h = harness({ attemptsPerCandidate: 2, backoffMs: () => 0, recoveryState: 'degraded' });
+  const caller = m.createResilientCaller(h.cfg);
+  let n = 0;
+  const out = await caller.run('stt', [cand('p', {})], async () => {
+    n += 1;
+    if (n === 1) throw E('E_TIMEOUT');
+    return 'ok';
+  });
+  assert.equal(out.health.state, 'degraded');
+});
+
+test('복구 샘플이 음성 채널 판정에 미치는 결과를 실제로 확인한다(§9.3)', b, async () => {
+  const fb = await import('../src/ops/fallback.ts');
+  const policy = {
+    tenantId: 't1', staleAfterMs: 60_000, treatUnknownAsDown: false,
+    legacyIvrAvailable: false, agentQueueAvailable: true,
+  };
+  const NOW = '2026-09-17T00:00:00.000Z';
+  const run = async (recoveryState) => {
+    const reg = fb.createHealthRegistry([
+      'telephony', 'tts', 'llm', 'rag', 'backend',
+    ].map((c) => ({ component: c, state: 'up', observedAt: NOW })));
+    const h = harness({ attemptsPerCandidate: 2, backoffMs: () => 0, now: () => NOW, record: reg.record, ...(recoveryState ? { recoveryState } : {}) });
+    const caller = m.createResilientCaller(h.cfg);
+    let n = 0;
+    await caller.run('stt', [cand('p', {})], async () => { n += 1; if (n === 1) throw E('E_TIMEOUT'); return 'ok'; });
+    return fb.decideFallbackMode('voice', reg, policy, NOW);
+  };
+  const silent = await run(undefined);
+  assert.equal(silent.mode, 'normal');
+  assert.deepEqual(silent.disable, []);
+  const declared = await run('degraded');
+  assert.equal(declared.mode, 'degraded_ai');
+  assert.deepEqual(declared.disable, ['speech_recognition']);
 });
 
 test('임베딩 실패는 L3(rag)로 집계한다 — L2 로 올리면 통화가 통째로 내려간다', b, async () => {
@@ -158,7 +196,8 @@ test('규격 위반은 같은 엔진에 다시 걸지 않고 대체 엔진으로
   assert.deepEqual(seen, ['a', 'b']);
   assert.equal(out.ok, true);
   assert.equal(out.usedCandidate, 'b');
-  assert.equal(out.health.state, 'degraded');
+  assert.equal(out.health.state, 'up'); // 대체로 살아난 것도 기본은 up — 신호는 detail 에 남는다
+  assert.match(out.health.detail, /재시도로 복구/);
 });
 
 test('HTTP 상태별로 재시도 여부가 갈린다 — 상태 미상은 재시도하지 않는다', b, () => {
@@ -278,7 +317,8 @@ test('첫 청크 전에 죽은 엔진은 대체 엔진으로 넘긴다', b, asyn
     { caller: caller },
   );
   assert.deepEqual(await collect(set.llm.complete([{ role: 'user', content: 'hi' }])), ['안녕', '하세요']);
-  assert.equal(h.samples.at(-1).state, 'degraded');
+  assert.equal(h.samples.at(-1).state, 'up');
+  assert.equal(h.samples.at(-1).component, 'llm');
 });
 
 test('첫 청크가 나간 뒤의 실패는 재시도하지 않고 그대로 드러낸다', b, async () => {

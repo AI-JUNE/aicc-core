@@ -104,6 +104,30 @@
 - [x] **실엔진 어댑터 1종 이상** — HTTP 엔진 어댑터(STT·TTS·LLM·임베딩 4종 §6.2 인터페이스 준수).
       근거: `src/adapters/http.ts` · `tests/adapters.http.test.mjs`(13건).
       기본 `dry_run`(네트워크 호출 없음), `live` 전환은 승인 근거(approvalRef)+비밀값 주입이 있어야만 가능 **[실호출은 승인]**
+      · Core 측 완료(2026-09-17): **엔진 호출 복원력 — 관측을 버리지 않는다**(`src/adapters/resilience.ts`).
+        §9.3 폴백 판정기는 이미 있었지만 그 입력인 `HealthSample` 을 **아무도 만들지 않았다** —
+        지금까지는 호스트가 브리지 `health` op 로 직접 선언할 때만 들어왔다. 정작 엔진 상태를 가장 먼저
+        아는 곳은 방금 그 엔진을 부른 자리인데 그 사실을 버리고 있었던 셈이다.
+        이제 호출 결과(성공·타임아웃·5xx·규격위반)가 그대로 재시도·대체엔진 판단과 헬스 샘플이 된다.
+        실패를 6종으로 가른 이유는 **대응이 서로 다르기 때문**이다(전부 테스트로 고정):
+        타임아웃·429·5xx 는 재시도+대체 · 규격 위반은 재시도 없이 대체(같은 엔진은 같은 규격으로 또 틀린다) ·
+        **콘텐츠 필터는 대체 엔진으로 우회하지 않는다**(장애가 아니다) · 4xx·빈 입력·설정 오류·승인 전 호출·
+        정체불명 예외는 **엔진 상태로 집계하지 않는다**. 마지막 항목이 핵심이다 — 승인을 안 받았다는 이유로
+        엔진이 죽은 것으로 집계되면 켜 보기도 전에 전 채널이 상담사 직결로 떨어진다.
+        **한 번 실패로 `down` 을 적지 않는다**(재시도·대체까지 전부 실패해야 down), 그리고 **되살아난 호출은
+        선언이 없으면 `up`** 이다 — `degraded` 샘플 하나가 `decideFallbackMode` 에서 곧바로
+        `speech_recognition` 을 끄기 때문이다(음성 채널에서 고객이 말을 못 하게 된다). 한 번의 복구로 그
+        대가를 치를지는 테넌트가 정한다(`recoveryState`). 복구 사실은 `detail`·`attempts` 에 남아 신호가
+        사라지지 않으며, 이 상호작용은 `decideFallbackMode` 를 실제로 불러 확인한다.
+        재시도 횟수·대기 기본값 없음(§13-3) — 주지 않으면 재시도하지 않고 종전과 완전히 같다.
+        재시도를 켜면서 `backoffMs` 를 주지 않는 것은 **설정 오류로 거부**한다(간격 없는 재시도는 힘들어하는
+        엔진을 더 밀어붙인다). 해외 후보는 `allowOverseas` 없이는 부르지 않고 제외를 결과에 드러내며,
+        합쳐진 엔진셋의 `residency` 는 **가장 노출도가 높은 후보**로 적는다 — 해외를 섞어 놓고 '국내'로 적으면
+        `assertResidency` 가 무력해진다(§10.3). 스트리밍(STT·TTS·LLM)은 **첫 청크 전까지만** 복원력을
+        적용한다: 이미 재생된 말을 두 번 내보내지 않기 위해서다. 임베딩은 한 번의 요청·응답이라 전 구간 재시도한다.
+        상위 계층은 §6.2 인터페이스(`EngineSet`)만 보므로 재시도가 붙었다는 사실을 몰라도 된다(`withResilientEngines`).
+        근거: `src/adapters/resilience.ts` · `src/adapters/http.ts`(`E_UNKNOWN` 추가) ·
+        `tests/adapters.resilience.test.mjs`(29건) · `API.md` 반영. 실호출은 여전히 **[승인 필요]**
 - [ ] 채널 어댑터 계약 실적용 — Callbot·챗봇·D-ARS가 Core를 실제로 소비하도록 연결
       · Core 측 완료: `src/channels/runtime.ts`(ConversationCorePort 실구현 — 세션·Flow·이벤트·§9.3 폴백·이관 요약 배선),
         `src/channels/profiles.ts`(채널 3종 능력 기본값) · `tests/channels.runtime.test.mjs`(15건)·`tests/channels.profiles.test.mjs`(5건)
