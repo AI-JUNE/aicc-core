@@ -107,6 +107,19 @@ export interface FallbackDecision {
   transferTo?: string;
 }
 
+/**
+ * 샘플 1건을 **정책을 반영한** 현재 상태로 읽는다. 오래된 샘플·없는 샘플을 어떻게 볼지가
+ * 여기 한 곳에만 있어야 한다 — 복구 프로브(`ops/recoveryProbe.ts`)가 "지금 나쁜 컴포넌트"를
+ * 고를 때 이 규칙을 다시 짜면 폴백 판정과 프로브 대상이 어긋난다(§2 의 이중 관리와 같은 실패).
+ */
+export function effectiveComponentState(
+  sample: HealthSample | undefined,
+  policy: FallbackPolicy,
+  nowIso: string,
+): HealthState {
+  return effectiveState(sample, policy, Date.parse(nowIso));
+}
+
 function effectiveState(s: HealthSample | undefined, policy: FallbackPolicy, nowMs: number): HealthState {
   if (!s) return policy.treatUnknownAsDown ? 'down' : 'unknown';
   const age = nowMs - Date.parse(s.observedAt);

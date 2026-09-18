@@ -232,7 +232,8 @@ const next  = await core.send(first.interactionId, { input: { kind: 'text', text
 
 | 모듈 | 계약 | 주요 export |
 |---|---|---|
-| `ops/fallback.ts` | 컴포넌트 건강도 → 폴백 모드(§9.3) | `createHealthRegistry`, `decideFallbackMode`, `resolveRuntimeAction` |
+| `ops/fallback.ts` | 컴포넌트 건강도 → 폴백 모드(§9.3) | `createHealthRegistry`, `decideFallbackMode`, `resolveRuntimeAction`, `effectiveComponentState` |
+| `ops/recoveryProbe.ts` | **폴백에서 빠져나오는 길**(§9.3). 폴백이 걸리면 엔진 호출이 멈추므로 새 샘플이 생기지 않는다 — 보수적 테넌트는 사람이 손대기 전까지 영구히 상담사 직결이고, 아닌 테넌트는 **증거 없이** 샘플이 낡았다는 이유만으로 AI 를 재개한다. 그래서 **지금 나쁜 상태인 컴포넌트만** 주입된 `HealthProbe` 로 다시 확인해 같은 레지스트리에 샘플을 남긴다(폴백 모드 판정은 여전히 `decideFallbackMode` 가 한다). **타이머를 스스로 돌리지 않는다** — 호스트가 `runDue(nowIso)` 를 부른다. 확인 간격·제한 시간 **기본값 없음**(§13-3, 주지 않으면 그 컴포넌트는 돌리지 않고 건너뛴 사유를 적는다). 정상인 컴포넌트는 찌르지 않고(합성 요청은 비용이자 §11.2 의 정체불명 사용량이다), 승인 전 호출·설정 오류·정체불명 예외는 **엔진 상태로 적지 않는다**(적으면 켜 보기도 전에 영구 `down` 이다 **[승인 필요]**). 프로브가 규약을 어긴 값을 돌려주면 `up` 으로도 `down` 으로도 읽지 않는다(프로브 결함이지 엔진 증거가 아니다). 프로브는 동시에 돌고, 어떤 경우에도 던지지 않는다. `confirmSuccesses` 를 주면 연속 성공이 확인될 때까지 복구를 기록하지 않는다 | `createRecoveryProbeRunner`, `formatRecoveryReport`, `RecoveryProbeOptions`, `ProbeSchedule`, `RecoveryRunReport` |
 | `ops/health.ts` | liveness/readiness 분리, 프로브 병렬·개별 예산 | `checkHealth`, `livenessReport`, `approvalPendingProbe` |
 | `ops/backup.ts` | 백업·복구와 **복구 리허설**(RUNBOOK.md 참조) | `createSnapshot`, `verifySnapshot`, `serializeSnapshot`, `parseSnapshot`, `restoreSnapshot`, `runRecoveryDrill` |
 | `ops/packageSurface.ts` | 채널이 부르는 import 경로(package.json exports) 고정·검증. 배포는 **[승인 필요]** | `CHANNEL_SUBPATHS`, `expectedExports`, `validatePackageSurface`, `surfaceOk`, `formatSurfaceReport` |
