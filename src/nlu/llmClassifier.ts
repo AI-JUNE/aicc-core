@@ -219,7 +219,12 @@ export function parseCandidates(raw: string): ParseOk | ParseNg {
 
 // ── 엔진 호출 ─────────────────────────────────────────────────────────────────
 
-async function collect(
+/**
+ * LLM 스트림을 문자열로 모은다. 제한 시간·길이 상한 규칙이 여기 한 곳에만 있어야 한다 —
+ * 복사해 쓰기 시작하면 "타임아웃은 분류에만 걸리고 답변 생성에는 안 걸린다" 같은 어긋남이 생기고,
+ * 그건 장애가 아니라 **고객이 오래 기다리는 것**으로만 나타난다. `knowledge/answer.ts` 가 공유한다.
+ */
+export async function collectLlmStream(
   stream: AsyncIterable<string>,
   timeoutMs: number | undefined,
   maxChars: number | undefined,
@@ -321,7 +326,7 @@ export function createIntentClassifier(cfg: ClassifierConfig): IntentClassifier 
 
       let raw: string;
       try {
-        raw = await collect(cfg.llm.complete(b.messages), cfg.timeoutMs, cfg.maxResponseChars);
+        raw = await collectLlmStream(cfg.llm.complete(b.messages), cfg.timeoutMs, cfg.maxResponseChars);
       } catch (err) {
         // 분류 실패로 통화를 끊지 않는다(§9.3). 사유는 마스킹을 지난다(§10.3).
         const e = err instanceof EngineError ? err : undefined;
