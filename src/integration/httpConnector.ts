@@ -60,6 +60,13 @@ export interface HttpConnectorConfig {
   idempotencyHeader?: string;
   /** 응답 본문 크기 상한(byte). 주지 않으면 검사하지 않는다(§13-3). */
   maxResponseBytes?: number;
+  /**
+   * 커넥터 id → 개인정보 파라미터 이름(`piiParams(def)`).
+   * 포트는 `ConnectorRequest` 만 받고 그 안에는 pii 선언이 없으므로, **모른 채로는 GET 을 보내지 않는다** —
+   * 쿼리스트링에 주민번호가 한 번 실리면 상대 접근 로그에서 되돌릴 방법이 없다(§10.3).
+   * 주지 않으면 GET 엔드포인트는 호출 전에 거절된다(§13-3 — 안전한 쪽을 가정하지 않고 거절한다).
+   */
+  piiParamsOf?: (connectorId: string) => readonly string[] | undefined;
 }
 
 /** 검토용 요청 계획. 파라미터 값은 실리지 않는다 — **이름만** 남는다(§10.3). */
@@ -76,7 +83,7 @@ export interface ConnectorRequestPlan {
 export interface HttpConnectorPort extends ConnectorPort {
   readonly activation: ConnectorActivation;
   /** 실호출 없이 "무엇을 보낼 것인가"를 보여준다. dry_run 검토·감사 근거. */
-  plan(request: ConnectorRequest, piiParamNames?: readonly string[]): ConnectorRequestPlan | { error: string };
+  plan(request: ConnectorRequest): ConnectorRequestPlan | { error: string };
 }
 
 const AUTH_PLACEHOLDER = (envName: string | undefined): string =>
@@ -119,34 +126,41 @@ export function createHttpConnectorPort(cfg: HttpConnectorConfig): HttpConnector
   }
   const idemHeader = cfg.idempotencyHeader ?? 'idempotency-key';
 
-  /** 배치 결정 — 여기서만 정한다. pii 가 있으면 쿼리스트링은 선택지가 아니다. */
-  function placementOf(httpMethod: string, hasPii: boolean): ParamPlacement | { error: string } {
-    if (httpMethod === 'GET') {
-      if (hasPii) {
-        return {
-          error: '개인정보 파라미터를 쿼리스트링으로 보낼 수 없습니다 — URL 은 상대 접근 로그·프록시에 마스킹 없이 남습니다(§10.3). 엔드포인트를 POST 로 선언하세요.',
-        };
-      }
-      return 'query';
+  /**
+   * 배치 결정 — 여기서만 정한다. GET 은 pii 선언을 **알 수 있을 때만** 쓰고, 하나라도 섞이면 거절한다.
+   * 선언을 모르면 GET 자체를 거절한다 — "아마 개인정보가 아닐 것"이라는 가정이 유출의 시작이다.
+   */
+  function placementOf(httpMethod: string, request: ConnectorRequest): ParamPlacement | { error: string } {
+    if (httpMethod !== 'GET') return 'body';
+    const declared = cfg.piiParamsOf?.(request.connectorId);
+    if (declared === undefined) {
+      return {
+        error: 'GET 엔드포인트인데 개인정보 파라미터 선언(piiParamsOf)을 알 수 없어 호출하지 않았습니다 — 쿼리스트링은 상대 접근 로그에 마스킹 없이 남습니다(§10.3).',
+      };
     }
-    return 'body';
+    const leaked = declared.filter((n) => Object.prototype.hasOwnProperty.call(request.params, n));
+    if (leaked.length > 0) {
+      return {
+        error: `개인정보 파라미터(${leaked.join(', ')})를 쿼리스트링으로 보낼 수 없습니다 — URL 은 상대 접근 로그·프록시에 마스킹 없이 남습니다(§10.3). 엔드포인트를 POST 로 선언하세요.`,
+      };
+    }
+    return 'query';
   }
 
   function prepare(
-    request: ConnectorRequest, piiParamNames: readonly string[],
+    request: ConnectorRequest,
   ): { ep: ResolvedEndpoint; httpMethod: string; placement: ParamPlacement } | { error: string } {
     const ep = cfg.resolveEndpoint(request.endpointRef);
     if (!ep) return { error: `엔드포인트 참조를 풀 수 없습니다: ${request.endpointRef}` };
     if (!/^https?:\/\/./.test(ep.url)) return { error: `엔드포인트 URL 형식 위반: ${JSON.stringify(ep.url)}` };
     const httpMethod = ep.httpMethod ?? defaultMethod(request.method);
-    const hasPii = piiParamNames.some((n) => Object.prototype.hasOwnProperty.call(request.params, n));
-    const placement = placementOf(httpMethod, hasPii);
+    const placement = placementOf(httpMethod, request);
     if (typeof placement === 'object') return placement;
     return { ep, httpMethod, placement };
   }
 
-  function plan(request: ConnectorRequest, piiParamNames: readonly string[] = []): ConnectorRequestPlan | { error: string } {
-    const p = prepare(request, piiParamNames);
+  function plan(request: ConnectorRequest): ConnectorRequestPlan | { error: string } {
+    const p = prepare(request);
     if ('error' in p) return p;
     const headers: Record<string, string> = {
       ...(p.ep.headers ?? {}),
@@ -164,8 +178,8 @@ export function createHttpConnectorPort(cfg: HttpConnectorConfig): HttpConnector
     };
   }
 
-  async function call(request: ConnectorRequest, piiParamNames: readonly string[] = []): Promise<ConnectorResponse> {
-    const p = prepare(request, piiParamNames);
+  async function call(request: ConnectorRequest): Promise<ConnectorResponse> {
+    const p = prepare(request);
     if ('error' in p) return { ok: false, code: 'invalid_request', detail: p.error };
 
     if (cfg.activation !== 'live') {
