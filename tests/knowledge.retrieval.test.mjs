@@ -171,13 +171,13 @@ test('규약을 어긴 반환값(배열 아님)을 빈 결과로 읽지 않는�
 });
 
 test('storeTimeoutMs 를 주면 늦은 조회를 실패로 적는다(주지 않으면 제한하지 않는다, §13-3)', b, async () => {
-  const slow = () => new Promise((res) => { const t = setTimeout(() => res([hit()]), 200); t.unref?.(); });
+  const slow = () => new Promise((res) => { setTimeout(() => res([hit()]), 120); });
   const f = fakeStore({ faq: slow });
   const r = await make({ store: f.store, storeTimeoutMs: 20 }).retrieve('질문', POLICY);
   assert.equal(r.status, 'store_failed');
   assert.equal(r.failures[0].code, 'E_TIMEOUT');
 
-  const f2 = fakeStore({ faq: () => new Promise((res) => { const t = setTimeout(() => res([hit()]), 30); t.unref?.(); }) });
+  const f2 = fakeStore({ faq: () => new Promise((res) => { setTimeout(() => res([hit()]), 30); }) });
   const r2 = await make({ store: f2.store }).retrieve('질문', POLICY);
   assert.equal(r2.status, 'grounded', '상한을 주지 않으면 기다린다');
 });
