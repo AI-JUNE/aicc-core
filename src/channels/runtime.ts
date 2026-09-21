@@ -28,6 +28,10 @@ import type { ComponentId, FallbackDecision, FallbackPolicy, HealthRegistry, Hea
 import { decideFallbackMode } from '../ops/fallback.ts';
 import type { SummaryOptions } from '../core/handoffSummary.ts';
 import { buildHandoffSummary, requiredSlotsOf } from '../core/handoffSummary.ts';
+import type { AdmissionOptions, QueueSnapshot, RoutingConfig } from '../routing/agentQueue.ts';
+import { validateRoutingConfig } from '../routing/agentQueue.ts';
+import type { HandoffPlacement } from '../routing/executeHandoff.ts';
+import { executeHandoff } from '../routing/executeHandoff.ts';
 import type {
   ChannelAdapterId, ChannelHealthReport, ChannelRegistration, ChannelSessionRequest,
   ChannelTurnInput, ChannelTurnResult, ConversationCorePort, ContractIssue, ChannelCapabilities,
@@ -89,6 +93,24 @@ export function createMemorySessionStore(): SessionStore {
   };
 }
 
+/**
+ * 상담사 큐 배정 연결(§2·§9.3). **주지 않으면 종전과 완전히 같다**(§13-3) —
+ * 시나리오가 적어 둔 큐 id 를 그대로 `transfer` 에 넘긴다.
+ *
+ * 주면 Core 가 `routing/executeHandoff.ts` 로 목적지를 확정한다. 이 배선이 없으면
+ * 큐 선택·수용 판정 모듈은 저장소에 있으나 **아무도 부르지 않는** 상태로 남고,
+ * 채널 3곳이 각자 같은 20줄을 쓰게 된다(브리지 앞에 아무도 쓰지 않은 30줄을 남겼을 때와 같은 실패).
+ */
+export interface RoutingBinding {
+  config: RoutingConfig;
+  /**
+   * 큐 실측 스냅샷. 호스트가 조회해 준다 — Core 는 대기 인원·상담사 수를 **추정하지 않는다**(§13-3).
+   * 실패하면 던지지 말고 빈 배열을 주면 된다(그 큐는 "상태 미확인"으로 보수적으로 닫힌다).
+   */
+  snapshots(): Promise<readonly QueueSnapshot[]> | readonly QueueSnapshot[];
+  admission?: AdmissionOptions;
+}
+
 export interface ConversationCoreOptions {
   scope: TenantScope;
   flows: FlowRegistry;
@@ -111,6 +133,8 @@ export interface ConversationCoreOptions {
    */
   timing?: TurnTimingPolicy;
   summary?: SummaryOptions;
+  /** 상담사 큐 배정(§2). 미지정 시 큐 판정을 하지 않는다 — 종전 동작과 동일하다(§13-3). */
+  routing?: RoutingBinding;
   now?: () => string;
   newInteractionId?: (req: ChannelSessionRequest) => string;
   onPublish?: (results: PublishResult[]) => void;
@@ -161,6 +185,22 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       throw new Error(`턴 타이밍 정책 거부: ${tIssues.filter((i) => i.severity === 'error').map((i) => i.messageKo).join(' / ')}`);
     }
     for (const i of tIssues) warnings.push({ severity: 'warning', code: 'W_TURN_TIMING', messageKo: i.messageKo });
+  }
+
+  // 라우팅 설정은 **배포 시점에** 거른다. 통화 중에 "갈 곳 없는 이관"으로 터지면 이미 늦고,
+  // 형태 오류를 통과로 두면 오타 하나로 큐 판정이 조용히 꺼진 채 "적용했다"로 남는다.
+  if (opts.routing !== undefined) {
+    if (typeof opts.routing.snapshots !== 'function') {
+      throw new Error('라우팅 배선 거부: 큐 스냅샷 조회가 없다 — 대기 인원을 추정하지 않는다 (설계서 §13-3)');
+    }
+    if (opts.routing.config.tenantId !== opts.scope.tenantId
+      || (opts.routing.config.workspaceId ?? undefined) !== (opts.scope.workspaceId ?? undefined)) {
+      throw new Error('라우팅 배선 거부: 다른 테넌트·워크스페이스의 라우팅 설정 (설계서 §11.1)');
+    }
+    const rIssues = validateRoutingConfig(opts.routing.config);
+    if (rIssues.length > 0) {
+      throw new Error(`라우팅 설정 거부: ${rIssues.join(' / ')}`);
+    }
   }
 
   for (const reg of opts.channels) {
@@ -312,6 +352,64 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     return result;
   }
 
+  /**
+   * 상담사 큐 배정. 배선이 없으면 `undefined` 를 돌려주고 호출부는 종전 경로를 탄다(§13-3).
+   *
+   * 스냅샷 조회가 실패해도 **던지지 않는다** — 큐 상태를 못 읽었다는 이유로 이관이 예외로 끝나면
+   * 고객은 봇에 갇힌다. 빈 배열로 진행하면 `admitToQueue` 가 "상태 미확인"으로 보수적으로 닫고
+   * §9.3 대안이 나온다.
+   */
+  async function placeHandoff(rec: SessionRecord, summaryMasked: string | undefined): Promise<HandoffPlacement | undefined> {
+    const binding = opts.routing;
+    if (!binding || !rec.state.handoff) return undefined;
+    let snapshots: readonly QueueSnapshot[] = [];
+    try {
+      snapshots = await binding.snapshots();
+    } catch {
+      snapshots = [];
+    }
+    // 내부 예약 슬롯(`__`)은 라우팅 규칙 비교에 넣지 않는다 — 시나리오 내부 상태가 큐를 고르면 안 된다.
+    const slots: Record<string, string> = {};
+    for (const [k, v] of Object.entries(rec.state.slots)) {
+      if (!k.startsWith('__')) slots[k] = v;
+    }
+    return executeHandoff(binding.config, {
+      scope: rec.scope,
+      channel: rec.state.channel,
+      reason: rec.state.handoff.reason,
+      slots,
+      ...(summaryMasked !== undefined ? { summaryMasked } : {}),
+      nowIso: now(),
+      snapshots,
+      ...(binding.admission !== undefined ? { admission: binding.admission } : {}),
+    });
+  }
+
+  /**
+   * 이관 전달. 배정 결과에 따라 **큐에 놓을 수 있을 때만** `transfer` 를 부른다.
+   *
+   * 배정이 대안(`alternative`)·목적지 불가(`unavailable`)인데도 `transfer` 를 부르면,
+   * 채널은 "상담사 연결 중"을 안내하고 고객은 아무도 없는 곳에서 기다린다 —
+   * §9.3 대안(콜백·음성사서함·기존 IVR)이 통째로 건너뛰어진다. 그래서 부르지 않고,
+   * 무엇을 해야 하는지는 `result.handoff.placement` 로 채널에 그대로 넘긴다.
+   */
+  async function deliverHandoff(
+    reg: ChannelRegistration,
+    rec: SessionRecord,
+    summaryMasked: string | undefined,
+    result: ChannelTurnResult,
+  ): Promise<void> {
+    if (!rec.state.handoff) return;
+    const placement = await placeHandoff(rec, summaryMasked);
+    if (!placement) {
+      await reg.port.transfer(rec.interactionId, rec.state.handoff.queue, summaryMasked);
+      return;
+    }
+    if (result.handoff) result.handoff.placement = placement;
+    if (placement.placement !== 'queued') return;
+    await reg.port.transfer(rec.interactionId, placement.queueId, summaryMasked);
+  }
+
   /** 통화 중 화면 전환(§5.2) — 채널이 초대 능력을 선언한 경우에만 실제 초대를 건다. */
   async function inviteIfSwitched(prev: ChannelKind, next: ChannelKind, rec: SessionRecord, reg: ChannelRegistration): Promise<void> {
     if (prev === next) return;
@@ -409,7 +507,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       await publish(events);
       const shown = visibleSteps(run.steps);
       if (shown.length > 0) await reg.port.present(interactionId, shown);
-      if (rec.state.handoff) await reg.port.transfer(interactionId, rec.state.handoff.queue, summaryMasked);
+      await deliverHandoff(reg, rec, summaryMasked, result);
       return result;
     },
 
@@ -456,7 +554,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       await inviteIfSwitched(prevChannel, rec.state.channel, rec, reg);
       const shown = visibleSteps(run.steps);
       if (shown.length > 0) await reg.port.present(interactionId, shown);
-      if (rec.state.handoff) await reg.port.transfer(interactionId, rec.state.handoff.queue, summaryMasked);
+      await deliverHandoff(reg, rec, summaryMasked, result);
       return result;
     },
 

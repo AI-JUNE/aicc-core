@@ -48,7 +48,7 @@ function fakePort(id = 'callbot', capsOver = {}, over = {}) {
   };
 }
 
-function build({ flows = [flowBilling], port = fakePort(), samples = [], policy = {}, components, reprompt, timing } = {}) {
+function build({ flows = [flowBilling], port = fakePort(), samples = [], policy = {}, components, reprompt, timing, routing } = {}) {
   const collector = B.createCollectorSink('t');
   const bus = B.createEventBus({
     scope: SCOPE, sinks: [collector],
@@ -67,6 +67,7 @@ function build({ flows = [flowBilling], port = fakePort(), samples = [], policy 
     newInteractionId: () => 'i_test1',
     ...(reprompt !== undefined ? { reprompt } : {}),
     ...(timing !== undefined ? { timing } : {}),
+    ...(routing !== undefined ? { routing } : {}),
   });
   return { core, port, collector, health };
 }
@@ -296,4 +297,124 @@ test('적용되지 않는 노드 종류를 선언하면 거부한다 — 적용 
 test('빈 타이밍 선언은 거부가 아니라 경고로 드러난다', b, () => {
   const { core } = build({ flows: [flowRetry], timing: {} });
   assert.ok(core.warnings().some((w) => w.code === 'W_TURN_TIMING'));
+});
+
+
+// ── 상담사 큐 배정 배선(§2·§9.3·§11.1·§13-3) ────────────────────────────────
+// 여기서 고정하는 것은 "라우팅이 동작한다"가 아니라 **배선이 실제로 닿는다**는 사실이다.
+// 모듈은 있는데 아무도 부르지 않는 상태가 이 저장소에서 반복된 실패라서다.
+const QUEUES = (over = {}) => ([
+  { id: 'q_care', tenantId: 'goone', titleKo: '케어', skills: [], closedAction: 'callback',
+    maxWaiting: 1, overflowQueueId: 'q_backup', ...over },
+  { id: 'q_backup', tenantId: 'goone', titleKo: '예비', skills: [], closedAction: 'voicemail' },
+]);
+const ROUTING = (over = {}) => ({
+  config: { tenantId: 'goone', queues: QUEUES(), rules: [], defaultQueueId: 'q_care' },
+  snapshots: () => [
+    { queueId: 'q_care', waiting: 0, availableAgents: 2, observedAt: NOW },
+    { queueId: 'q_backup', waiting: 0, availableAgents: 1, observedAt: NOW },
+  ],
+  ...over,
+});
+
+test('라우팅을 주지 않으면 종전과 완전히 같다(§13-3)', b, async () => {
+  const { core, port } = build({ flows: [flowHandoff] });
+  const r = await core.start(req({ flowId: 'care' }));
+  await core.send('i_test1', { input: { kind: 'utterance', text: '901010-1234567 입니다' } });
+  const transfer = port.log.find((l) => l[0] === 'transfer');
+  assert.equal(transfer[2], 'q_care');
+  assert.equal(r.handoff?.placement, undefined);
+});
+
+test('라우팅을 주면 배정 결과가 결과에 실리고 확정된 큐로 전달된다', b, async () => {
+  const { core, port } = build({ flows: [flowHandoff], routing: ROUTING() });
+  await core.start(req({ flowId: 'care' }));
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '901010-1234567 입니다' } });
+  assert.equal(r.handoff.placement.placement, 'queued');
+  assert.equal(r.handoff.placement.queueId, 'q_care');
+  const transfer = port.log.find((l) => l[0] === 'transfer');
+  assert.equal(transfer[2], 'q_care');
+});
+
+test('오버플로면 요청 큐가 아니라 수용 큐로 전달한다', b, async () => {
+  const routing = ROUTING({
+    snapshots: () => [
+      { queueId: 'q_care', waiting: 1, availableAgents: 2, observedAt: NOW },   // maxWaiting 1 → 꽉 참
+      { queueId: 'q_backup', waiting: 0, availableAgents: 1, observedAt: NOW },
+    ],
+  });
+  const { core, port } = build({ flows: [flowHandoff], routing });
+  await core.start(req({ flowId: 'care' }));
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '901010-1234567 입니다' } });
+  assert.equal(r.handoff.placement.overflowed, true);
+  const transfer = port.log.find((l) => l[0] === 'transfer');
+  assert.equal(transfer[2], 'q_backup', '꽉 찬 큐로 보내면 안 된다');
+});
+
+test('배정이 안 되면 transfer 를 부르지 않는다 — 대안을 채널에 넘긴다(§9.3)', b, async () => {
+  const routing = ROUTING({ snapshots: () => [] });   // 상태 미확인 → 보수적으로 닫힘
+  const { core, port } = build({ flows: [flowHandoff], routing });
+  await core.start(req({ flowId: 'care' }));
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '901010-1234567 입니다' } });
+  assert.equal(r.handoff.placement.placement, 'alternative');
+  assert.equal(r.handoff.placement.action, 'callback');
+  assert.equal(port.log.some((l) => l[0] === 'transfer'), false,
+    '큐에 못 넣었는데 transfer 를 부르면 고객은 아무도 없는 곳에서 기다린다');
+});
+
+test('스냅샷 조회가 실패해도 이관이 예외로 끝나지 않는다', b, async () => {
+  const routing = ROUTING({ snapshots: () => { throw new Error('큐 API 장애'); } });
+  const { core, port } = build({ flows: [flowHandoff], routing });
+  await core.start(req({ flowId: 'care' }));
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '901010-1234567 입니다' } });
+  assert.equal(r.status, 'transferred');
+  assert.equal(r.handoff.placement.placement, 'alternative');
+  assert.equal(port.log.some((l) => l[0] === 'transfer'), false);
+});
+
+test('이관 요약은 배정 경로를 지나도 그대로 상담사에게 간다(§2)', b, async () => {
+  const { core, port } = build({ flows: [flowHandoff], routing: ROUTING() });
+  await core.start(req({ flowId: 'care' }));
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '901010-1234567 입니다' } });
+  const transfer = port.log.find((l) => l[0] === 'transfer');
+  assert.equal(transfer[3], r.handoff.summaryMasked);
+  assert.equal(r.handoff.placement.summaryMasked, r.handoff.summaryMasked);
+  assert.equal(r.handoff.summaryMasked.includes('901010-1234567'), false, '§10.3');
+  assert.match(r.handoff.summaryMasked, /901010-\*{7}/);
+});
+
+test('깨진 라우팅 설정은 통화 중이 아니라 생성 시점에 거부된다', b, () => {
+  assert.throws(
+    () => build({ flows: [flowHandoff], routing: ROUTING({
+      config: { tenantId: 'goone', queues: QUEUES(), rules: [], defaultQueueId: 'q_오탈자' },
+    }) }),
+    /라우팅 설정 거부/,
+  );
+});
+
+test('다른 테넌트의 라우팅 설정은 배선되지 않는다(§11.1)', b, () => {
+  assert.throws(
+    () => build({ flows: [flowHandoff], routing: ROUTING({
+      config: { tenantId: 'other', queues: QUEUES().map((q) => ({ ...q, tenantId: 'other' })), rules: [], defaultQueueId: 'q_care' },
+    }) }),
+    /§11.1/,
+  );
+});
+
+test('스냅샷 조회 없이 배선하면 거부한다 — 대기 인원을 추정하지 않는다(§13-3)', b, () => {
+  assert.throws(() => build({ flows: [flowHandoff], routing: ROUTING({ snapshots: undefined }) }), /스냅샷/);
+});
+
+test('§9.3 장애 폴백 큐는 라우팅 규칙으로 다시 고르지 않는다', b, async () => {
+  // 폴백 경로가 라우팅 설정에 의존하면 설정이 깨졌을 때 폴백까지 같이 죽는다.
+  const { core, port } = build({
+    flows: [flowHandoff],
+    routing: ROUTING(),
+    samples: [{ component: 'stt', state: 'down', observedAt: NOW }],
+    policy: { fallbackQueue: 'q_정책지정' },
+  });
+  const r = await core.start(req({ flowId: 'care' }));
+  assert.equal(r.status, 'transferred');
+  const transfer = port.log.find((l) => l[0] === 'transfer');
+  assert.equal(transfer[2], 'q_정책지정');
 });

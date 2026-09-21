@@ -7,6 +7,7 @@
 // 여기서 한 번만 정의한다. 채널 저장소는 이 인터페이스만 구현하고, Core 내부 타입을 직접 만지지 않는다.
 //
 // 이 파일에는 전송·프로토콜 코드가 없다. 실제 회선·웹소켓 연결은 승인 후 각 저장소에서 붙인다 — [승인 필요].
+import type { HandoffPlacement } from '../routing/executeHandoff.ts';
 import type { ChannelKind } from '../domain/types.ts';
 import type { RenderedStep, Flow } from '../flow/types.ts';
 import type { FlowInput, FlowState, RunStatus } from '../flow/runner.ts';
@@ -64,7 +65,12 @@ export interface ChannelTurnResult {
   events: InteractionEvent[];
   /** §9.3 판정. 채널은 이 값에 따라 회선을 내리거나 상담사로 넘긴다. */
   fallback?: FallbackDecision;
-  handoff?: { queue?: string; summaryMasked?: string };
+  /**
+   * 이관 정보. `placement` 는 Core 에 라우팅이 배선된 경우에만 실린다(§2).
+   * `placement.placement !== 'queued'` 면 **큐에 사람이 들어가지 않았다** — 채널은
+   * `action`(콜백·음성사서함·기존 IVR)을 수행해야 하며, 상담사 연결 안내를 해서는 안 된다(§9.3).
+   */
+  handoff?: { queue?: string; summaryMasked?: string; placement?: HandoffPlacement };
 }
 
 /**
