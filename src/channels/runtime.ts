@@ -13,7 +13,7 @@ import type { ChannelKind, Handoff, Interaction, Turn } from '../domain/types.ts
 import { resolveOutcome } from '../domain/types.ts';
 import type { Flow, RenderedStep } from '../flow/types.ts';
 import { renderNode } from '../flow/types.ts';
-import type { FlowState, RunStatus, RunnerContext } from '../flow/runner.ts';
+import type { FlowInput, FlowState, RunResult, RunStatus, RunnerContext } from '../flow/runner.ts';
 import { start as runnerStart, send as runnerSend } from '../flow/runner.ts';
 import type { RepromptPolicy } from '../flow/reprompt.ts';
 import { repromptPolicyOk, validateRepromptPolicy } from '../flow/reprompt.ts';
@@ -32,6 +32,8 @@ import type { AdmissionOptions, QueueSnapshot, RoutingConfig } from '../routing/
 import { validateRoutingConfig } from '../routing/agentQueue.ts';
 import type { HandoffPlacement } from '../routing/executeHandoff.ts';
 import { executeHandoff } from '../routing/executeHandoff.ts';
+import type { ConnectorPumpBinding } from '../integration/connectorPump.ts';
+import { connectorHopLimit, hopLimitInput, missingConnectors, pumpConnectorHop } from '../integration/connectorPump.ts';
 import type {
   ChannelAdapterId, ChannelHealthReport, ChannelRegistration, ChannelSessionRequest,
   ChannelTurnInput, ChannelTurnResult, ConversationCorePort, ContractIssue, ChannelCapabilities,
@@ -73,6 +75,17 @@ export interface SessionRecord {
   correlationId?: string;
   ended: boolean;
   lastResult: ChannelTurnResult;
+  /**
+   * 진행 중인 Api 대기 건의 호출 회차(§6.1). **논리적 호출 1건 = 멱등 키 1개**이므로 세션에 남긴다 —
+   * 펌프가 부를 때마다 회차를 올리면 키가 매번 달라져 command 커넥터에서 이중 신청이 되고,
+   * 장애 로그에는 성공 두 건만 남는다. 커넥터가 결과를 내면 지워지고, 시나리오가 onError 를 지나
+   * 같은 Api 노드를 **다시 밟았을 때만** 회차가 올라간다(그때는 정말로 새 호출이다).
+   */
+  connectorCall?: { connectorId: string; call: number };
+  /** 커넥터별 누적 호출 회차. 멱등 키가 논리적 호출 단위로 갈리게 한다. */
+  connectorCalls?: Record<string, number>;
+  /** 펌프 실행 중 표시. 같은 대기 건에 두 번 들어와 업무시스템을 두 번 부르는 것을 막는다. */
+  connectorInFlight?: boolean;
 }
 
 /** 세션 저장소. 인메모리는 단일 프로세스용 — 영속 구현은 이 인터페이스 뒤로 교체한다(§6.2). */
@@ -135,6 +148,16 @@ export interface ConversationCoreOptions {
   summary?: SummaryOptions;
   /** 상담사 큐 배정(§2). 미지정 시 큐 판정을 하지 않는다 — 종전 동작과 동일하다(§13-3). */
   routing?: RoutingBinding;
+  /**
+   * Api 노드 이행(§6.1). **주지 않으면 종전과 완전히 같다**(§13-3) — Api 노드에서
+   * `state.pendingConnectorId` 만 세운 채 멈추고, 호스트가 직접 커넥터를 불러
+   * `send({ input: { kind: 'connectorResult', ... } })` 로 되돌려준다.
+   *
+   * 주면 Core 가 `integration/connectorPump.ts` 로 이행한다. 이 배선이 없으면 실행기(§14)는
+   * **아무도 부르지 않는** 상태로 남고, 증상은 예외가 아니라 **무음**이다 — Api 대기 중
+   * 커넥터 결과가 아닌 입력은 빈 결과가 되어 고객이 무슨 말을 해도 채널이 렌더할 것이 없다.
+   */
+  connectors?: ConnectorPumpBinding;
   now?: () => string;
   newInteractionId?: (req: ChannelSessionRequest) => string;
   onPublish?: (results: PublishResult[]) => void;
@@ -352,6 +375,109 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     return result;
   }
 
+  /** 이번 Api 대기 건의 호출 회차. 같은 대기 건에 다시 들어오면 **같은 회차**를 돌려준다. */
+  function connectorCallNo(rec: SessionRecord, connectorId: string): number {
+    if (rec.connectorCall && rec.connectorCall.connectorId === connectorId) return rec.connectorCall.call;
+    const calls = rec.connectorCalls ?? {};
+    const call = (calls[connectorId] ?? 0) + 1;
+    calls[connectorId] = call;
+    rec.connectorCalls = calls;
+    rec.connectorCall = { connectorId, call };
+    return call;
+  }
+
+  /**
+   * Api 대기 이행(§6.1). 배선이 없으면 **아무것도 하지 않는다** — 종전과 완전히 같다(§13-3).
+   *
+   * 여기서 지키는 것:
+   * - **대기 안내는 호출 전에 나간다.** `waitText` 가 선언된 Api 단계는 무음이 아니다. 호출이 끝난
+   *   뒤에 "잠시만 기다려 주세요"를 내보내면 안내가 아니라 잡음이고, 그 사이는 통째로 무음이 된다.
+   *   그래서 홉마다 **직전까지의 단계를 먼저 present** 하고 나서 업무시스템을 부른다.
+   * - **재진입해도 업무시스템을 두 번 부르지 않는다**(`connectorInFlight`) — command 커넥터에서
+   *   이중 신청으로 나타나고, 예외가 없어 장애로 보이지 않는다.
+   * - **순환은 구조적 상한으로 끊는다.** `onError` 가 Api 노드를 다시 가리키면 영원히 돌 수 있다.
+   *   상한에 걸리면 실패 입력을 한 번 넣어 §9.3 이관을 돌리고, 그래도 다시 대기가 서면
+   *   `advance()` 의 순회 상한과 같이 **세션을 실패로 끝낸다** — 고객을 무음에 두지 않는다.
+   * - **테넌트 격리 위반은 삼키지 않는다**(§11.1). 실행기가 던지는 유일한 경우이며 그대로 올린다.
+   */
+  async function drainConnectors(
+    rec: SessionRecord, reg: ChannelRegistration, run: RunResult,
+  ): Promise<{ steps: RenderedStep[]; events: InteractionEvent[]; presented: number; endReasonKo?: string }> {
+    const binding = opts.connectors;
+    const steps: RenderedStep[] = [...run.steps];
+    const events: InteractionEvent[] = [...run.events];
+    let presented = 0;
+    if (!binding || rec.state.pendingConnectorId === undefined) return { steps, events, presented };
+    // 같은 대기 건에 두 번 들어왔다. 두 번 부르지 않고 조용히 물러난다 — 이행은 앞의 호출이 끝낸다.
+    if (rec.connectorInFlight) return { steps, events, presented };
+
+    const limit = connectorHopLimit(rec.flow);
+    rec.connectorInFlight = true;
+    try {
+      for (let hops = 0; rec.state.pendingConnectorId !== undefined; hops++) {
+        const connectorId = rec.state.pendingConnectorId;
+        // 호출 회차를 **안내·호출보다 먼저** 정하고 저장한다. 여기서 정해 두면 안내 전달이나
+        // 호출 도중 턴이 끊겨도(영속 세션 저장소에서는 프로세스 재기동까지) 되살아난 세션이
+        // **같은 멱등 키**로 재개한다 — 회차를 호출 직전에 만들면 재개가 곧 이중 신청이다.
+        const call = connectorCallNo(rec, connectorId);
+        sessions.put(rec);                       // 호출 전에 상태를 남긴다(호출 중 중단되어도 잃지 않게)
+        const ahead = visibleSteps(steps.slice(presented));
+        presented = steps.length;
+        if (ahead.length > 0) await reg.port.present(rec.interactionId, ahead);
+
+        let input: FlowInput;
+        if (hops >= limit) {
+          input = hopLimitInput();
+        } else {
+          const hop = await pumpConnectorHop({
+            binding,
+            connectorId,
+            scope: rec.scope,
+            interactionId: rec.interactionId,
+            slots: { ...rec.state.slots },
+            call,
+            onHealth: (s) => opts.health.record(s),
+            now,
+          });
+          input = hop.input;
+          // 설정 오류·동의 조립 예외를 삼키지 않는다. 보고 훅이 없으면 조용히 진행한다(§13-3).
+          if (binding.onBlock && (hop.block !== undefined || hop.consentError !== undefined)) {
+            binding.onBlock({
+              interactionId: rec.interactionId, connectorId,
+              ...(hop.block !== undefined ? { block: hop.block } : {}),
+              ...(hop.consentError !== undefined ? { consentError: hop.consentError } : {}),
+            });
+          }
+        }
+        if (hops >= limit && binding.onBlock) {
+          binding.onBlock({ interactionId: rec.interactionId, connectorId, block: 'hop_limit' });
+        }
+
+        const next = runnerSend(rec.flow, rec.state, input, runnerCtx(rec, reg.port.capabilities));
+        rec.state = next.state;
+        steps.push(...next.steps);
+        events.push(...next.events);
+        delete rec.connectorCall;                // 결과가 왔다 — 다음에 같은 노드를 밟으면 새 호출이다
+
+        if (hops >= limit && rec.state.pendingConnectorId !== undefined) {
+          // 실패 입력조차 다시 Api 대기로 돌아왔다. 시나리오 순환이며 진행할 방법이 없다.
+          delete rec.state.pendingConnectorId;
+          rec.state.status = 'failed';
+          rec.state.currentNodeId = null;
+          rec.state.error = 'Api 노드 순회 상한 초과(커넥터 순환 의심)';
+          events.push(sessionEnded(meta(rec), { outcome: 'FAILED', turnCount: rec.state.turnCount }));
+          rec.ended = true;
+          sessions.put(rec);
+          return { steps, events, presented, endReasonKo: rec.state.error };
+        }
+      }
+    } finally {
+      rec.connectorInFlight = false;
+    }
+    sessions.put(rec);
+    return { steps, events, presented };
+  }
+
   /**
    * 상담사 큐 배정. 배선이 없으면 `undefined` 를 돌려주고 호출부는 종전 경로를 탄다(§13-3).
    *
@@ -465,6 +591,16 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
         // 렌더 불가 노드를 가진 시나리오는 시작하지 않는다 — 통화 중간에 막히는 것이 더 나쁘다(§5.3).
         throw new Error(`${req.adapter} 채널에서 실행할 수 없는 시나리오입니다: ${unsupported.map((i) => i.messageKo).join(' / ')}`);
       }
+      if (opts.connectors) {
+        // 렌더 불가 노드와 같은 이유로 **시작 전에** 본다(§5.3). 커넥터 id 오타·미배포는 통화 중에
+        // 예외가 아니라 조회 실패로만 나타나고, 그때는 이미 고객이 회선에 있다.
+        const missing = missingConnectors(flow, opts.connectors.connectors);
+        if (missing.length > 0) {
+          throw new Error(
+            `선언되지 않은 커넥터를 가리키는 Api 노드가 있습니다: ${missing.map((m) => `${m.nodeId}→${m.connectorId}`).join(', ')} (설계서 §6.1)`,
+          );
+        }
+      }
 
       const channel = ADAPTER_CHANNEL[req.adapter];
       const interactionId = newId(req);
@@ -493,21 +629,26 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       for (const [k, v] of Object.entries(req.presetSlots ?? {})) {
         if (!k.startsWith('__')) rec.state.slots[k] = v;   // 예약 슬롯은 채널이 덮어쓸 수 없다
       }
-      const events = run.events;
+      // Api 노드는 여기서 이행한다. presetSlots 를 병합한 **뒤에** 부른다 — 커넥터 파라미터가
+      // 채널이 넘긴 슬롯에서 오는 경우(발신번호·회원번호) 앞서 부르면 필수 슬롯 누락으로 막힌다.
+      const drained = await drainConnectors(rec, reg, run);
+      const events = drained.events;
       recordTurns(rec, events);
       const summaryMasked = rec.state.handoff ? attachSummary(rec, events) : undefined;
       rec.ended = rec.state.status !== 'running';
       const result: ChannelTurnResult = {
-        interactionId, state: rec.state, steps: run.steps, status: rec.state.status, events,
+        interactionId, state: rec.state, steps: drained.steps, status: rec.state.status, events,
         ...(decision.mode === 'degraded_ai' ? { fallback: decision } : {}),
         ...(rec.state.handoff ? { handoff: { ...(rec.state.handoff.queue !== undefined ? { queue: rec.state.handoff.queue } : {}), ...(summaryMasked !== undefined ? { summaryMasked } : {}) } } : {}),
       };
       rec.lastResult = result;
       sessions.put(rec);                 // 전달 실패로 상태를 잃지 않도록 먼저 저장한다
       await publish(events);
-      const shown = visibleSteps(run.steps);
+      // 펌프가 이미 내보낸 단계는 다시 내보내지 않는다 — 대기 안내가 두 번 나가면 안내가 아니다.
+      const shown = visibleSteps(drained.steps.slice(drained.presented));
       if (shown.length > 0) await reg.port.present(interactionId, shown);
       await deliverHandoff(reg, rec, summaryMasked, result);
+      if (drained.endReasonKo !== undefined) await reg.port.end(interactionId, drained.endReasonKo);
       return result;
     },
 
@@ -528,23 +669,25 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       const run = runnerSend(rec.flow, rec.state, turn.input, ctx);
       rec.state = run.state;
 
-      const events = run.events;
       if (turn.usage !== undefined) {
         // §11.2 과금 근거는 실측만 싣는다. 이번 턴의 고객 발화 이벤트에 붙인다.
-        for (let idx = events.length - 1; idx >= 0; idx--) {
-          const e = events[idx];
+        // 커넥터 이행 **전에** 붙인다 — 이행이 만든 봇 발화가 뒤에 쌓여도 대상이 흔들리지 않게.
+        for (let idx = run.events.length - 1; idx >= 0; idx--) {
+          const e = run.events[idx];
           if (e && e.type === 'turn.completed' && (e as TurnCompletedEvent).speaker === 'customer') {
-            events[idx] = { ...(e as TurnCompletedEvent), usage: turn.usage };
+            run.events[idx] = { ...(e as TurnCompletedEvent), usage: turn.usage };
             break;
           }
         }
       }
+      const drained = await drainConnectors(rec, reg, run);
+      const events = drained.events;
       const summaryMasked = rec.state.handoff ? attachSummary(rec, events) : undefined;
       if (!rec.state.handoff) recordTurns(rec, events);
       rec.ended = rec.state.status !== 'running';
 
       const result: ChannelTurnResult = {
-        interactionId, state: rec.state, steps: run.steps, status: rec.state.status, events,
+        interactionId, state: rec.state, steps: drained.steps, status: rec.state.status, events,
         ...(decision.mode === 'degraded_ai' ? { fallback: decision } : {}),
         ...(rec.state.handoff ? { handoff: { ...(rec.state.handoff.queue !== undefined ? { queue: rec.state.handoff.queue } : {}), ...(summaryMasked !== undefined ? { summaryMasked } : {}) } } : {}),
       };
@@ -552,9 +695,10 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       sessions.put(rec);
       await publish(events);
       await inviteIfSwitched(prevChannel, rec.state.channel, rec, reg);
-      const shown = visibleSteps(run.steps);
+      const shown = visibleSteps(drained.steps.slice(drained.presented));
       if (shown.length > 0) await reg.port.present(interactionId, shown);
       await deliverHandoff(reg, rec, summaryMasked, result);
+      if (drained.endReasonKo !== undefined) await reg.port.end(interactionId, drained.endReasonKo);
       return result;
     },
 

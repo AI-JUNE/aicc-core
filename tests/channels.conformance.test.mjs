@@ -218,3 +218,58 @@ test('힌트가 붙은 단계를 고쳐 쓰는 구현을 잡는다(이벤트·�
   const r = await m.runChannelConformance({ port, timeoutMs: 500 });
   assert.equal(r.checks.find((c) => c.id === 'TURN_HINTS').passed, false);
 });
+
+// ── Api 대기 이행 (§6.1) ─────────────────────────────────────────────────────
+
+test('CONNECTOR_WAIT: 한 턴에 present 가 두 번 오는 것을 흡수하면 통과한다', b, async () => {
+  const port = m.createDryRunPort({ id: 'callbot' });
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  const c = r.checks.find((x) => x.id === 'CONNECTOR_WAIT');
+  assert.equal(c.passed, true, c.messageKo);
+  assert.equal(c.severity, 'error');
+});
+
+test('CONNECTOR_WAIT: 한 턴 = present 한 번으로 가정한 포트를 잡는다 — 배선을 켜는 순간 깨진다', b, async () => {
+  // 화면을 통째로 갈아 끼우는 구현에서 흔한 일회성 가드. 커넥터 배선이 없는 동안에는
+  // 아무 문제도 나타나지 않고, 설정 하나를 바꾼 날 전 통화가 깨진다.
+  const seen = new Set();
+  const port = m.createDryRunPort({ id: 'callbot' });
+  const inner = port.present.bind(port);
+  port.present = async (iid, steps) => {
+    if (seen.has(iid)) throw new Error('이미 렌더된 턴입니다');
+    seen.add(iid);
+    return inner(iid, steps);
+  };
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  const c = r.checks.find((x) => x.id === 'CONNECTOR_WAIT');
+  assert.equal(c.passed, false);
+  assert.match(c.messageKo, /present 는 여러 번 올 수 있습니다/);
+  assert.equal(r.passed, false);
+});
+
+test('CONNECTOR_WAIT: Api 대기 단계를 변형하는 포트를 잡는다 — 같은 배열이 이력에 쓰인다', b, async () => {
+  const port = m.createDryRunPort({ id: 'dars' });
+  const inner = port.present.bind(port);
+  port.present = async (iid, steps) => {
+    for (const s of steps) delete s.awaitConnectorId;   // "모르는 필드니까 지운다"
+    return inner(iid, steps);
+  };
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  const c = r.checks.find((x) => x.id === 'CONNECTOR_WAIT');
+  assert.equal(c.passed, false);
+  assert.match(c.messageKo, /변형/);
+});
+
+test('CONNECTOR_WAIT: 모르는 단계 종류(Api)에 던지는 포트를 잡는다 — 호출은 Core 가 한다(§6.2)', b, async () => {
+  const port = m.createDryRunPort({ id: 'chatbot' });
+  const inner = port.present.bind(port);
+  port.present = async (iid, steps) => {
+    for (const s of steps) {
+      if (s.kind === 'Api') throw new Error(`처리할 수 없는 단계 종류: ${s.kind}`);
+    }
+    return inner(iid, steps);
+  };
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  const c = r.checks.find((x) => x.id === 'CONNECTOR_WAIT');
+  assert.equal(c.passed, false);
+});

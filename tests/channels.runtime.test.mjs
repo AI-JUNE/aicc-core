@@ -48,7 +48,7 @@ function fakePort(id = 'callbot', capsOver = {}, over = {}) {
   };
 }
 
-function build({ flows = [flowBilling], port = fakePort(), samples = [], policy = {}, components, reprompt, timing, routing } = {}) {
+function build({ flows = [flowBilling], port = fakePort(), samples = [], policy = {}, components, reprompt, timing, routing, connectors } = {}) {
   const collector = B.createCollectorSink('t');
   const bus = B.createEventBus({
     scope: SCOPE, sinks: [collector],
@@ -68,6 +68,7 @@ function build({ flows = [flowBilling], port = fakePort(), samples = [], policy 
     ...(reprompt !== undefined ? { reprompt } : {}),
     ...(timing !== undefined ? { timing } : {}),
     ...(routing !== undefined ? { routing } : {}),
+    ...(connectors !== undefined ? { connectors } : {}),
   });
   return { core, port, collector, health };
 }
@@ -417,4 +418,321 @@ test('§9.3 장애 폴백 큐는 라우팅 규칙으로 다시 고르지 않는�
   assert.equal(r.status, 'transferred');
   const transfer = port.log.find((l) => l[0] === 'transfer');
   assert.equal(transfer[2], 'q_정책지정');
+});
+
+// ── Api 노드 이행 배선 (§6.1) ────────────────────────────────────────────────
+//
+// 여기서 고정하는 것은 **무음으로 멈추지 않는 것**이다. 배선이 없던 동안 Api 노드에 도달한 통화는
+// 예외 없이 멈춰 있었다 — runner.send 가 커넥터 결과 외의 입력에 빈 결과를 돌려주므로 고객이
+// 무슨 말을 해도 steps 0건·events 0건이 나가고, 어떤 알림도 울리지 않는다.
+
+const flowApi = (over = {}) => ({
+  id: 'api', version: 1, startNodeId: 'ask',
+  nodes: {
+    ask: { id: 'ask', kind: 'Collect', slot: 'account_no', prompt: '계좌번호를 말씀해 주세요.', next: 'lookup' },
+    lookup: { id: 'lookup', kind: 'Api', connectorId: 'c_balance', waitText: '조회 중입니다. 잠시만 기다려 주세요.', ...over },
+    tell: { id: 'tell', kind: 'Say', text: '조회가 끝났습니다.' },
+    sorry: { id: 'sorry', kind: 'Say', text: '지금은 조회가 어렵습니다.' },
+  },
+});
+// lookup.next 는 over 로 덮이지 않게 별도로 붙인다
+const flowApiOk = () => { const f = flowApi(); f.nodes.lookup.next = 'tell'; return f; };
+const flowApiOnError = () => { const f = flowApiOk(); f.nodes.lookup.onError = 'sorry'; return f; };
+const flowApiNoError = () => flowApiOk();
+/** onError 가 다시 Api 노드를 가리키는 순환 시나리오. 설정 사고이며 통화 중에 드러난다. */
+const flowApiCycle = () => { const f = flowApiOk(); f.nodes.lookup.onError = 'lookup'; return f; };
+
+const CDEF = (over = {}) => ({
+  id: 'c_balance', tenantId: 'goone', name: '잔액조회', method: 'query',
+  endpointRef: 'secret://core/balance', residency: 'domestic', timeoutMs: 3000,
+  params: [{ name: 'acct', fromSlot: 'account_no', required: true }],
+  outputs: [{ field: 'balance', toSlot: 'balance' }],
+  onFailure: 'branch', ...over,
+});
+
+/** 포트 호출을 채널 로그와 **같은 배열**에 남긴다 — 안내와 호출의 순서를 직접 재기 위해서다. */
+function wiring({ responses = [{ ok: true, data: { balance: '10000' } }], defs = [CDEF()], log, ...over } = {}) {
+  const calls = [];
+  return {
+    calls,
+    binding: {
+      connectors: { get: (id) => defs.find((d) => d.id === id) },
+      port: {
+        async call(req) {
+          calls.push(req);
+          if (log) log.push(['connector', req.connectorId, req.idempotencyKey]);
+          const r = responses[Math.min(calls.length - 1, responses.length - 1)];
+          return typeof r === 'function' ? r(req) : r;
+        },
+      },
+      allowOverseas: false,
+      ...over,
+    },
+  };
+}
+
+test('배선이 없으면 종전과 완전히 같다 — Api 대기만 세우고 멈춘다(§13-3)', b, async () => {
+  const { core, port } = build({ flows: [flowApiOk()] });
+  await core.start(req({ flowId: 'api' }));
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '110-1234' } });
+  assert.equal(r.state.pendingConnectorId, 'c_balance');
+  assert.equal(r.status, 'running');
+  // 그리고 이 상태에서 고객이 말을 걸면 **아무것도 나가지 않는다** — 이것이 배선 전의 증상이다.
+  const stuck = await core.send('i_test1', { input: { kind: 'utterance', text: '여보세요?' } });
+  assert.deepEqual(stuck.steps, []);
+  assert.deepEqual(stuck.events, []);
+  assert.equal(stuck.state.pendingConnectorId, 'c_balance');
+  assert.equal(port.log.filter((l) => l[0] === 'present').length, 2);   // 첫 프롬프트 + 대기 안내
+});
+
+test('배선하면 Api 노드가 이행되어 다음 노드까지 진행한다 — 통화가 멈추지 않는다', b, async () => {
+  const w = wiring();
+  const { core, port } = build({ flows: [flowApiOk()], connectors: w.binding });
+  await core.start(req({ flowId: 'api' }));
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '110-1234' } });
+  assert.equal(r.state.pendingConnectorId, undefined);
+  assert.equal(r.state.slots.balance, '10000');
+  assert.equal(w.calls.length, 1);
+  assert.equal(r.status, 'completed');
+  assert.deepEqual(r.steps.map((s) => s.nodeId), ['lookup', 'tell']);
+  const presented = port.log.filter((l) => l[0] === 'present').flatMap((l) => l[2]);
+  assert.deepEqual(presented, ['ask', 'lookup', 'tell']);
+});
+
+test('대기 안내는 **호출 전에** 나간다 — 조회가 끝난 뒤의 "기다려 주세요"는 안내가 아니다', b, async () => {
+  const log = [];
+  const port = fakePort('callbot', {}, {
+    async present(iid, steps) { log.push(['present', iid, steps.map((s) => s.nodeId)]); },
+  });
+  port.log = log;
+  const w = wiring({ log });
+  const { core } = build({ flows: [flowApiOk()], port, connectors: w.binding });
+  await core.start(req({ flowId: 'api' }));
+  await core.send('i_test1', { input: { kind: 'utterance', text: '110-1234' } });
+  const order = log.map((l) => (l[0] === 'connector' ? 'connector' : l[2].join('+')));
+  // 'lookup'(대기 안내) → 'connector' → 'tell'(결과). 순서가 바뀌면 그 사이가 통째로 무음이 된다.
+  assert.deepEqual(order, ['ask', 'lookup', 'connector', 'tell']);
+});
+
+test('무음 Api 단계(waitText 없음)는 present 하지 않는다', b, async () => {
+  const f = flowApiOk();
+  delete f.nodes.lookup.waitText;
+  const w = wiring();
+  const { core, port } = build({ flows: [f], connectors: w.binding });
+  await core.start(req({ flowId: 'api' }));
+  await core.send('i_test1', { input: { kind: 'utterance', text: '110-1234' } });
+  const presented = port.log.filter((l) => l[0] === 'present').flatMap((l) => l[2]);
+  assert.deepEqual(presented, ['ask', 'tell']);
+});
+
+test('호출 실패는 onError 분기로 간다 — 실패 카운트를 올리지 않는다', b, async () => {
+  const w = wiring({ responses: [{ ok: false, code: 'unavailable' }] });
+  const { core } = build({ flows: [flowApiOnError()], connectors: w.binding });
+  await core.start(req({ flowId: 'api' }));
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '110-1234' } });
+  assert.deepEqual(r.steps.map((s) => s.nodeId), ['lookup', 'sorry']);
+  assert.equal(r.state.slots.__last_connector_error__, 'unavailable');
+  assert.equal(r.state.failCount, 0);
+});
+
+test('onError 가 없으면 §9.3 에 따라 상담사로 내려간다 — 조회 실패로 콜을 끊지 않는다', b, async () => {
+  const w = wiring({ responses: [{ ok: false, code: 'unavailable' }] });
+  const { core, port } = build({ flows: [flowApiNoError()], connectors: w.binding });
+  // onError 없는 시나리오로 만든다
+  await core.start(req({ flowId: 'api' }));
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '110-1234' } });
+  assert.equal(r.status, 'transferred');
+  assert.equal(r.handoff.summaryMasked !== undefined, true);
+  assert.equal(port.log.some((l) => l[0] === 'transfer'), true);
+});
+
+test('동의가 없어 막힌 호출은 성공으로 넘어가지 않는다 — 고객이 빈 안내를 듣지 않는다(§10.1)', b, async () => {
+  const piiFlow = flowApiOnError();
+  const w = wiring({ defs: [CDEF({ params: [{ name: 'rrn', fromSlot: 'account_no', required: true, pii: true }] })] });
+  const { core } = build({ flows: [piiFlow], connectors: w.binding });
+  await core.start(req({ flowId: 'api' }));
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '900101-1234567' } });
+  assert.equal(w.calls.length, 0);
+  assert.deepEqual(r.steps.map((s) => s.nodeId), ['lookup', 'sorry']);
+  assert.equal(r.state.slots.__last_connector_error__, 'consent_context_missing');
+});
+
+test('선언되지 않은 커넥터를 가리키는 시나리오는 시작하지 않는다 — 통화 중간에 막히는 것이 더 나쁘다', b, async () => {
+  const w = wiring({ defs: [] });
+  const { core } = build({ flows: [flowApiOk()], connectors: w.binding });
+  await assert.rejects(() => core.start(req({ flowId: 'api' })), /선언되지 않은 커넥터/);
+});
+
+test('배선이 없으면 미선언 커넥터도 시작을 막지 않는다 — 종전 동작을 바꾸지 않는다(§13-3)', b, async () => {
+  const { core } = build({ flows: [flowApiOk()] });
+  const r = await core.start(req({ flowId: 'api' }));
+  assert.equal(r.status, 'running');
+});
+
+test('멱등 키는 같은 대기 건에 고정된다 — 이중 신청이 되면 로그에는 성공 두 건만 남는다', b, async () => {
+  // 재시도를 선언한 커넥터. 실행기가 두 번 부르더라도 키는 하나여야 한다.
+  const w = wiring({
+    defs: [CDEF({ retry: { maxAttempts: 2, retryOn: ['unavailable'] } })],
+    responses: [{ ok: false, code: 'unavailable' }, { ok: true, data: { balance: '7' } }],
+    backoffMs: () => 0,
+  });
+  const { core } = build({ flows: [flowApiOk()], connectors: w.binding });
+  await core.start(req({ flowId: 'api' }));
+  await core.send('i_test1', { input: { kind: 'utterance', text: '110-1234' } });
+  assert.equal(w.calls.length, 2);
+  assert.equal(w.calls[0].idempotencyKey, w.calls[1].idempotencyKey);
+  assert.deepEqual(w.calls.map((c) => c.attempt), [1, 2]);
+});
+
+test('안내 전달이 끊겨 재개해도 **같은 멱등 키**로 부른다 — 재개가 이중 신청이 되면 안 된다', b, async () => {
+  // Api 노드 둘. 두 번째 대기 안내 전달이 한 번 실패해 턴이 끊긴 뒤 채널이 다시 보낸다.
+  // 영속 세션 저장소에서는 프로세스 재기동이 정확히 이 모양이다.
+  const f = flowApiOk();
+  f.nodes.lookup.next = 'lookup2';
+  f.nodes.lookup2 = { id: 'lookup2', kind: 'Api', connectorId: 'c_apply', waitText: '신청 중입니다.', next: 'tell' };
+  let failNext = true;
+  const port = fakePort('callbot', {}, {
+    async present(iid, steps) {
+      const ids = steps.map((s) => s.nodeId);
+      if (failNext && ids.includes('lookup2')) { failNext = false; throw new Error('매체 전달 실패'); }
+      port.log.push(['present', iid, ids]);
+    },
+  });
+  const w = wiring({
+    defs: [CDEF(), CDEF({ id: 'c_apply', method: 'command', params: [], outputs: [] })],
+    responses: [{ ok: true, data: { balance: '1' } }, { ok: true, data: {} }],
+  });
+  const { core } = build({ flows: [f], port, connectors: w.binding });
+  await core.start(req({ flowId: 'api' }));
+  await assert.rejects(() => core.send('i_test1', { input: { kind: 'utterance', text: '110-1234' } }), /매체 전달 실패/);
+  // 첫 조회는 끝났고 신청(command)은 **아직 부르지 않았다**.
+  assert.deepEqual(w.calls.map((c) => c.connectorId), ['c_balance']);
+  assert.equal(core.sessions.get('i_test1').state.pendingConnectorId, 'c_apply');
+
+  // 채널이 다시 보낸다(대기 중이므로 발화는 흐름을 흔들지 않는다).
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '여보세요?' } });
+  const applyCalls = w.calls.filter((c) => c.connectorId === 'c_apply');
+  assert.equal(applyCalls.length, 1);
+  assert.equal(applyCalls[0].idempotencyKey, 'i_test1:c_apply:1');   // 회차가 오르지 않았다
+  assert.equal(r.status, 'completed');
+});
+
+test('같은 Api 노드를 다시 밟으면 새 호출이므로 키가 바뀐다', b, async () => {
+  // onError 가 Say 를 거쳐 다시 조회로 오는 구조 대신, 두 통화의 키가 갈리는지로 논리를 고정한다.
+  const w = wiring();
+  const { core } = build({ flows: [flowApiOk()], connectors: w.binding });
+  await core.start(req({ flowId: 'api' }));
+  await core.send('i_test1', { input: { kind: 'utterance', text: '110-1234' } });
+  const first = w.calls[0].idempotencyKey;
+  assert.match(first, /:1$/);
+  assert.match(first, /^i_test1:c_balance:/);
+});
+
+test('순환(onError→Api)은 구조적 상한에서 끊기고 세션이 실패로 끝난다 — 고객을 무음에 두지 않는다', b, async () => {
+  const w = wiring({ responses: [{ ok: false, code: 'unavailable' }] });
+  const blocks = [];
+  w.binding.onBlock = (i) => blocks.push(i.block);
+  const { core, port } = build({ flows: [flowApiCycle()], connectors: w.binding });
+  await core.start(req({ flowId: 'api' }));
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '110-1234' } });
+  assert.equal(r.status, 'failed');
+  assert.match(r.state.error, /순회 상한/);
+  assert.equal(r.state.pendingConnectorId, undefined);
+  assert.equal(port.log.some((l) => l[0] === 'end'), true);
+  assert.equal(blocks.includes('hop_limit'), true);
+  // 상한이 없으면 이 호출이 끝나지 않는다 — 호출 횟수가 상한(Api 1개 + 1)을 넘지 않았음을 고정한다.
+  assert.ok(w.calls.length <= 2, `호출 ${w.calls.length}회 — 상한을 넘었다`);
+});
+
+test('설정 오류는 보고 훅으로 드러난다 — 커넥터 id 오타는 예외가 아니라 조회 실패로만 나타난다', b, async () => {
+  // 시작은 통과시키되 통화 중에 레지스트리에서 사라진 경우(재배포).
+  const defs = [CDEF()];
+  const blocks = [];
+  const w = wiring({ defs });
+  w.binding.onBlock = (i) => blocks.push(i);
+  const { core } = build({ flows: [flowApiOnError()], connectors: w.binding });
+  await core.start(req({ flowId: 'api' }));
+  defs.length = 0;                                  // 대기 직전에 선언이 사라졌다
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '110-1234' } });
+  assert.equal(blocks.length, 1);
+  assert.equal(blocks[0].block, 'connector_undefined');
+  assert.equal(blocks[0].connectorId, 'c_balance');
+  assert.equal(r.state.slots.__last_connector_error__, 'connector_undefined');
+  assert.deepEqual(r.steps.map((s) => s.nodeId), ['lookup', 'sorry']);
+});
+
+test('선언 미존재를 업무시스템 장애로 적지 않는다 — 전 채널이 상담사 직결로 떨어지면 안 된다', b, async () => {
+  const defs = [CDEF()];
+  const w = wiring({ defs });
+  const { core, health } = build({ flows: [flowApiOnError()], connectors: w.binding });
+  await core.start(req({ flowId: 'api' }));
+  defs.length = 0;
+  await core.send('i_test1', { input: { kind: 'utterance', text: '110-1234' } });
+  assert.equal(health.latest('backend'), undefined);
+});
+
+test('업무시스템 실패는 Core 헬스에 그대로 집계된다(§9.3)', b, async () => {
+  const w = wiring({ responses: [{ ok: false, code: 'unavailable' }] });
+  const { core, health } = build({ flows: [flowApiOnError()], connectors: w.binding });
+  await core.start(req({ flowId: 'api' }));
+  await core.send('i_test1', { input: { kind: 'utterance', text: '110-1234' } });
+  const s = health.latest('backend');
+  assert.equal(s.state, 'down');
+  assert.equal(s.observedAt, NOW);
+});
+
+test('presetSlots 는 이행 전에 병합된다 — 채널이 넘긴 슬롯으로 조회한다', b, async () => {
+  const f = flowApiOk();
+  f.startNodeId = 'lookup';                        // 시작 즉시 조회
+  const w = wiring();
+  const { core } = build({ flows: [f], connectors: w.binding });
+  const r = await core.start(req({ flowId: 'api', presetSlots: { account_no: '110-9999' } }));
+  assert.equal(w.calls.length, 1);
+  assert.equal(w.calls[0].params.acct, '110-9999');
+  assert.equal(r.state.slots.balance, '10000');
+  assert.equal(r.status, 'completed');
+});
+
+test('이행 중 발행된 이벤트는 한 번만 나간다 — 중복 집계가 과금으로 나타난다(§8.1)', b, async () => {
+  const w = wiring();
+  const { core, collector } = build({ flows: [flowApiOk()], connectors: w.binding });
+  await core.start(req({ flowId: 'api' }));
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '110-1234' } });
+  const ids = collector.events.map((e) => e.event_id);
+  assert.equal(new Set(ids).size, ids.length);
+  const resultIds = r.events.map((e) => e.event_id);
+  assert.equal(new Set(resultIds).size, resultIds.length);
+});
+
+test('과금 근거는 커넥터가 만든 봇 발화가 아니라 고객 발화에 붙는다(§11.2)', b, async () => {
+  const w = wiring();
+  const { core } = build({ flows: [flowApiOk()], connectors: w.binding });
+  await core.start(req({ flowId: 'api' }));
+  const r = await core.send('i_test1', {
+    input: { kind: 'utterance', text: '110-1234' },
+    usage: { stt_audio_ms: 1200 },
+  });
+  const withUsage = r.events.filter((e) => e.type === 'turn.completed' && e.usage !== undefined);
+  assert.equal(withUsage.length, 1);
+  assert.equal(withUsage[0].speaker, 'customer');
+});
+
+test('다른 테넌트 커넥터 호출은 폴백하지 않고 던진다(§11.1)', b, async () => {
+  const w = wiring({ defs: [CDEF({ tenantId: 'other' })] });
+  const { core } = build({ flows: [flowApiOk()], connectors: w.binding });
+  await core.start(req({ flowId: 'api' }));
+  await assert.rejects(
+    () => core.send('i_test1', { input: { kind: 'utterance', text: '110-1234' } }),
+    /§11\.1|테넌트/,
+  );
+});
+
+test('호스트가 직접 커넥터 결과를 넣는 경로는 배선이 있어도 그대로 동작한다', b, async () => {
+  const w = wiring();
+  const { core } = build({ flows: [flowApiOk()], connectors: w.binding });
+  await core.start(req({ flowId: 'api' }));
+  // 배선이 있으면 이 시점에 이미 이행이 끝나 있다 — 늦게 온 결과는 무시된다(멱등, §8.1).
+  const r = await core.send('i_test1', { input: { kind: 'connectorResult', ok: true, slots: { balance: '999' } } });
+  assert.equal(r.state.slots.balance, undefined);
+  assert.equal(w.calls.length, 0);
 });

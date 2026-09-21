@@ -35,7 +35,8 @@ export type ConformanceCheckId =
   | 'TIMEOUT_BUDGET'      // 각 호출이 예산 안에 정착하는가
   | 'PII_SAFE_ECHO'       // 오류 메시지에 개인정보 원문을 되뱉지 않는가(§10.3)
   | 'FLOW_SUPPORT'        // 선언한 능력으로 대상 Flow 를 렌더할 수 있는가(§5.3)
-  | 'TURN_HINTS';         // 재시도·타이밍 힌트가 붙은 단계를 흡수하는가(§5.1)
+  | 'TURN_HINTS'          // 재시도·타이밍 힌트가 붙은 단계를 흡수하는가(§5.1)
+  | 'CONNECTOR_WAIT';     // 한 턴에 present 가 두 번 와도(대기 안내 → 결과) 되는가(§6.1)
 
 export interface ConformanceCheck {
   id: ConformanceCheckId;
@@ -86,6 +87,18 @@ function hintedStep(channel: ChannelKind): RenderedStep {
     reprompt: { reason: 'no_input', attempt: 2, exhausted: false },
     inputTimeoutMs: 7000,
     ...(channel === 'voice' ? { bargeIn: true, acceptDtmf: true } : {}),
+  };
+}
+
+/**
+ * §6.1 Api 대기 안내 단계. `waitText` 가 선언된 Api 노드는 **무음이 아니므로** 채널에 그대로 나간다 —
+ * `awaitConnectorId` 가 실린 `Api` 종류의 단계를 받는 것이다. 단계 종류를 열거해 처리하거나
+ * `awaitConnectorId` 를 보고 자기가 커넥터를 부르려 드는 포트는 여기서 깨진다(호출은 Core 가 한다, §6.2).
+ */
+function waitStep(channel: ChannelKind): RenderedStep {
+  return {
+    channel, nodeId: 'n_probe_api', kind: 'Api', text: '조회 중입니다. 잠시만 기다려 주세요.',
+    awaitConnectorId: 'c_probe',
   };
 }
 
@@ -322,7 +335,31 @@ export async function runChannelConformance(opts: ConformanceOptions): Promise<C
     });
   }
 
-  // 11) 시나리오 렌더 가능성(§5.3) — 능력 선언과 실제 시나리오가 어긋나면 배포 후에야 드러난다.
+  // 11) Api 대기 이행(§6.1) — **한 턴에 present 가 두 번 온다**. 대기 안내가 먼저 나가고,
+  //     업무시스템 조회가 끝난 뒤 결과가 또 나간다. 한 턴 = present 한 번으로 가정한 포트
+  //     (화면을 통째로 갈아 끼우거나 일회성 가드를 둔 구현)는 **커넥터 배선을 켜는 순간** 전 통화가
+  //     깨진다 — 그것도 코드 배포가 아니라 설정 변경으로. TURN_HINTS 와 같은 이유로 미리 잡는다.
+  {
+    const first: RenderedStep[] = [waitStep(channel)];
+    const second: RenderedStep[] = [step(channel, '조회가 끝났습니다.')];
+    const snapshot = JSON.stringify(first);
+    const r1 = await withBudget(() => port.present('i_probe_api', first), budget);
+    const r2 = await withBudget(() => port.present('i_probe_api', second), budget);
+    const unchanged = JSON.stringify(first) === snapshot;
+    const failing = r1.ok !== true ? r1 : r2;
+    add({
+      id: 'CONNECTOR_WAIT',
+      passed: r1.ok === true && r2.ok === true && unchanged,
+      severity: 'error',
+      messageKo: r1.ok === true && r2.ok === true && unchanged
+        ? '한 턴에 두 번 오는 present(대기 안내 → 결과)를 흡수하고, Api 대기 단계를 변형하지 않습니다(§6.1).'
+        : !unchanged
+          ? 'Api 대기 단계를 present 가 변형했습니다. 같은 배열이 §8.1 이벤트·이력에 쓰입니다.'
+          : `대기 안내 → 결과 순서의 두 번째 present 에서 실패했습니다: ${'timeout' in failing ? '예산 초과' : errText((failing as { error: unknown }).error)}. 한 턴에 present 는 여러 번 올 수 있습니다 — 커넥터 배선을 켜는 순간 전 통화가 깨집니다.`,
+    });
+  }
+
+  // 12) 시나리오 렌더 가능성(§5.3) — 능력 선언과 실제 시나리오가 어긋나면 배포 후에야 드러난다.
   if (!opts.flows || opts.flows.length === 0) {
     add({ id: 'FLOW_SUPPORT', passed: true, skipped: true, severity: 'warning', messageKo: 'flows 미지정 — 시나리오 렌더 가능 여부를 검사하지 않았습니다(§5.3).' });
   } else {
