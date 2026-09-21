@@ -42,13 +42,13 @@ function fakePort(id = 'callbot', capsOver = {}, over = {}) {
     async present(iid, steps) { log.push(['present', iid, steps.map((s) => s.nodeId)]); },
     async transfer(iid, queue, summary) { log.push(['transfer', iid, queue, summary]); },
     async routeToLegacyIvr(iid, reason) { log.push(['ivr', iid, reason]); },
-    async invite(iid, target) { log.push(['invite', iid, target]); },
+    async invite(iid, target, ticket) { log.push(['invite', iid, target, ticket]); },
     async end(iid, reason) { log.push(['end', iid, reason]); },
     ...over,
   };
 }
 
-function build({ flows = [flowBilling], port = fakePort(), samples = [], policy = {}, components, reprompt, timing, routing, connectors } = {}) {
+function build({ flows = [flowBilling], port = fakePort(), ports, samples = [], policy = {}, components, reprompt, timing, routing, connectors, channelSwitch } = {}) {
   const collector = B.createCollectorSink('t');
   const bus = B.createEventBus({
     scope: SCOPE, sinks: [collector],
@@ -58,7 +58,9 @@ function build({ flows = [flowBilling], port = fakePort(), samples = [], policy 
   const core = R.createConversationCore({
     scope: SCOPE,
     flows: R.createMemoryFlowRegistry(flows),
-    channels: [{ port, reportsComponents: components ?? P.CHANNEL_COMPONENTS[port.id], contractVersion: 1 }],
+    channels: (ports ?? [port]).map((p) => ({
+      port: p, reportsComponents: components ?? P.CHANNEL_COMPONENTS[p.id], contractVersion: 1,
+    })),
     policy: {
       tenantId: 'goone', staleAfterMs: 60000, treatUnknownAsDown: false,
       legacyIvrAvailable: false, agentQueueAvailable: true, ...policy,
@@ -69,6 +71,7 @@ function build({ flows = [flowBilling], port = fakePort(), samples = [], policy 
     ...(timing !== undefined ? { timing } : {}),
     ...(routing !== undefined ? { routing } : {}),
     ...(connectors !== undefined ? { connectors } : {}),
+    ...(channelSwitch !== undefined ? { channelSwitch } : {}),
   });
   return { core, port, collector, health };
 }
@@ -143,7 +146,7 @@ test('인식 실패 2회면 같은 Interaction으로 화면 전환을 초대한�
   await core.send('i_test1', { input: { kind: 'timeout' } });
   const r = await core.send('i_test1', { input: { kind: 'timeout' } });
   assert.equal(r.state.channel, 'visual');
-  assert.deepEqual(port.log.find((l) => l[0] === 'invite'), ['invite', 'i_test1', 'visual']);
+  assert.deepEqual(port.log.find((l) => l[0] === 'invite'), ['invite', 'i_test1', 'visual', undefined]);
   assert.equal(core.sessions.get('i_test1').channels.includes('visual'), true);
 });
 
@@ -735,4 +738,171 @@ test('호스트가 직접 커넥터 결과를 넣는 경로는 배선이 있어�
   const r = await core.send('i_test1', { input: { kind: 'connectorResult', ok: true, slots: { balance: '999' } } });
   assert.equal(r.state.slots.balance, undefined);
   assert.equal(w.calls.length, 0);
+});
+
+// ── 채널 전환 배선(§5.2·§10.3·§11.1) ────────────────────────────────────────
+// 여기서 고정하는 결함은 **예외가 아니라 조용한 열림**이다. 배선이 없으면 합류는
+// Interaction id 하나로 통과하고, 그 id 는 링크 URL·프록시 로그·상담 메모에 남는다.
+
+let CS = null;
+try { CS = await import('../src/core/channelSwitch.ts'); } catch { /* 구형 런타임 */ }
+
+const darsPort = (over = {}) => fakePort('dars', {}, over);
+
+function switchWiring(over = {}) {
+  let n = 0;
+  const invites = CS.createInviteRegistry();
+  return {
+    invites,
+    binding: {
+      invites,
+      newToken: () => `tk_switch_${++n}`,
+      ttlMs: 300000,
+      carry: { allow: ['customer_name'] },
+      reachable: () => true,
+      delivery: 'sms',
+      ...over,
+    },
+  };
+}
+
+test('배선 없음: 전환 링크에 실릴 것이 id 뿐이라는 사실을 경고로 드러낸다(§5.2)', b, async () => {
+  const { core } = build({ flows: [flowRetry] });
+  const w = core.warnings().filter((i) => i.code === 'W_CHANNEL_SWITCH_UNBOUND');
+  assert.equal(w.length, 1);
+  assert.match(w[0].messageKo, /Interaction id/);
+});
+
+test('배선 있음: 전환 초대에 1회용 티켓이 실리고 토큰은 id 와 얽히지 않는다', b, async () => {
+  const sw = switchWiring();
+  const port = fakePort();
+  const { core } = build({ flows: [flowRetry], ports: [port, darsPort()], channelSwitch: sw.binding });
+  assert.equal(core.warnings().some((i) => i.code === 'W_CHANNEL_SWITCH_UNBOUND'), false);
+  await core.start(req({ flowId: 'retry' }));
+  await core.send('i_test1', { input: { kind: 'timeout' } });
+  const r = await core.send('i_test1', { input: { kind: 'timeout' } });
+  assert.equal(r.state.channel, 'visual');
+  const inv = port.log.find((l) => l[0] === 'invite');
+  assert.equal(inv[2], 'visual');
+  assert.equal(inv[3].token, 'tk_switch_1');
+  assert.equal(inv[3].token.includes('i_test1'), false);
+  assert.ok(inv[3].expiresAt > NOW);
+  // 티켓에 슬롯 값이 실리지 않는다(§10.3).
+  assert.equal(JSON.stringify(inv[3]).includes('customer_name'), false);
+});
+
+test('배선 있음: 고객 단말 수신이 확인되지 않으면 전환하지 않고 §5.1 사다리를 따른다', b, async () => {
+  const sw = switchWiring({ reachable: () => false });
+  const port = fakePort();
+  const { core } = build({ flows: [flowRetry], ports: [port, darsPort()], channelSwitch: sw.binding });
+  await core.start(req({ flowId: 'retry' }));
+  await core.send('i_test1', { input: { kind: 'timeout' } });
+  const r = await core.send('i_test1', { input: { kind: 'timeout' } });
+  // 화면으로 넘어간 척하지 않는다 — 통화 중인 고객에게 화면용 단계를 내보내면 안 된다.
+  assert.equal(r.state.channel, 'voice');
+  assert.equal(port.log.some((l) => l[0] === 'invite'), false);
+  assert.equal(r.status, 'transferred');
+  assert.ok(port.log.some((l) => l[0] === 'transfer'));
+});
+
+test('배선 있음: 목적지 채널이 등록돼 있지 않으면 전환을 고르지 않는다(§9.3)', b, async () => {
+  const sw = switchWiring();
+  const port = fakePort();
+  const { core } = build({ flows: [flowRetry], ports: [port], channelSwitch: sw.binding });
+  await core.start(req({ flowId: 'retry' }));
+  await core.send('i_test1', { input: { kind: 'timeout' } });
+  const r = await core.send('i_test1', { input: { kind: 'timeout' } });
+  assert.equal(r.state.channel, 'voice');
+  assert.equal(port.log.some((l) => l[0] === 'invite'), false);
+});
+
+test('발급이 막히면 토큰 없는 링크를 만들게 두지 않고 경고로 드러낸다(§10.3)', b, async () => {
+  // 토큰이 Interaction id 를 품으면 발급이 거절된다 — 그 상태로 invite 를 부르면
+  // 채널은 id 로 링크를 만들 수밖에 없다.
+  const sw = switchWiring({ newToken: () => 'tk_i_test1' });
+  const port = fakePort();
+  const { core } = build({ flows: [flowRetry], ports: [port, darsPort()], channelSwitch: sw.binding });
+  await core.start(req({ flowId: 'retry' }));
+  await core.send('i_test1', { input: { kind: 'timeout' } });
+  await core.send('i_test1', { input: { kind: 'timeout' } });
+  assert.equal(port.log.some((l) => l[0] === 'invite'), false);
+  assert.ok(core.warnings().some((i) => i.messageKo.includes('E_TOKEN_WEAK')));
+});
+
+test('배선 있음: 토큰 없는 합류는 거부된다 — id 만으로는 들어올 수 없다(§5.2)', b, async () => {
+  const sw = switchWiring();
+  const dars = darsPort();
+  const { core } = build({ flows: [flowBilling], ports: [fakePort(), dars], channelSwitch: sw.binding });
+  await core.start(req());
+  await assert.rejects(
+    () => core.start(req({ adapter: 'dars', joinInteractionId: 'i_test1' })),
+    /초대 토큰이 없습니다/,
+  );
+});
+
+test('배선 있음: 상환된 토큰으로만 합류하고 재사용은 거부된다', b, async () => {
+  const sw = switchWiring();
+  const dars = darsPort();
+  const { core } = build({ flows: [flowBilling], ports: [fakePort(), dars], channelSwitch: sw.binding });
+  await core.start(req());
+  const rec = core.sessions.get('i_test1');
+  const issued = sw.invites.issue({
+    scope: SCOPE, interactionId: 'i_test1', fromChannel: 'voice', toChannel: 'visual',
+    reason: 'customer_request', delivery: 'sms', token: 'tk_join_1', issuedAt: NOW,
+    ttlMs: 300000, slots: rec.state.slots, carry: { allow: [] }, crossChannelInviteSupported: true,
+  });
+  const joined = await core.start(req({ adapter: 'dars', joinInteractionId: 'i_test1', joinToken: issued.token }));
+  assert.equal(joined.interactionId, 'i_test1');
+  assert.equal(joined.state.channel, 'visual');
+  await assert.rejects(
+    () => core.start(req({ adapter: 'dars', joinInteractionId: 'i_test1', joinToken: issued.token })),
+    /합류 거부\(already_redeemed\)/,
+  );
+});
+
+test('배선 있음: 남의 Interaction 을 주장하면 토큰이 맞아도 합류하지 않는다(§1.2)', b, async () => {
+  const sw = switchWiring();
+  const { core } = build({ flows: [flowBilling], ports: [fakePort(), darsPort()], channelSwitch: sw.binding });
+  await core.start(req());
+  sw.invites.issue({
+    scope: SCOPE, interactionId: 'i_other', fromChannel: 'voice', toChannel: 'visual',
+    reason: 'customer_request', delivery: 'sms', token: 'tk_join_2', issuedAt: NOW,
+    ttlMs: 300000, carry: { allow: [] }, crossChannelInviteSupported: true,
+  });
+  await assert.rejects(
+    () => core.start(req({ adapter: 'dars', joinInteractionId: 'i_test1', joinToken: 'tk_join_2' })),
+    /interaction_mismatch/,
+  );
+});
+
+test('합류는 워크스페이스까지 본다 — 같은 고객사 다른 사업부는 들어올 수 없다(§11.1)', b, async () => {
+  const dars = darsPort();
+  const { core } = build({ flows: [flowBilling], ports: [fakePort(), dars] });
+  await core.start(req());
+  await assert.rejects(
+    () => core.start(req({ adapter: 'dars', scope: { tenantId: 'goone', workspaceId: 'ws_other' }, joinInteractionId: 'i_test1' })),
+    /워크스페이스 격리 위반/,
+  );
+});
+
+test('전환 배선 형태 오류는 통화 중이 아니라 생성 시점에 거절한다(§13-3)', b, () => {
+  const bad = [
+    [{ newToken: undefined }, /토큰 발급기/],
+    [{ reachable: undefined }, /수신 가능 여부/],
+    [{ ttlMs: 0 }, /유효기간/],
+    [{ invites: undefined }, /초대 레지스트리/],
+    [{ carry: { allow: 'customer_name' } }, /allowlist/],
+  ];
+  for (const [over, re] of bad) {
+    assert.throws(() => build({ channelSwitch: switchWiring(over).binding }), re);
+  }
+});
+
+test('배선이 없으면 합류·초대 동작이 종전과 완전히 같다(§13-3)', b, async () => {
+  const dars = darsPort();
+  const { core } = build({ flows: [flowBilling], ports: [fakePort(), dars] });
+  await core.start(req());
+  const joined = await core.start(req({ adapter: 'dars', joinInteractionId: 'i_test1' }));
+  assert.equal(joined.interactionId, 'i_test1');
+  assert.equal(joined.state.channel, 'visual');
 });

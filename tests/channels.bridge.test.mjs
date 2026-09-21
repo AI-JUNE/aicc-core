@@ -360,3 +360,27 @@ test('참조 Core 픽스처로 브리지가 실제로 돈다', b, async () => {
   assert.equal(r.ok, true, JSON.stringify(r.error));
   assert.equal(built.port.activation, 'dry_run');
 });
+
+test('합류 토큰은 들어오는 방향으로 통과한다 — 전환 배선을 켜도 비-Node 호스트만 막히지 않는다(§5.2)', b, async () => {
+  const seen = [];
+  const fakeCore = {
+    contractVersion: 1,
+    async start(req) {
+      seen.push(req);
+      return { interactionId: 'i_join', state: { flowId: 'billing', flowVersion: 1, channel: 'voice', currentNodeId: null, slots: {}, failCount: 0, turnCount: 0, eventSeq: 0, status: 'running', visited: [] }, steps: [], status: 'running', events: [] };
+    },
+    async send() { throw new Error('미사용'); },
+    async end() { throw new Error('미사용'); },
+    reportHealth() {},
+  };
+  const bridge = BR.createBridge({ core: fakeCore, adapter: 'callbot', scope: SCOPE });
+  const r = await bridge.handleLine(line({
+    id: '1', op: 'start',
+    req: { flowId: 'billing', entryPoint: 'inbound_call', joinInteractionId: 'i_join', joinToken: 'tk_from_link' },
+  }));
+  assert.equal(r.ok, true);
+  assert.equal(seen[0].joinInteractionId, 'i_join');
+  assert.equal(seen[0].joinToken, 'tk_from_link');
+  // 응답에는 토큰을 되돌려주지 않는다 — 열쇠를 로그로 흘리지 않는다(§10.3).
+  assert.equal(JSON.stringify(r).includes('tk_from_link'), false);
+});

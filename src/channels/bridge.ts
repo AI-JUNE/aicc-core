@@ -295,6 +295,10 @@ function toSessionRequest(body: Record<string, unknown>, opts: BridgeOptions): C
   if (typeof req.flowVersion === 'number') out.flowVersion = req.flowVersion;
   if (presetSlots) out.presetSlots = presetSlots;
   if (nonEmptyString(req.joinInteractionId)) out.joinInteractionId = req.joinInteractionId;
+  // 합류 자격 토큰(§5.2). 통과시키지 않으면 전환 배선을 켜는 순간 비-Node 호스트만 합류하지 못한다 —
+  // 그 비대칭은 "특정 채널에서만 화면 전환이 안 된다"로 나타나 원인을 한참 뒤에 찾게 된다.
+  // 토큰은 Core 가 발급해 채널에 준 값이므로 **들어오는 방향만** 열려 있다(응답에 싣지 않는다, §10.3).
+  if (nonEmptyString(req.joinToken)) out.joinToken = req.joinToken;
   if (nonEmptyString(req.correlationId)) out.correlationId = req.correlationId;
   return out;
 }

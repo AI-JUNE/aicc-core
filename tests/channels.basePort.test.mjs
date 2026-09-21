@@ -204,3 +204,29 @@ test('알 수 없는 세션·빈 steps 에서도 무해하게 접수한다', b, 
   assert.equal(port.failures.length, 0);
   assert.equal(port.records.length, 2);
 });
+
+test('전환 티켓은 transport 로 그대로 가고 기록에는 토큰이 남지 않는다(§5.2·§10.3)', b, async () => {
+  const seen = [];
+  const port = m.createChannelPort({
+    id: 'callbot',
+    activation: 'live',
+    approvalRef: 'APPROVAL-TEST-1',
+    transport: { async deliver(env) { seen.push(env); } },
+  });
+  const ticket = {
+    token: 'tk_secret_key_1', interactionId: 'i_1', toChannel: 'visual',
+    expiresAt: '2026-09-01T09:05:00.000Z',
+  };
+  await port.invite('i_1', 'visual', ticket);
+  // 링크를 만들려면 토큰이 필요하다 — transport 까지는 그대로 간다.
+  assert.equal(seen[0].ticket.token, 'tk_secret_key_1');
+  // 기록에는 남지 않는다. 남으면 그 로그를 읽는 누구나 남의 상담에 합류할 수 있다.
+  const rec = port.records.find((r) => r.kind === 'invite');
+  assert.equal(JSON.stringify(rec).includes('tk_secret_key_1'), false);
+  assert.match(rec.detail, /ticket=있음/);
+
+  // 배선 전(티켓 없음)에도 종전대로 동작한다 — 한쪽만 되는 구현은 배선을 되돌리는 날 죽는다.
+  await port.invite('i_1', 'visual');
+  assert.equal(seen[1].ticket, undefined);
+  assert.match(port.records.filter((r) => r.kind === 'invite')[1].detail, /ticket=없음/);
+});

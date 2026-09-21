@@ -18,6 +18,7 @@
 import type { ChannelKind } from '../domain/types.ts';
 import type { RenderedStep } from '../flow/types.ts';
 import { maskPii } from '../core/policyGuard.ts';
+import type { SwitchTicket } from '../core/executeSwitch.ts';
 import type { ChannelAdapterId, ChannelCapabilities, ChannelPort } from './contract.ts';
 import { ADAPTER_CHANNEL } from './contract.ts';
 import { profileFor } from './profiles.ts';
@@ -53,6 +54,13 @@ export interface DeliveryEnvelope {
   summaryMasked?: string;
   reasonKo?: string;
   target?: ChannelKind;
+  /**
+   * invite 전용. Core 에 채널 전환이 배선된 경우에만 실린다(§5.2).
+   * **링크는 `ticket.token` 으로 만든다** — `interactionId` 로 만들면 1회용·만료·회수가 전부
+   * 무의미해진다(다른 경로로 같은 문이 열린다). 티켓이 없으면 배선 전 상태이며, 그때의 링크는
+   * id 가 곧 열쇠다. 토큰은 **기록에 남기지 않는다**(§10.3 — 베이스는 있었다는 사실만 적는다).
+   */
+  ticket?: SwitchTicket;
 }
 
 /**
@@ -203,7 +211,7 @@ export function createChannelPort(opts: ChannelPortOptions): BaseChannelPort {
 
   const port: BaseChannelPort & {
     routeToLegacyIvr?: (id: string, reasonKo: string) => Promise<void>;
-    invite?: (id: string, target: ChannelKind) => Promise<void>;
+    invite?: (id: string, target: ChannelKind, ticket?: SwitchTicket) => Promise<void>;
   } = {
     id: opts.id,
     capabilities,
@@ -252,10 +260,16 @@ export function createChannelPort(opts: ChannelPortOptions): BaseChannelPort {
     };
   }
   if (capabilities.crossChannelInvite) {
-    port.invite = async (interactionId, target) => {
+    port.invite = async (interactionId, target, ticket) => {
+      // 티켓은 transport 로 **그대로** 넘긴다 — 링크를 만들려면 토큰이 필요하다. 반면 기록에는
+      // 토큰을 남기지 않는다: 초대 토큰은 세션 열쇠라, 로그에 남으면 그 로그를 읽을 수 있는
+      // 누구나 진행 중인 상담에 합류할 수 있다(§10.3).
       await run(
-        { interactionId, adapter: opts.id, channel: capabilities.channel, kind: 'invite', target },
-        { kind: 'invite', interactionId, detail: target },
+        {
+          interactionId, adapter: opts.id, channel: capabilities.channel, kind: 'invite', target,
+          ...(ticket !== undefined ? { ticket } : {}),
+        },
+        { kind: 'invite', interactionId, detail: `${target} ticket=${ticket === undefined ? '없음' : '있음'}` },
       );
     };
   }

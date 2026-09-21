@@ -571,6 +571,59 @@
         `src/channels/runtime.ts`(`ConnectorPumpBinding` 배선·`drainConnectors`) ·
         `tests/channels.runtime.test.mjs`(55건) · `src/channels/conformance.ts`(`CONNECTOR_WAIT`) ·
         `tests/channels.conformance.test.mjs`(25건) · `API.md` 반영
+      · Core 측 완료(19): **채널 전환의 빈 자리 — 링크가 곧 세션 열쇠였다(2026-09-21)** — (17)(18)이 메운 것과
+        같은 모양의 공백이 **§5.2 전환 쪽에 하나 더** 있었다. `core/channelSwitch.ts` 에는 조각이 다 있다
+        (1회용 토큰 발급·만료·상환 판정·운영자 회수·승계 allowlist·세션 반영). 그런데 **저장소 전체에서 그
+        함수들을 부르는 곳이 테스트뿐이었다.** 실제 전환 경로인 `channels/runtime.ts` 는
+        `port.invite(interactionId, target)` 로 **Interaction id 를 그대로** 넘기고, 합류(`joinInteractionId`)는
+        그 id 하나만 맞으면 통과시켰다. 즉 **링크에 실리는 값이 곧 진행 중인 세션의 열쇠**였고,
+        channelSwitch.ts 머리말이 막겠다고 적어 둔 사고가 정확히 그 상태로 열려 있었다.
+        이 공백의 증상은 예외가 아니라 **조용한 열림**이라 가장 나쁘다 — interaction id 는 비밀이 아니다.
+        링크 URL·브라우저 이력·프록시 로그·상담 메모에 남고 형태가 규칙적이라 추측도 된다. 그 값 하나로
+        합류가 되면 **이미 수집된 슬롯이 그려진 화면**이 남에게 열리는데, 어디서도 터지지 않고 감사에도
+        정상 합류로 남는다. 게다가 재상환·만료 개념이 없으니 같은 링크가 **몇 주 뒤에도, 몇 번이고** 열린다.
+        - 실행기(`src/core/executeSwitch.ts`): **판정 → 토큰 검증 → 발급 순서가 곧 안전장치다**(티켓을
+          마지막에 만들어 어느 단계에서 걸려도 보낼 수 있는 링크 재료가 생기지 않는다). 고정한 것:
+          **토큰이 Interaction id 를 품거나 id 가 토큰을 품으면 발급을 거절한다**(그건 열쇠를 다시 id 로
+          되돌리는 것이라 1회용·만료가 통째로 무의미해진다) · **판정과 발급을 한 함수로 묶는다**(전환 조건을
+          안 보고 링크부터 만들면 화면을 못 받는 고객이 오지 않는 화면을 기다리다 통화가 끝난다 —
+          판정 전에는 토큰을 뽑지도 않는다, 뽑아 두면 어딘가에 남는다) · **토큰을 어떤 문구에도 싣지 않는다**
+          (`maskPii` 는 토큰을 모른다 — 레지스트리 오류에 토큰이 섞이면 메시지를 통째로 버린다) ·
+          **티켓에는 슬롯 값도 키 목록도 없다**(채널이 할 일은 링크를 만드는 것뿐이다, §10.3) ·
+          **거절 사유는 운영·감사용**이며 고객 문안은 만들지 않는다(사유를 구분해 보여주면 "이 토큰은
+          존재한다"가 새고, 문안은 테넌트가 정한다 §13-3) · **판정을 복사하지 않는다**(만료·1회용·테넌트·
+          목적지 일치는 `channelSwitch.ts` 하나 — 검사가 이 파일에 그 규칙이 없음을 고정한다) ·
+          ttl·토큰 발급기·allowlist **기본값 없음**(Core 가 토큰을 만들면 추측 가능한 열쇠가 된다).
+        - 배선(`channels/runtime.ts` 의 `channelSwitch`): 주면 티켓을 발급해 `port.invite(id, target, ticket)`
+          로 넘기고 **합류에 그 토큰을 요구한다**. 전환 성립 여부(목적지 채널 등록·`reachable`)는
+          **§5.1 사다리 판정 전에** 본다 — 순서가 중요하다. 전환을 고른 뒤 발급이 막히면 `state.channel` 은
+          이미 화면인데 고객은 여전히 통화 중이라 **화면용으로 렌더된 단계를 듣게 된다**. 미리 보면 사다리는
+          그냥 다음 칸(상담사)으로 간다. 발급이 막히면 **`invite` 를 부르지 않는다**(부르면 채널은 id 로 링크를
+          만들 수밖에 없다) 대신 경고로 드러낸다. 배선 형태 오류는 **생성 시점에 거부**한다(통과시키면 오타
+          하나로 토큰 요구가 조용히 꺼진 채 "적용했다"로 남는다 — 라우팅·요청 제한기와 같은 규칙).
+          `channelSwitch` 미지정 시 **종전과 완전히 같고**(§13-3, 검사로 고정), 교차채널 초대가 가능한 채널이
+          등록돼 있으면 `W_CHANNEL_SWITCH_UNBOUND` 경고를 남긴다(조용한 보안 결함이 가장 오래 산다).
+        - **합류의 격리 결함 수정**: `join` 은 `tenantId` 만 보고 `workspaceId` 를 보지 않았다 —
+          같은 고객사의 **다른 사업부**가 진행 중인 상담에 합류할 수 있었고, 타입도 값도 멀쩡해 어디서도
+          터지지 않는다(§11.1). 배선 유무와 무관한 결함이라 그 자체로 고쳤다.
+        - **베이스 포트·채널 경계**: `basePort` 의 `invite` 가 **티켓을 버리고 있었다** — 저장소가 권장 경로로
+          포트를 만들면 배선을 켜도 티켓이 도착하지 않아 링크는 여전히 id 로 만들어진다(배선이 있는데도
+          결함이 그대로인 가장 나쁜 조합). 이제 `DeliveryEnvelope.ticket` 으로 transport 까지 그대로 가고,
+          **기록에는 남지 않는다**(토큰이 로그에 남으면 그 로그를 읽는 누구나 남의 상담에 합류한다).
+          적합성 검사 `CHANNEL_INVITE` 는 `TURN_HINTS`·`CONNECTOR_WAIT` 와 같은 이유로 각 저장소 CI 에서
+          미리 잡는다 — 세 번째 인자를 받고 던지는 포트는 **설정을 바꾸는 날** 전 전환이 깨진다.
+          브리지는 `joinToken` 을 **들어오는 방향만** 통과시킨다(막으면 비-Node 호스트만 합류하지 못해
+          "특정 채널에서만 화면 전환이 안 된다"로 나타나고, 응답에 실으면 열쇠가 로그로 흐른다).
+        실발송(SMS·푸시·알림톡)과 실회선 연결은 여전히 **[승인 필요]**.
+        **변이 검증(도구 출력 그대로)**: 워크스페이스 검사를 빼면 1건 실패 · 토큰 요구를 빼면 1건 실패 ·
+        `reachable` 을 무시하면 1건 실패 · 발급 실패에도 invite 를 부르면 1건 실패 · 베이스가 티켓을
+        버리면 1건 실패 · 기록에 토큰을 남기면 1건 실패 — 여섯 가지 모두 원본에 대고 돌리면 통과한다.
+        근거: `src/core/executeSwitch.ts` · `tests/core.executeSwitch.test.mjs`(17건) ·
+        `src/channels/runtime.ts`(`ChannelSwitchBinding`·`switchFeasible`·`join` 토큰 상환·워크스페이스 격리) ·
+        `tests/channels.runtime.test.mjs`(66건) · `src/channels/contract.ts`(`joinToken`·`invite` 티켓·
+        `W_CHANNEL_SWITCH_UNBOUND`) · `src/channels/basePort.ts` · `tests/channels.basePort.test.mjs`(20건) ·
+        `src/channels/conformance.ts`(`CHANNEL_INVITE`) · `src/channels/bridge.ts` ·
+        `tests/channels.bridge.test.mjs`(26건) · `API.md` 반영
       · 남은 것: **Callbot 저장소 쪽 배선** — 코드는 훅마다 한 줄(README 참조)이며 더 쓸 것이 없다.
         남은 것은 저장소 결정 사항이다: 현행 LLM 툴(welfare_apply 등)과 Core 시나리오의 역할 분담
         (어느 쪽이 화면 노드를 밀 것인가)·실운영 Core 모듈·Flow id 를 **사람이 정해야 한다**,

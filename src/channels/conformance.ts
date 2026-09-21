@@ -16,6 +16,7 @@
 import type { ChannelKind } from '../domain/types.ts';
 import type { Flow, RenderedStep } from '../flow/types.ts';
 import { maskPii } from '../core/policyGuard.ts';
+import type { SwitchTicket } from '../core/executeSwitch.ts';
 import type {
   ChannelAdapterId, ChannelCapabilities, ChannelPort, ChannelRegistration,
 } from './contract.ts';
@@ -36,7 +37,8 @@ export type ConformanceCheckId =
   | 'PII_SAFE_ECHO'       // 오류 메시지에 개인정보 원문을 되뱉지 않는가(§10.3)
   | 'FLOW_SUPPORT'        // 선언한 능력으로 대상 Flow 를 렌더할 수 있는가(§5.3)
   | 'TURN_HINTS'          // 재시도·타이밍 힌트가 붙은 단계를 흡수하는가(§5.1)
-  | 'CONNECTOR_WAIT';     // 한 턴에 present 가 두 번 와도(대기 안내 → 결과) 되는가(§6.1)
+  | 'CONNECTOR_WAIT'      // 한 턴에 present 가 두 번 와도(대기 안내 → 결과) 되는가(§6.1)
+  | 'CHANNEL_INVITE';     // 전환 초대에 티켓이 실려도 흡수하는가 — 링크는 토큰으로 만든다(§5.2·§10.3)
 
 export interface ConformanceCheck {
   id: ConformanceCheckId;
@@ -359,7 +361,58 @@ export async function runChannelConformance(opts: ConformanceOptions): Promise<C
     });
   }
 
-  // 12) 시나리오 렌더 가능성(§5.3) — 능력 선언과 실제 시나리오가 어긋나면 배포 후에야 드러난다.
+  // 12) 채널 전환 초대(§5.2) — 전환이 배선되면 `invite` 에 **세 번째 인자(티켓)** 가 실린다.
+  //     인자 개수를 세거나 모르는 값에서 던지는 포트는 **배선을 켜는 날** 전 전환이 깨진다 —
+  //     그것도 코드 배포가 아니라 설정 변경으로(TURN_HINTS·CONNECTOR_WAIT 와 같은 이유).
+  //     더 중요한 것은 그 다음이다: **티켓이 오면 링크는 토큰으로 만들어야 한다.** interactionId 로
+  //     만들면 1회용·만료·회수가 전부 무의미해진다(다른 경로로 같은 문이 열린다). 그 사실은 여기서
+  //     검사할 수 없으므로 — 링크 문자열은 포트 안에서 만들어진다 — 실패 문구에 못박아 둔다.
+  if (typeof port.invite !== 'function') {
+    // **건너뜀으로 적지 않는다.** 교차채널 초대를 선언하지 않은 채널(챗봇·D-ARS)에서 invite 가 없는
+    // 것은 정상이며, 이를 판정보류로 적으면 "검사를 못 돌렸다"와 "해당 사항이 없다"가 섞인다 —
+    // 그러면 진짜 판정보류(설정 누락, §13-3)가 잡음에 묻힌다.
+    add({
+      id: 'CHANNEL_INVITE',
+      passed: !port.capabilities.crossChannelInvite,
+      severity: 'error',
+      messageKo: port.capabilities.crossChannelInvite
+        ? 'crossChannelInvite 를 선언했으나 invite 구현이 없습니다 — 전환을 시켜도 아무 일도 일어나지 않고, 고객은 오지 않는 화면을 기다립니다(§5.2).'
+        : '해당 없음 — 교차채널 초대를 선언하지 않은 채널입니다(§5.2).',
+    });
+  } else if (!port.capabilities.crossChannelInvite) {
+    add({
+      id: 'CHANNEL_INVITE',
+      passed: false,
+      severity: 'warning',
+      messageKo: 'invite 를 구현했지만 crossChannelInvite 를 선언하지 않았습니다 — Core 는 이 경로를 쓰지 않습니다(§5.2).',
+    });
+  } else {
+    const ticket: SwitchTicket = {
+      token: 'tk_conformance_probe',
+      interactionId: 'i_probe_switch',
+      toChannel: 'visual',
+      expiresAt: '2026-01-01T00:00:00.000Z',
+    };
+    const snapshot = JSON.stringify(ticket);
+    // 배선 전(티켓 없음)과 배선 후(티켓 있음)가 **둘 다** 동작해야 한다. 한쪽만 되는 구현은
+    // 배선을 켜는 순간, 또는 되돌리는 순간 전환이 죽는다.
+    const bare = await withBudget(() => (port.invite as NonNullable<ChannelPort['invite']>)('i_probe_switch', 'visual'), budget);
+    const withTicket = await withBudget(() => (port.invite as NonNullable<ChannelPort['invite']>)('i_probe_switch', 'visual', ticket), budget);
+    const unchanged = JSON.stringify(ticket) === snapshot;
+    const failing = bare.ok !== true ? bare : withTicket;
+    add({
+      id: 'CHANNEL_INVITE',
+      passed: bare.ok === true && withTicket.ok === true && unchanged,
+      severity: 'error',
+      messageKo: bare.ok === true && withTicket.ok === true && unchanged
+        ? '전환 초대를 티켓 유무 양쪽에서 흡수하고 티켓을 변형하지 않습니다. 티켓이 실리면 링크는 token 으로 만드세요 — interactionId 로 만들면 1회용·만료가 무의미해집니다(§5.2·§10.3).'
+        : !unchanged
+          ? '전환 티켓을 invite 가 변형했습니다. 같은 객체가 만료 안내·감사 기록에 쓰입니다(§5.2).'
+          : `전환 초대에서 실패했습니다: ${'timeout' in failing ? '예산 초과' : errText((failing as { error: unknown }).error)}. 모르는 인자는 무시하세요 — 전환 배선을 켜는 순간 전 전환이 깨집니다(§5.2).`,
+    });
+  }
+
+  // 13) 시나리오 렌더 가능성(§5.3) — 능력 선언과 실제 시나리오가 어긋나면 배포 후에야 드러난다.
   if (!opts.flows || opts.flows.length === 0) {
     add({ id: 'FLOW_SUPPORT', passed: true, skipped: true, severity: 'warning', messageKo: 'flows 미지정 — 시나리오 렌더 가능 여부를 검사하지 않았습니다(§5.3).' });
   } else {
@@ -452,7 +505,7 @@ export function createDryRunPort(opts: DryRunPortOptions): DryRunPort {
 
   const port = base as DryRunPort & {
     routeToLegacyIvr?: (id: string, reasonKo: string) => Promise<void>;
-    invite?: (id: string, target: ChannelKind) => Promise<void>;
+    invite?: (id: string, target: ChannelKind, ticket?: SwitchTicket) => Promise<void>;
   };
   if (capabilities.routeToLegacyIvr) {
     port.routeToLegacyIvr = async (interactionId, reasonKo) => {
@@ -460,8 +513,14 @@ export function createDryRunPort(opts: DryRunPortOptions): DryRunPort {
     };
   }
   if (capabilities.crossChannelInvite) {
-    port.invite = async (interactionId, target) => {
-      calls.push({ method: 'invite', interactionId, detail: target });
+    port.invite = async (interactionId, target, ticket) => {
+      // 토큰은 기록하지 않는다 — 초대 토큰은 세션 열쇠라, 로그에 남으면 그 로그를 읽는 누구나
+      // 남의 상담에 합류할 수 있다(§10.3). 있었다는 사실과 만료만 남긴다.
+      calls.push({
+        method: 'invite',
+        interactionId,
+        detail: `${target} ticket=${ticket === undefined ? '없음' : `있음(만료 ${ticket.expiresAt})`}`,
+      });
     };
   }
   return port;

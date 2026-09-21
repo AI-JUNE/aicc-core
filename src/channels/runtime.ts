@@ -32,6 +32,8 @@ import type { AdmissionOptions, QueueSnapshot, RoutingConfig } from '../routing/
 import { validateRoutingConfig } from '../routing/agentQueue.ts';
 import type { HandoffPlacement } from '../routing/executeHandoff.ts';
 import { executeHandoff } from '../routing/executeHandoff.ts';
+import type { InviteDeliveryKind, InviteRegistry, SlotCarryPolicy, SwitchReason, SwitchTargetChannel } from '../core/channelSwitch.ts';
+import { issueSwitch, redeemSwitch } from '../core/executeSwitch.ts';
 import type { ConnectorPumpBinding } from '../integration/connectorPump.ts';
 import { connectorHopLimit, hopLimitInput, missingConnectors, pumpConnectorHop } from '../integration/connectorPump.ts';
 import type {
@@ -124,6 +126,36 @@ export interface RoutingBinding {
   admission?: AdmissionOptions;
 }
 
+/**
+ * 채널 전환 배선(§5.2·§10.3·§11.1). **주지 않으면 종전과 완전히 같다**(§13-3) —
+ * 전환 시 `port.invite(interactionId, target)` 를 토큰 없이 부르고, 합류(`joinInteractionId`)는
+ * id 하나만 맞으면 통과한다. 그 상태에서는 **링크에 실리는 값이 곧 진행 중인 세션의 열쇠**이므로
+ * 교차채널 초대가 가능한 채널이 등록되어 있으면 경고(`W_CHANNEL_SWITCH_UNBOUND`)로 드러낸다.
+ *
+ * 주면 Core 가 `core/executeSwitch.ts` 로 1회용·만료 토큰을 발급해 채널에 넘기고,
+ * **합류에 그 토큰을 요구한다**. 이 배선이 없으면 `core/channelSwitch.ts`(발급·상환·회수·
+ * 승계 allowlist)는 저장소에 있으나 **아무도 부르지 않는** 상태로 남는다.
+ */
+export interface ChannelSwitchBinding {
+  /** 초대 레지스트리. 영속 구현으로 교체 가능(§6.2) — 인메모리는 단일 프로세스용이다. */
+  invites: InviteRegistry;
+  /** 1회용 토큰 발급기. 주입이다 — Core 가 만들면 추측 가능한 열쇠가 된다(§13-3). */
+  newToken: () => string;
+  /** 링크 유효기간(ms). 테넌트 운영값 — 기본값 없음(§13-3). */
+  ttlMs: number;
+  /** 승계 슬롯 allowlist(§10.3). 빈 배열이면 아무 슬롯도 초대에 싣지 않는다. */
+  carry: SlotCarryPolicy;
+  /**
+   * 고객 단말이 링크를 받을 수 있다고 **확인**되었는가. 추정 금지 — 호스트가 관측한 값만(§13-3).
+   * 확인하지 못했으면 false 를 주면 된다(전환은 성립하지 않고 §5.1 사다리의 다음 칸으로 간다).
+   */
+  reachable: (interactionId: string) => boolean;
+  /** 발송 수단 기록값. Core 는 발송하지 않는다 — 실발신은 [승인 필요]. */
+  delivery?: InviteDeliveryKind;
+  /** 전환 사유 기록값(§7 7.6 전환 품질 축). 미지정 시 §5.1 사다리에서 온 전환으로 적는다. */
+  reason?: SwitchReason;
+}
+
 export interface ConversationCoreOptions {
   scope: TenantScope;
   flows: FlowRegistry;
@@ -158,6 +190,8 @@ export interface ConversationCoreOptions {
    * 커넥터 결과가 아닌 입력은 빈 결과가 되어 고객이 무슨 말을 해도 채널이 렌더할 것이 없다.
    */
   connectors?: ConnectorPumpBinding;
+  /** 채널 전환 초대(§5.2). 미지정 시 종전 동작 — 합류에 토큰을 요구하지 않는다(§13-3). */
+  channelSwitch?: ChannelSwitchBinding;
   now?: () => string;
   newInteractionId?: (req: ChannelSessionRequest) => string;
   onPublish?: (results: PublishResult[]) => void;
@@ -226,6 +260,27 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     }
   }
 
+  // 전환 배선도 **배포 시점에** 거른다. 형태 오류를 통과로 두면 오타 하나로 토큰 요구가 조용히 꺼진 채
+  // "적용했다"로 남고, 그 상태의 합류는 id 하나로 통과한다(라우팅·요청 제한기와 같은 규칙).
+  if (opts.channelSwitch !== undefined) {
+    const cs = opts.channelSwitch;
+    if (typeof cs.newToken !== 'function') {
+      throw new Error('채널 전환 배선 거부: 토큰 발급기가 없다 — Core 는 세션 열쇠를 만들지 않는다 (설계서 §13-3·§10.3)');
+    }
+    if (typeof cs.reachable !== 'function') {
+      throw new Error('채널 전환 배선 거부: 고객 단말 수신 가능 여부를 확인할 길이 없다 — 추정하지 않는다 (설계서 §13-3)');
+    }
+    if (!Number.isFinite(cs.ttlMs) || cs.ttlMs <= 0) {
+      throw new Error('채널 전환 배선 거부: 유효기간(ttlMs)이 양수가 아니다 — 만료 없는 링크는 영구 열쇠다 (설계서 §5.2)');
+    }
+    if (!cs.invites || typeof cs.invites.issue !== 'function' || typeof cs.invites.redeem !== 'function') {
+      throw new Error('채널 전환 배선 거부: 초대 레지스트리가 없다 (설계서 §5.2)');
+    }
+    if (!Array.isArray(cs.carry?.allow)) {
+      throw new Error('채널 전환 배선 거부: 승계 슬롯 allowlist 가 배열이 아니다 (설계서 §10.3)');
+    }
+  }
+
   for (const reg of opts.channels) {
     const issues = validateRegistration(reg);
     if (!registrationOk(issues)) {
@@ -234,6 +289,17 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     warnings.push(...issues.filter((i) => i.severity === 'warning'));
     regs.set(reg.port.id, reg);
     declared.set(reg.port.id, new Set(reg.reportsComponents));
+  }
+
+  // 전환이 가능한 채널이 붙어 있는데 배선이 없으면, 그 전환 링크는 **id 가 곧 열쇠**다.
+  // 종전 동작이므로 막지는 않되 조용히 두지도 않는다 — 조용한 보안 결함이 가장 오래 산다.
+  if (opts.channelSwitch === undefined && opts.channels.some((r) => r.port.capabilities.crossChannelInvite)) {
+    warnings.push({
+      code: 'W_CHANNEL_SWITCH_UNBOUND',
+      severity: 'warning',
+      messageKo: '교차채널 초대가 가능한 채널이 등록됐으나 전환 배선(channelSwitch)이 없습니다. '
+        + '합류가 Interaction id 하나로 통과하므로 링크를 본 사람이 진행 중인 상담 화면을 열 수 있습니다(§5.2·§10.3).',
+    });
   }
 
   function registration(adapter: ChannelAdapterId): ChannelRegistration {
@@ -313,7 +379,9 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       interactionId: rec.interactionId,
       channel: rec.state.channel,
       // §5.1 2회 실패 시 화면 전환은 "화면을 띄울 수 있는 채널"에서만 성립한다.
-      visualAvailable: caps.channel === 'visual' || caps.crossChannelInvite,
+      // 전환이 배선되면 링크를 실제로 보낼 수 있는지까지 본다 — 사다리가 전환을 고른 뒤에
+      // 발급이 막히면 고객은 통화 중인데 화면용 단계를 듣게 된다(switchFeasible 주석 참조).
+      visualAvailable: caps.channel === 'visual' || switchFeasible(rec, caps),
       now,
     };
     if (opts.minConfidence !== undefined) ctx.minConfidence = opts.minConfidence;
@@ -537,12 +605,78 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
   }
 
   /** 통화 중 화면 전환(§5.2) — 채널이 초대 능력을 선언한 경우에만 실제 초대를 건다. */
+  /** 같은 경고를 세션 수만큼 쌓지 않는다 — 운영 화면이 같은 줄로 가득 차면 아무도 읽지 않는다. */
+  function warnOnce(code: ContractIssue['code'], messageKo: string): void {
+    if (warnings.some((w) => w.code === code && w.messageKo === messageKo)) return;
+    warnings.push({ code, severity: 'warning', messageKo });
+  }
+
+  /** 목적지 채널이 지금 등록되어 있는가. 추정하지 않는다 — 등록 사실만 본다(§13-3). */
+  function targetRegistered(target: SwitchTargetChannel): boolean {
+    for (const reg of regs.values()) {
+      if (reg.port.capabilities.channel === target) return true;
+    }
+    return false;
+  }
+
+  /**
+   * §5.1 사다리가 화면 전환을 고를 수 있는가. 배선이 없으면 **종전과 똑같이** 채널 능력만 본다(§13-3).
+   *
+   * 배선이 있으면 전환 성립 조건을 **사다리 판정 전에** 본다. 순서가 중요하다 — 전환을 고른 뒤에
+   * 링크 발급이 막히면 `state.channel` 은 이미 화면으로 바뀌어 있고, 고객은 여전히 통화 중인데
+   * 화면용으로 렌더된 단계를 듣게 된다. 미리 보면 사다리는 그냥 다음 칸(상담사)으로 간다.
+   */
+  function switchFeasible(rec: SessionRecord, caps: ChannelCapabilities): boolean {
+    if (!caps.crossChannelInvite) return false;
+    const cs = opts.channelSwitch;
+    if (cs === undefined) return true;
+    if (!targetRegistered('visual')) return false;
+    try {
+      return cs.reachable(rec.interactionId) === true;
+    } catch {
+      // 확인에 실패한 것을 "확인됨"으로 읽지 않는다. 전환하지 않으면 사다리가 상담사로 내려간다(§5.1).
+      warnOnce('W_CHANNEL_SWITCH_UNBOUND', '고객 단말 수신 가능 여부 확인(reachable)이 예외로 끝났습니다 — 전환하지 않고 §5.1 사다리를 따릅니다.');
+      return false;
+    }
+  }
+
   async function inviteIfSwitched(prev: ChannelKind, next: ChannelKind, rec: SessionRecord, reg: ChannelRegistration): Promise<void> {
     if (prev === next) return;
     if (!rec.channels.includes(next)) rec.channels.push(next);
-    if (reg.port.capabilities.crossChannelInvite && typeof reg.port.invite === 'function') {
+    if (!reg.port.capabilities.crossChannelInvite || typeof reg.port.invite !== 'function') return;
+
+    const cs = opts.channelSwitch;
+    if (cs === undefined || (next !== 'visual' && next !== 'chat')) {
+      // 종전 경로 — 토큰 없는 초대. 링크에 실릴 값이 Interaction id 뿐이라는 사실은 등록 시 경고로 남았다.
       await reg.port.invite(rec.interactionId, next);
+      return;
     }
+
+    const issued = issueSwitch({
+      scope: rec.scope,
+      interactionId: rec.interactionId,
+      fromChannel: prev,
+      toChannel: next,
+      reason: cs.reason ?? 'recognition_failure',
+      delivery: cs.delivery ?? 'manual',
+      newToken: cs.newToken,
+      issuedAt: now(),
+      ttlMs: cs.ttlMs,
+      carry: cs.carry,
+      slots: rec.state.slots,
+      crossChannelInviteSupported: true,
+      targetChannelAvailable: targetRegistered(next),
+      reachable: (() => { try { return cs.reachable(rec.interactionId) === true; } catch { return false; } })(),
+      registry: cs.invites,
+    });
+
+    if (!issued.ok) {
+      // **토큰 없는 링크를 만들게 두지 않는다.** invite 를 부르면 채널은 id 로 링크를 만들 수밖에 없고,
+      // 그 링크는 1회용도 만료도 없다. 전환을 못 했다는 사실은 경고로 드러낸다(조용히 삼키지 않는다).
+      warnOnce('W_CHANNEL_SWITCH_UNBOUND', `채널 전환 초대를 발급하지 못해 링크를 보내지 않았습니다: ${issued.code} ${issued.reasonKo}`);
+      return;
+    }
+    await reg.port.invite(rec.interactionId, next, issued.ticket);
   }
 
   async function join(req: ChannelSessionRequest, interactionId: string): Promise<ChannelTurnResult> {
@@ -551,8 +685,40 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     if (rec.scope.tenantId !== req.scope.tenantId) {
       throw new Error(`테넌트 격리 위반(채널 합류): 기대=${rec.scope.tenantId} 실제=${req.scope.tenantId} (설계서 §11.1)`);
     }
+    // 워크스페이스까지 봐야 격리가 성립한다. 테넌트만 보면 **같은 고객사의 다른 사업부**가
+    // 진행 중인 상담에 합류한다 — 타입도 값도 멀쩡해서 어디서도 터지지 않는다(§11.1).
+    if ((rec.scope.workspaceId ?? undefined) !== (req.scope.workspaceId ?? undefined)) {
+      throw new Error('워크스페이스 격리 위반(채널 합류): 다른 워크스페이스의 Interaction 입니다 (설계서 §11.1)');
+    }
     const reg = registration(req.adapter);
     const channel = ADAPTER_CHANNEL[req.adapter];
+
+    // 합류 자격 — 배선이 있으면 **토큰이 있어야만** 합류한다. 없으면 종전과 같다(§13-3),
+    // 다만 그 상태는 등록 시점에 경고로 남는다(id 가 곧 열쇠다).
+    const cs = opts.channelSwitch;
+    if (cs !== undefined) {
+      const token = req.joinToken;
+      if (typeof token !== 'string' || token.trim() === '') {
+        throw new Error('합류 거부: 초대 토큰이 없습니다 — Interaction id 만으로는 합류할 수 없습니다 (설계서 §5.2·§10.3)');
+      }
+      const redeemed = redeemSwitch({
+        registry: cs.invites,
+        token,
+        scope: req.scope,
+        channel,
+        at: now(),
+        expectInteractionId: interactionId,
+      });
+      if (!redeemed.ok) {
+        // 사유는 운영 로그용이다. 토큰·슬롯 값은 실리지 않는다(§10.3).
+        throw new Error(`합류 거부(${redeemed.rejection}): ${redeemed.reasonKo}`);
+      }
+      // 승계 슬롯은 **덮어쓰지 않는다** — 초대는 발급 시점의 스냅샷이라, 그 사이 통화에서 고객이
+      // 정정한 값을 오래된 값으로 되돌리면 방금 고친 내용이 사라진다(applyInvite 와 같은 규칙).
+      for (const [k, v] of Object.entries(redeemed.carriedSlots)) {
+        if (!k.startsWith('__') && rec.state.slots[k] === undefined) rec.state.slots[k] = v;
+      }
+    }
     rec.state.channel = channel;
     if (!rec.channels.includes(channel)) rec.channels.push(channel);
     // 같은 Interaction·같은 노드를 새 채널 렌더러로 다시 그린다. 새 발화가 아니므로 턴 이벤트를 만들지 않는다(§8.1).

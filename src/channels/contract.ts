@@ -13,6 +13,7 @@ import type { RenderedStep, Flow } from '../flow/types.ts';
 import type { FlowInput, FlowState, RunStatus } from '../flow/runner.ts';
 import type { EntryPoint, LatencyMs, UsageMetrics, InteractionEvent } from '../events/schema.ts';
 import type { TenantScope } from '../core/tenancy.ts';
+import type { SwitchTicket } from '../core/executeSwitch.ts';
 import type { ComponentId, HealthSample, FallbackDecision } from '../ops/fallback.ts';
 
 export const CHANNEL_CONTRACT_VERSION = 1;
@@ -40,6 +41,13 @@ export interface ChannelSessionRequest {
    * 지정되면 새 세션을 만들지 않고 같은 Interaction에 채널을 붙인다.
    */
   joinInteractionId?: string;
+  /**
+   * 합류 자격 토큰(§5.2·§10.3). Core 에 채널 전환이 배선된 경우 **필수**다 —
+   * id 만으로 합류를 허용하면 링크 URL·프록시 로그·상담 메모에 남는 Interaction id 가 곧
+   * 진행 중인 세션의 열쇠가 되고, 이미 수집된 슬롯이 그려진 화면이 남에게 열린다.
+   * 값은 `port.invite` 로 받은 티켓의 `token` 을 그대로 넘긴다(채널이 만들지 않는다).
+   */
+  joinToken?: string;
   /** 상관관계 추적용 채널측 식별자(호 ID·대화 ID). 개인정보를 넣지 않는다. */
   correlationId?: string;
 }
@@ -114,8 +122,15 @@ export interface ChannelPort {
   transfer(interactionId: string, queue: string | undefined, summaryMasked: string | undefined): Promise<void>;
   /** 기존 IVR 회귀(§9.3). routeToLegacyIvr=false 인 채널은 구현하지 않아도 된다. */
   routeToLegacyIvr?(interactionId: string, reasonKo: string): Promise<void>;
-  /** 다른 채널 초대(§5.2). crossChannelInvite=false 면 미구현. */
-  invite?(interactionId: string, target: ChannelKind): Promise<void>;
+  /**
+   * 다른 채널 초대(§5.2). crossChannelInvite=false 면 미구현.
+   *
+   * `ticket` 은 Core 에 채널 전환이 배선된 경우에만 실린다. **실리면 링크에는 그 토큰을 쓴다** —
+   * `interactionId` 로 링크를 만들면 1회용·만료·회수가 전부 무의미해진다(다른 경로로 같은 문이 열린다).
+   * 배선이 없으면 `ticket` 은 `undefined` 이며, 그 상태의 전환 링크는 **id 가 곧 열쇠**다(§10.3).
+   * 모르는 인자를 받아도 던지지 않아야 한다 — 배선을 켜는 일은 코드 배포가 아니라 설정 변경이다.
+   */
+  invite?(interactionId: string, target: ChannelKind, ticket?: SwitchTicket): Promise<void>;
   end(interactionId: string, reasonKo: string): Promise<void>;
 }
 
@@ -151,7 +166,13 @@ export type ContractIssueCode =
   /** 재프롬프트 정책이 비어 있어 실패 시 원문이 그대로 재생된다(§5.1). 금지는 아니지만 운영이 알아야 한다. */
   | 'W_REPROMPT_POLICY'
   /** 턴 타이밍이 선언되지 않아 채널이 각자의 대기 시간을 쓴다(§5.1). */
-  | 'W_TURN_TIMING';
+  | 'W_TURN_TIMING'
+  /**
+   * 교차채널 초대를 할 수 있는 채널이 등록됐는데 전환 배선이 없다(§5.2·§10.3).
+   * 이 상태의 합류는 **Interaction id 하나로 통과**하므로, 링크를 본 사람은 누구나
+   * 진행 중인 상담 화면을 열 수 있다. 금지는 아니지만(종전 동작) 운영이 반드시 알아야 한다.
+   */
+  | 'W_CHANNEL_SWITCH_UNBOUND';
 
 export interface ContractIssue {
   code: ContractIssueCode;
