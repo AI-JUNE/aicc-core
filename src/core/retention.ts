@@ -112,6 +112,66 @@ export function validateRetentionPolicy(policy: RetentionPolicy): string[] {
   return errors;
 }
 
+// ── 저장 가능 판정(§8.2) ────────────────────────────────────────────────────────
+//
+// 위 `DataClassSpec.mayContainPii` 주석은 "보존기간 미설정 시 **저장 자체를 막는다**"라고 적어 뒀는데,
+// 그것을 실제로 막을 수 있는 함수가 없었다. `validateRetentionPolicy` 는 **오류 문자열 목록**을 돌려주므로
+// 설정 화면은 읽을 수 있어도 **저장하는 코드는 물어볼 데가 없다** — 문자열을 부분 일치로 뒤져서 판정하는
+// 코드가 생기면 문구를 다듬는 순간 조용히 통과한다. 그래서 묻는 자리를 함수 하나로 연다.
+//
+// 막는 사고: **보존기간을 정하지 않은 채 개인정보가 먼저 쌓인다.** 한 번 쌓이면 기한을 나중에 정해도
+// 이미 들어온 건의 기산 시점은 되돌릴 수 없고, 정책이 없으니 `decide` 는 영원히 `blocked` 를 낸다 —
+// **지울 근거도 지울 기한도 없는 개인정보**가 남는다. 그래서 개인정보 포함 분류는 규칙이 없거나
+// 미승인이면 **저장을 거절**한다(파기 쪽 `decide` 와 같은 조건이다 — 두 규칙이 갈리면 저장은 되는데
+// 파기는 안 되는 조합이 생긴다).
+//
+// 개인정보를 담지 않는 분류는 규칙이 없어도 **막지 않는다** — 막으면 설정을 다 채우기 전에는
+// 이벤트 한 건도 못 쌓아 도입 자체가 불가능해진다. 대신 경고로 드러낸다(조용히 넘기지 않는다).
+
+export type StorabilityCode = 'E_UNKNOWN_CLASS' | 'E_NO_RULE' | 'E_NOT_APPROVED';
+
+export type StorabilityVerdict =
+  | { allowed: true; warningKo?: string }
+  | { allowed: false; code: StorabilityCode; reasonKo: string };
+
+/**
+ * 이 분류를 지금 저장해도 되는가(§8.2). 판정만 하고 던지지 않는다 —
+ * 호출자가 "거절"과 "경고"를 구분해 처리할 수 있어야 하기 때문이다.
+ */
+export function canStore(policy: RetentionPolicy, dataClass: DataClass): StorabilityVerdict {
+  let spec: DataClassSpec;
+  try {
+    spec = dataClassSpec(dataClass);
+  } catch {
+    return { allowed: false, code: 'E_UNKNOWN_CLASS', reasonKo: `알 수 없는 데이터 분류: ${dataClass} (설계서 §8.2)` };
+  }
+  const rule = policy.rules.find((r) => r.dataClass === dataClass);
+  if (!rule) {
+    if (spec.mayContainPii) {
+      return {
+        allowed: false,
+        code: 'E_NO_RULE',
+        reasonKo: `${spec.titleKo}: 보존 규칙이 없어 저장할 수 없습니다 — 기한 없는 개인정보는 지울 근거도 없습니다 (설계서 §8.2)`,
+      };
+    }
+    return { allowed: true, warningKo: `${spec.titleKo}: 보존 규칙이 없습니다 — 자동 파기 대상이 되지 않습니다 (설계서 §8.2)` };
+  }
+  if (spec.mayContainPii && !rule.approved) {
+    return {
+      allowed: false,
+      code: 'E_NOT_APPROVED',
+      reasonKo: `${spec.titleKo}: 보존 규칙이 미승인 상태라 저장할 수 없습니다 [승인 필요]`,
+    };
+  }
+  return { allowed: true };
+}
+
+/** 저장 경로에서 쓰는 강제형. 거절 사유를 그대로 던진다 — 통과시키면 되돌릴 수 없다. */
+export function assertStorable(policy: RetentionPolicy, dataClass: DataClass): void {
+  const v = canStore(policy, dataClass);
+  if (!v.allowed) throw new Error(v.reasonKo);
+}
+
 export function ruleFor(policy: RetentionPolicy, dataClass: DataClass): RetentionRule | undefined {
   return policy.rules.find((r) => r.dataClass === dataClass);
 }
