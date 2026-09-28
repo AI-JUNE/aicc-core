@@ -34,6 +34,8 @@ import type { HandoffPlacement } from '../routing/executeHandoff.ts';
 import { executeHandoff } from '../routing/executeHandoff.ts';
 import type { InviteDeliveryKind, InviteRegistry, SlotCarryPolicy, SwitchReason, SwitchTargetChannel } from '../core/channelSwitch.ts';
 import { issueSwitch, redeemSwitch } from '../core/executeSwitch.ts';
+import type { AiDisclosureConfig } from '../portal/aiDisclosure.ts';
+import { planDisclosure, validateDisclosureBinding } from '../core/executeDisclosure.ts';
 import type { ConnectorPumpBinding } from '../integration/connectorPump.ts';
 import { connectorHopLimit, hopLimitInput, missingConnectors, pumpConnectorHop } from '../integration/connectorPump.ts';
 import type {
@@ -88,6 +90,11 @@ export interface SessionRecord {
   connectorCalls?: Record<string, number>;
   /** 펌프 실행 중 표시. 같은 대기 건에 두 번 들어와 업무시스템을 두 번 부르는 것을 막는다. */
   connectorInFlight?: boolean;
+  /**
+   * 이 세션에서 AI 고지를 마친 채널(§10.1). 매 턴 다시 고지하면 안내가 잡음이 되고,
+   * 채널이 바뀌면(§5.2) 새 매체에서는 아직 고지하지 않은 것이므로 채널 단위로 센다.
+   */
+  disclosedChannels?: ChannelKind[];
 }
 
 /** 세션 저장소. 인메모리는 단일 프로세스용 — 영속 구현은 이 인터페이스 뒤로 교체한다(§6.2). */
@@ -192,6 +199,17 @@ export interface ConversationCoreOptions {
   connectors?: ConnectorPumpBinding;
   /** 채널 전환 초대(§5.2). 미지정 시 종전 동작 — 합류에 토큰을 요구하지 않는다(§13-3). */
   channelSwitch?: ChannelSwitchBinding;
+  /**
+   * AI 고지(§10.1·§7 7.4). **주지 않으면 종전과 완전히 같다**(§13-3) — 고지는 나가지 않고,
+   * 그 사실이 `W_AI_DISCLOSURE_UNBOUND` 경고로 남는다.
+   *
+   * 주면 Core 가 고객이 실제로 보고·듣는 매체에 맞는 문구를 **AI 첫 응답보다 앞에** 끼운다.
+   * 이 배선이 없으면 `portal/aiDisclosure.ts` 는 저장소에 있으나 **아무도 부르지 않는** 상태로
+   * 남고, 채널 3곳이 각자 "세션 시작 시 문구를 한 번 내보낸다"를 짜며 각자 다르게 틀린다.
+   *
+   * 문구는 Core 가 만들지 않는다 — 법무 검토를 거친 테넌트 문구만 싣는다 **[승인 필요]**.
+   */
+  disclosure?: AiDisclosureConfig;
   now?: () => string;
   newInteractionId?: (req: ChannelSessionRequest) => string;
   onPublish?: (results: PublishResult[]) => void;
@@ -289,6 +307,29 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     warnings.push(...issues.filter((i) => i.severity === 'warning'));
     regs.set(reg.port.id, reg);
     declared.set(reg.port.id, new Set(reg.reportsComponents));
+  }
+
+  // AI 고지도 **배포 시점에** 거른다(§10.1). 미승인 문구·음성에 배너 같은 설정 오류를 통과시키면
+  // 고지는 나가지 않거나 렌더되지 않는데 "적용했다"로 남는다. 검증 대상 채널은 **실제로 등록된
+  // 채널만**이다 — 붙지도 않은 채널의 문구가 없다는 경고가 쌓이면 진짜 누락이 그 안에 묻힌다.
+  if (opts.disclosure !== undefined) {
+    const activeChannels = [...new Set(opts.channels.map((r) => r.port.capabilities.channel))];
+    const issues = validateDisclosureBinding(opts.disclosure, opts.scope, activeChannels);
+    if (issues.errorsKo.length > 0) {
+      throw new Error(`AI 고지 배선 거부: ${issues.errorsKo.join(' / ')}`);
+    }
+    for (const messageKo of issues.warningsKo) {
+      warnings.push({ code: 'W_AI_DISCLOSURE', severity: 'warning', messageKo });
+    }
+  } else {
+    // 고지는 법적 의무이고 미배선의 증상은 **아무 일도 일어나지 않는 것**이다 — 통화도 이벤트도
+    // 적합성 검사도 정상이라 어디서도 터지지 않는다. 종전 동작이므로 막지 않되 반드시 드러낸다.
+    warnings.push({
+      code: 'W_AI_DISCLOSURE_UNBOUND',
+      severity: 'warning',
+      messageKo: 'AI 고지 배선(disclosure)이 없습니다 — 어떤 채널에서도 고지가 나가지 않습니다(§10.1·§7 7.4). '
+        + '문구는 법무 검토를 거친 테넌트 문안이어야 합니다 [승인 필요].',
+    });
   }
 
   // 전환이 가능한 채널이 붙어 있는데 배선이 없으면, 그 전환 링크는 **id 가 곧 열쇠**다.
@@ -679,6 +720,46 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     await reg.port.invite(rec.interactionId, next, issued.ticket);
   }
 
+  /**
+   * AI 고지를 이번 턴 단계 **맨 앞에** 끼운다(§10.1). 배선이 없으면 아무것도 하지 않는다(§13-3).
+   *
+   * 여기서 지키는 것:
+   * - **steps 배열을 제자리에서 고친다.** 호출부의 `presented` 인덱스 계산·결과 `steps`·
+   *   `port.present` 가 전부 같은 배열을 본다. 새 배열을 만들어 돌려주면 한 곳이라도 옛 배열을
+   *   들고 있으면 고지가 그 경로에서만 사라지고, 그건 "어떤 호스트에서만 고지가 안 된다"가 된다.
+   * - **앞에 넣는다.** 뒤에 붙이면 AI 가 먼저 말한 뒤에 고지가 나가 §10.1 을 지키지 못한다
+   *   (Api 대기 안내를 호출 뒤로 옮기면 안내가 아니라 잡음이 되는 것과 같은 자리다).
+   * - **채널 단위로 한 번만.** 매 턴 반복하면 안내가 잡음이 되고, 채널이 바뀌면(§5.2) 새 매체는
+   *   아직 고지하지 않은 것이므로 다시 낸다 — 고객은 화면을 처음 보는 중이다.
+   * - **고지할 수 없으면 AI 응대를 시작하지 않는다.** 미승인 문구 상태로 응대하면 위반이
+   *   조용히 누적되고, 드러나는 시점에는 지나간 통화 전부가 대상이다. 통화 1건이 예외로 끝나는
+   *   쪽이 낫다 — 배선 시점 검증이 이미 같은 조건을 거르므로 이 경로는 설정 객체가 런타임에
+   *   바뀐 경우에만 닿는다(그때는 조용히 넘기면 안 되는 상황이 맞다).
+   *
+   * 장애 폴백(§9.3)으로 이관·종료되는 경로에서는 부르지 않는다 — **AI 가 응대하지 않았으므로
+   * 고지 대상이 없다**. 상담사로 넘기기 직전에 "AI 가 응대합니다"를 내보내면 고지가 아니라 오안내다.
+   */
+  function prependDisclosure(rec: SessionRecord, steps: RenderedStep[]): ChannelTurnResult['disclosure'] {
+    const config = opts.disclosure;
+    if (config === undefined) return undefined;
+    const channel = rec.state.channel;
+    const plan = planDisclosure({
+      config, scope: rec.scope, channel, disclosedChannels: rec.disclosedChannels ?? [],
+    });
+    if (plan.action === 'block') {
+      throw new Error(`AI 고지 거부(${plan.code}): ${plan.reasonKo}`);
+    }
+    if (plan.action === 'skip') {
+      // 끈 것·이미 고지한 것은 정상이다. **등록된 채널의 문구 누락만** 드러낸다 —
+      // 그 상태는 고지 없이 응대하는 것이고, 배선했다는 사실이 그걸 가려 준다.
+      if (plan.code === 'channel_not_configured') warnOnce('W_AI_DISCLOSURE', plan.reasonKo);
+      return undefined;
+    }
+    steps.unshift(plan.step);
+    rec.disclosedChannels = [...(rec.disclosedChannels ?? []), channel];
+    return { channel, placement: plan.placement, configVersion: plan.configVersion };
+  }
+
   async function join(req: ChannelSessionRequest, interactionId: string): Promise<ChannelTurnResult> {
     const rec = sessions.get(interactionId);
     if (!rec) throw new Error(`합류할 Interaction이 없습니다: ${interactionId} (§5.2)`);
@@ -724,11 +805,15 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     // 같은 Interaction·같은 노드를 새 채널 렌더러로 다시 그린다. 새 발화가 아니므로 턴 이벤트를 만들지 않는다(§8.1).
     const node = rec.state.currentNodeId === null ? undefined : rec.flow.nodes[rec.state.currentNodeId];
     const steps = node ? [renderNode(node, channel)] : [];
+    // 합류한 매체에서는 아직 고지하지 않았다 — 고객은 이 화면을 처음 본다(§5.2·§10.3).
+    // 렌더할 단계가 없어도 고지는 나간다: 화면이 열린 것 자체가 AI 응대의 시작이다.
+    const disclosure = prependDisclosure(rec, steps);
     sessions.put(rec);
     const shown = visibleSteps(steps);
     if (shown.length > 0) await reg.port.present(rec.interactionId, shown);
     const result: ChannelTurnResult = {
       interactionId: rec.interactionId, state: rec.state, steps, status: rec.state.status, events: [],
+      ...(disclosure !== undefined ? { disclosure } : {}),
     };
     rec.lastResult = result;
     return result;
@@ -795,6 +880,9 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       for (const [k, v] of Object.entries(req.presetSlots ?? {})) {
         if (!k.startsWith('__')) rec.state.slots[k] = v;   // 예약 슬롯은 채널이 덮어쓸 수 없다
       }
+      // 고지는 **첫 단계보다 앞에** 들어가야 하므로 커넥터 이행보다 먼저 끼운다(§10.1) —
+      // Api 대기 안내가 먼저 present 되는 시나리오에서는 그 안내가 곧 첫 발화다.
+      const disclosure = prependDisclosure(rec, run.steps);
       // Api 노드는 여기서 이행한다. presetSlots 를 병합한 **뒤에** 부른다 — 커넥터 파라미터가
       // 채널이 넘긴 슬롯에서 오는 경우(발신번호·회원번호) 앞서 부르면 필수 슬롯 누락으로 막힌다.
       const drained = await drainConnectors(rec, reg, run);
@@ -805,6 +893,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       const result: ChannelTurnResult = {
         interactionId, state: rec.state, steps: drained.steps, status: rec.state.status, events,
         ...(decision.mode === 'degraded_ai' ? { fallback: decision } : {}),
+        ...(disclosure !== undefined ? { disclosure } : {}),
         ...(rec.state.handoff ? { handoff: { ...(rec.state.handoff.queue !== undefined ? { queue: rec.state.handoff.queue } : {}), ...(summaryMasked !== undefined ? { summaryMasked } : {}) } } : {}),
       };
       rec.lastResult = result;
@@ -846,6 +935,9 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
           }
         }
       }
+      // 채널이 이 턴에 바뀌었으면(§5.2) 새 매체는 아직 고지 전이다 — 이미 고지한 채널이면
+      // 아무것도 하지 않으므로 턴마다 반복되지 않는다.
+      const disclosure = prependDisclosure(rec, run.steps);
       const drained = await drainConnectors(rec, reg, run);
       const events = drained.events;
       const summaryMasked = rec.state.handoff ? attachSummary(rec, events) : undefined;
@@ -855,6 +947,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       const result: ChannelTurnResult = {
         interactionId, state: rec.state, steps: drained.steps, status: rec.state.status, events,
         ...(decision.mode === 'degraded_ai' ? { fallback: decision } : {}),
+        ...(disclosure !== undefined ? { disclosure } : {}),
         ...(rec.state.handoff ? { handoff: { ...(rec.state.handoff.queue !== undefined ? { queue: rec.state.handoff.queue } : {}), ...(summaryMasked !== undefined ? { summaryMasked } : {}) } } : {}),
       };
       rec.lastResult = result;

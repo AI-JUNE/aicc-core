@@ -2,6 +2,7 @@
 // 이것이 "시나리오 이중 관리"(§2 운영비용 최대 항목)를 구조적으로 제거한다.
 import type { ChannelKind } from '../domain/types.ts';
 import type { RepromptReason } from './reprompt.ts';
+import type { DisclosurePlacement } from '../portal/aiDisclosure.ts';
 
 export type NodeKind = 'Say' | 'Collect' | 'Choice' | 'Confirm' | 'Transfer' | 'Api';
 
@@ -51,6 +52,15 @@ export interface RenderedStep {
   inputTimeoutMs?: number;
   /** 안내 도중 끼어들기 허용 여부. 음성 채널에만 실린다. */
   bargeIn?: boolean;
+  /**
+   * AI 고지 단계라는 표시(§10.1 · §7 7.4). 고지가 배선된 테넌트에서만 실린다 —
+   * 이 필드가 없으면 종전과 완전히 같다(§13-3).
+   *
+   * 이 단계는 **시나리오 노드가 아니다**(`nodeId` 가 `flow.nodes` 에 없다). 모르는 포트는
+   * 그냥 텍스트로 내보내면 되고 그것이 곧 고지다 — `placement` 를 읽는 포트는 매체에 맞게
+   * (화면 상단 고정 배너·첫 발화 전) 표현을 달리할 수 있다.
+   */
+  disclosure?: { placement: DisclosurePlacement; configVersion: number };
 }
 
 export function renderNode(node: FlowNode, channel: ChannelKind): RenderedStep {

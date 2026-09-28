@@ -17,6 +17,7 @@ import type { ChannelKind } from '../domain/types.ts';
 import type { Flow, RenderedStep } from '../flow/types.ts';
 import { maskPii } from '../core/policyGuard.ts';
 import type { SwitchTicket } from '../core/executeSwitch.ts';
+import { DISCLOSURE_NODE_ID } from '../core/executeDisclosure.ts';
 import type {
   ChannelAdapterId, ChannelCapabilities, ChannelPort, ChannelRegistration,
 } from './contract.ts';
@@ -38,7 +39,8 @@ export type ConformanceCheckId =
   | 'FLOW_SUPPORT'        // 선언한 능력으로 대상 Flow 를 렌더할 수 있는가(§5.3)
   | 'TURN_HINTS'          // 재시도·타이밍 힌트가 붙은 단계를 흡수하는가(§5.1)
   | 'CONNECTOR_WAIT'      // 한 턴에 present 가 두 번 와도(대기 안내 → 결과) 되는가(§6.1)
-  | 'CHANNEL_INVITE';     // 전환 초대에 티켓이 실려도 흡수하는가 — 링크는 토큰으로 만든다(§5.2·§10.3)
+  | 'CHANNEL_INVITE'      // 전환 초대에 티켓이 실려도 흡수하는가 — 링크는 토큰으로 만든다(§5.2·§10.3)
+  | 'AI_DISCLOSURE';      // 시나리오 노드가 아닌 AI 고지 단계를 그대로 내보내는가(§10.1·§7 7.4)
 
 export interface ConformanceCheck {
   id: ConformanceCheckId;
@@ -101,6 +103,23 @@ function waitStep(channel: ChannelKind): RenderedStep {
   return {
     channel, nodeId: 'n_probe_api', kind: 'Api', text: '조회 중입니다. 잠시만 기다려 주세요.',
     awaitConnectorId: 'c_probe',
+  };
+}
+
+/**
+ * §10.1 AI 고지 단계. 고지가 배선되면 턴의 **맨 앞**에 이 단계가 하나 더 들어온다.
+ * 중요한 차이는 필드가 아니라 `nodeId` 다 — 이 단계는 **시나리오 노드가 아니라**
+ * `flow.nodes` 에 없다. 단계를 받아 `flow.nodes[step.nodeId]` 로 되짚는 포트(문안 치환·
+ * 화면 템플릿 선택에 흔한 구현)는 고지를 켜는 날 전 통화가 첫 단계에서 깨진다.
+ */
+function disclosureStep(channel: ChannelKind): RenderedStep {
+  return {
+    channel, nodeId: DISCLOSURE_NODE_ID, kind: 'Say',
+    text: '본 상담은 AI 상담원이 진행합니다.',
+    disclosure: {
+      placement: channel === 'voice' ? 'before_first_response' : 'persistent_banner',
+      configVersion: 3,
+    },
   };
 }
 
@@ -412,7 +431,33 @@ export async function runChannelConformance(opts: ConformanceOptions): Promise<C
     });
   }
 
-  // 13) 시나리오 렌더 가능성(§5.3) — 능력 선언과 실제 시나리오가 어긋나면 배포 후에야 드러난다.
+  // 13) AI 고지(§10.1·§7 7.4) — 고지가 배선되면 턴 맨 앞에 **시나리오에 없는 단계**가 하나 붙는다.
+  //     TURN_HINTS·CONNECTOR_WAIT·CHANNEL_INVITE 와 같은 이유로 각 저장소 CI 에서 미리 잡는다:
+  //     고지를 켜는 일은 코드 배포가 아니라 설정 변경이라, 여기서 깨지는 포트는 **설정을 바꾸는 날**
+  //     전 통화가 첫 단계에서 죽고 원인을 찾기도 어렵다.
+  //     **고지 문구를 삼키는 구현은 이 검사로 잡을 수 없다** — 무엇을 내보냈는지는 포트 안의 일이다.
+  //     그래서 실패 문구에 못박아 둔다: 이 단계는 반드시 고객에게 나가야 하고, 나가지 않으면
+  //     통화도 이벤트도 정상이라 어디서도 터지지 않은 채 §10.1 위반만 쌓인다.
+  {
+    const steps: RenderedStep[] = [disclosureStep(channel), step(channel, '무엇을 도와드릴까요?')];
+    const snapshot = JSON.stringify(steps);
+    const r = await withBudget(() => port.present('i_probe_disclosure', steps), budget);
+    const unchanged = JSON.stringify(steps) === snapshot;
+    add({
+      id: 'AI_DISCLOSURE',
+      passed: r.ok === true && unchanged,
+      severity: 'error',
+      messageKo: r.ok === true && unchanged
+        ? 'AI 고지 단계를 흡수하고 변형하지 않습니다(§10.1). 이 단계는 시나리오 노드가 아니므로 '
+          + `\`flow.nodes['${DISCLOSURE_NODE_ID}']\` 는 없습니다 — 텍스트를 그대로 내보내면 그것이 고지입니다.`
+        : !unchanged
+          ? 'AI 고지 단계를 present 가 변형했습니다. 고지 문구·버전은 감사 근거이므로 채널이 고쳐 쓸 수 없습니다(§10.1).'
+          : `AI 고지 단계에서 실패했습니다: ${'timeout' in r ? '예산 초과' : errText((r as { error: unknown }).error)}. `
+            + `이 단계의 nodeId 는 시나리오에 없습니다 — 단계를 flow.nodes 로 되짚지 마세요(§10.1).`,
+    });
+  }
+
+  // 14) 시나리오 렌더 가능성(§5.3) — 능력 선언과 실제 시나리오가 어긋나면 배포 후에야 드러난다.
   if (!opts.flows || opts.flows.length === 0) {
     add({ id: 'FLOW_SUPPORT', passed: true, skipped: true, severity: 'warning', messageKo: 'flows 미지정 — 시나리오 렌더 가능 여부를 검사하지 않았습니다(§5.3).' });
   } else {

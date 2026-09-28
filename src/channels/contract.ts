@@ -14,6 +14,7 @@ import type { FlowInput, FlowState, RunStatus } from '../flow/runner.ts';
 import type { EntryPoint, LatencyMs, UsageMetrics, InteractionEvent } from '../events/schema.ts';
 import type { TenantScope } from '../core/tenancy.ts';
 import type { SwitchTicket } from '../core/executeSwitch.ts';
+import type { DisclosurePlacement } from '../portal/aiDisclosure.ts';
 import type { ComponentId, HealthSample, FallbackDecision } from '../ops/fallback.ts';
 
 export const CHANNEL_CONTRACT_VERSION = 1;
@@ -79,6 +80,13 @@ export interface ChannelTurnResult {
    * `action`(콜백·음성사서함·기존 IVR)을 수행해야 하며, 상담사 연결 안내를 해서는 안 된다(§9.3).
    */
   handoff?: { queue?: string; summaryMasked?: string; placement?: HandoffPlacement };
+  /**
+   * 이번 턴에 AI 고지를 냈다는 사실(§10.1). 고지 문구 자체는 `steps` 맨 앞 단계에 실려 나간다 —
+   * 여기 있는 것은 **감사 근거**(어느 매체에 어떤 버전으로 고지했는가)다. 호스트가 steps 를
+   * 뒤져 찾아내게 두면 세 저장소가 각자 다르게 찾는다(§2).
+   * 고지가 배선되지 않았거나 이미 고지한 채널이면 실리지 않는다.
+   */
+  disclosure?: { channel: ChannelKind; placement: DisclosurePlacement; configVersion: number };
 }
 
 /**
@@ -172,7 +180,15 @@ export type ContractIssueCode =
    * 이 상태의 합류는 **Interaction id 하나로 통과**하므로, 링크를 본 사람은 누구나
    * 진행 중인 상담 화면을 열 수 있다. 금지는 아니지만(종전 동작) 운영이 반드시 알아야 한다.
    */
-  | 'W_CHANNEL_SWITCH_UNBOUND';
+  | 'W_CHANNEL_SWITCH_UNBOUND'
+  /** 고지 설정은 실렸으나 일부 채널 문구가 비어 있는 등, 막지는 않되 운영이 알아야 하는 상태(§10.1). */
+  | 'W_AI_DISCLOSURE'
+  /**
+   * AI 고지가 배선되지 않았다(§10.1·§7 7.4). 이 상태에서는 **어떤 채널에서도 고지가 나가지 않는다** —
+   * 통화는 정상으로 끝나고 이벤트도 정상이라 어디서도 터지지 않는다. 종전 동작이므로 막지는 않되
+   * 조용히 두지도 않는다: 드러나는 시점이 감독기관 점검이면 이미 지나간 통화 전부가 대상이다.
+   */
+  | 'W_AI_DISCLOSURE_UNBOUND';
 
 export interface ContractIssue {
   code: ContractIssueCode;
