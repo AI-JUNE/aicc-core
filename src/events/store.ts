@@ -14,7 +14,10 @@
 import type { InteractionEvent } from './schema.ts';
 import { assertTenantScoped } from './schema.ts';
 import { assertTenantScope, type TenantScope } from '../core/tenancy.ts';
-import { idempotencyKey, type IdempotencyStore } from './bus.ts';
+import {
+  idempotencyKey, type IdempotencyStore,
+  type EventBus, type EventSink, type PublishResult, type SinkOutcome,
+} from './bus.ts';
 
 /** 원장에 기록된 한 건. offset 은 테넌트 원장 안에서 0부터 단조 증가한다. */
 export interface StoredEvent {
@@ -130,6 +133,15 @@ export function createMemoryEventLog(scope: TenantScope, seed: StoredEvent[] = [
  * release 를 구현하지 않는다: 추가 전용 원장에서 키를 되돌릴 수 없기 때문이다.
  * 따라서 이 저장소를 쓰는 버스는 releaseKeyOnSinkFailure: false 여야 한다
  * (싱크 실패 시 재전송은 replay 로 한다 — 아래 replayUndelivered).
+ *
+ * **`bus.ts` 의 `createEventBus` 에 그대로 넘기지 않는다.** `IdempotencyStore.markIfNew(key)` 는
+ * 키만 받으므로, 이 저장소는 append 할 이벤트 전체를 알 방법이 없다 — 그래서 `attach(event)` 를
+ * 직전에 부르는 관례가 필요하다. `createEventBus` 의 `publish` 는 이 관례를 모른 채 `markIfNew` 만
+ * 부르므로, **그대로 넘기면 매 호출 첫 이벤트에서 위 예외로 던진다.** 게다가 "직전에 attach" 관례는
+ * 슬롯이 하나뿐이라 같은 버스로 서로 다른 이벤트를 동시에(await 없이 겹쳐) 발행하면 경합한다.
+ * 실제로 원장 위에 완결된 버스가 필요하면 `attach` 를 직접 다루지 말고 아래 `createLogBackedEventBus`
+ * 를 쓴다. 이 함수와 `attach` 는 원장이 아닌 다른 조합(예: 이 저장소를 감싸는 자체 버스 구현)을
+ * 손으로 짤 때만 남겨 둔 저수준 조각이다.
  */
 export function createLogBackedIdempotencyStore(log: EventLog): IdempotencyStore & { attach(event: InteractionEvent): void } {
   let pending: InteractionEvent | null = null;
@@ -157,6 +169,88 @@ export function createLogSink(log: EventLog, name = 'event_log'): { name: string
   return {
     name,
     deliver(event) { log.append(event); },
+  };
+}
+
+/**
+ * 원장 위에서 완결되는 이벤트 버스 — 채널 런타임(`channels/runtime.ts` 의 `bus` 옵션)에
+ * 그대로 넘길 수 있는 형태다.
+ *
+ * 왜 `createEventBus` + `createLogBackedIdempotencyStore` 조합을 쓰지 않는가:
+ * 그 조합은 버스가 `markIfNew(key)` 를 부르기 **직전에** 누군가 `attach(event)` 를 불러 둬야
+ * 한다는 관례에 의존한다. `createEventBus` 는 그 관례를 모르므로(인터페이스에 없다) 실제로
+ * 그대로 연결하면 **첫 발행에서 곧바로 예외가 난다** — 조립해 보기 전에는 "붙은 줄 알았는데
+ * 실제로는 한 줄도 못 나간다"는 것이 드러나지 않는다(위 (13)(14) 등이 반복해 지적한 것과 같은
+ * 모양의 공백이다). 그래서 이 함수는 그 관례를 아예 없앤다 — 원장의 `append` 가 스코프 검사와
+ * 중복 판정과 기록을 **한 번에** 하므로, 버스는 이벤트를 그대로 원장에 넘기기만 하면 된다.
+ * 이벤트마다 공유하는 가변 상태가 없으므로, 서로 다른 이벤트를 겹쳐 발행해도 경합하지 않는다.
+ *
+ * 지키는 것:
+ *  - **판정을 복사하지 않는다(§2)** — 스코프·중복 판정은 `EventLog.append` 하나다. 여기서
+ *    다시 검사를 쓰면 두 판정이 갈라질 여지가 생긴다.
+ *  - **원장 스코프와 버스 스코프가 다르면 조립 자체를 거절한다** — 다른 테넌트 원장에 잘못
+ *    연결한 버스는 모든 이벤트를 조용히 그 테넌트로 흘릴 수 있다(§11.1). 생성 시점에 잡는다.
+ *  - **원장에 이미 기록된 이벤트(중복)는 싱크를 다시 부르지 않는다** — 원장이 저장의 원천이므로,
+ *    추가 싱크(알림·브로커 전달 등)까지 중복으로 다시 태우면 그 쪽에서 이중 집계가 난다.
+ *  - **테넌트 격리 위반은 삼키지 않는다(§11.1)** — `EventLogRejected` 는 `rejected` 결과로
+ *    돌려주지만(§8.1 규약과 동일한 모양), 그 외의 예외(원장 구현이 던진 나머지 오류)는 그대로 올린다.
+ *  - **싱크 실패는 서로 격리된다** — 한 싱크가 던져도 나머지 싱크는 계속 가고, 실패는
+ *    `PublishResult.sinks` 에 담겨 삼켜지지 않는다(bus.ts 의 규약과 동일).
+ *  - **release 개념이 없다** — 추가 전용 원장은 되돌릴 수 없으므로, 싱크 실패로 재발행이
+ *    필요하면 `replayUndelivered` 를 쓴다(위).
+ */
+export function createLogBackedEventBus(opts: {
+  scope: TenantScope;
+  log: EventLog;
+  /** 원장 외에 추가로 전달할 싱크(알림·브로커 등). 원장 자체는 항상 먼저, 무조건 기록된다. */
+  sinks?: EventSink[];
+}): EventBus {
+  assertTenantScope(opts.scope);
+  if (opts.log.scope.tenantId !== opts.scope.tenantId) {
+    throw new Error(
+      `이벤트 원장의 스코프(${opts.log.scope.tenantId})가 버스 스코프(${opts.scope.tenantId})와 다르다 ` +
+      `(설계서 §11.1) — 다른 테넌트 원장에 연결된 버스는 이벤트를 조용히 남의 원장으로 흘릴 수 있다.`,
+    );
+  }
+  const sinks = opts.sinks ?? [];
+
+  async function publishOne(event: InteractionEvent): Promise<PublishResult> {
+    let appended;
+    try {
+      appended = opts.log.append(event);
+    } catch (err) {
+      if (err instanceof EventLogRejected) {
+        return { eventId: event.event_id ?? '', key: '', status: 'rejected', reasonKo: err.message, sinks: [] };
+      }
+      throw err;
+    }
+    if (appended.duplicate) {
+      return { eventId: event.event_id as string, key: appended.key, status: 'duplicate', sinks: [] };
+    }
+    const outcomes: SinkOutcome[] = [];
+    for (const sink of sinks) {
+      try {
+        await sink.deliver(event);
+        outcomes.push({ sink: sink.name, ok: true });
+      } catch (err) {
+        outcomes.push({
+          sink: sink.name,
+          ok: false,
+          errorMessage: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    return { eventId: event.event_id as string, key: appended.key, status: 'delivered', sinks: outcomes };
+  }
+
+  return {
+    publish: publishOne,
+    async publishAll(events) {
+      // bus.ts 와 같은 규약 — 같은 interaction 의 이벤트는 발행 순서가 곧 시간 순서라 병렬 처리하지 않는다.
+      const results: PublishResult[] = [];
+      for (const e of events) results.push(await publishOne(e));
+      return results;
+    },
   };
 }
 

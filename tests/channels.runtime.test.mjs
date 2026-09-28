@@ -1,12 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-let R = null, F = null, B = null, P = null;
+let R = null, F = null, B = null, P = null, EV = null;
 try {
   R = await import('../src/channels/runtime.ts');
   F = await import('../src/ops/fallback.ts');
   B = await import('../src/events/bus.ts');
   P = await import('../src/channels/profiles.ts');
+  EV = await import('../src/events/store.ts');
 } catch { /* 구형 런타임 */ }
 const b = { skip: R ? false : '타입 스트리핑 미지원 런타임' };
 
@@ -905,4 +906,45 @@ test('배선이 없으면 합류·초대 동작이 종전과 완전히 같다(§
   const joined = await core.start(req({ adapter: 'dars', joinInteractionId: 'i_test1' }));
   assert.equal(joined.interactionId, 'i_test1');
   assert.equal(joined.state.channel, 'visual');
+});
+
+test('원장 위 버스(createLogBackedEventBus)를 실제로 물려도 통화가 끊기지 않는다', b, async () => {
+  // (13)(14) 등이 반복해 지적한 것과 같은 모양의 공백에 대한 회귀 — 조립기가 없으면
+  // 이 배선(createEventBus + createLogBackedIdempotencyStore, attach 없이)은 첫 턴에서 던진다.
+  const log = EV.createMemoryEventLog(SCOPE);
+  const eventBus = EV.createLogBackedEventBus({ scope: SCOPE, log });
+  const health = F.createHealthRegistry([]);
+  const core = R.createConversationCore({
+    scope: SCOPE,
+    flows: R.createMemoryFlowRegistry([flowBilling]),
+    channels: [{ port: fakePort(), reportsComponents: P.CHANNEL_COMPONENTS.callbot, contractVersion: 1 }],
+    policy: { tenantId: 'goone', staleAfterMs: 60000, treatUnknownAsDown: false, legacyIvrAvailable: false, agentQueueAvailable: true },
+    health, bus: eventBus, now: () => NOW,
+    newInteractionId: () => 'i_test1',
+  });
+  const r = await core.start(req());
+  assert.equal(r.status, 'running');
+  assert.ok(log.size() >= 1, '세션 시작 이벤트가 원장에 실제로 기록돼야 한다');
+  assert.equal(log.read()[0].event.type, 'session.started');
+  assert.equal(log.read().every((row) => row.event.tenant_id === 'goone'), true);
+});
+
+test('원장 위 버스는 재개된 세션에서도 이벤트를 중복 없이 누적한다', b, async () => {
+  const log = EV.createMemoryEventLog(SCOPE);
+  const eventBus = EV.createLogBackedEventBus({ scope: SCOPE, log });
+  const health = F.createHealthRegistry([]);
+  const core = R.createConversationCore({
+    scope: SCOPE,
+    flows: R.createMemoryFlowRegistry([flowBilling]),
+    channels: [{ port: fakePort(), reportsComponents: P.CHANNEL_COMPONENTS.callbot, contractVersion: 1 }],
+    policy: { tenantId: 'goone', staleAfterMs: 60000, treatUnknownAsDown: false, legacyIvrAvailable: false, agentQueueAvailable: true },
+    health, bus: eventBus, now: () => NOW,
+    newInteractionId: () => 'i_test1',
+  });
+  await core.start(req());
+  const beforeTurn = log.size();
+  await core.send('i_test1', { input: { kind: 'utterance', text: '홍길동' } });
+  assert.ok(log.size() > beforeTurn, '턴 진행 이벤트가 원장에 추가돼야 한다');
+  const keys = log.read().map((row) => row.key);
+  assert.equal(new Set(keys).size, keys.length, '같은 멱등 키가 원장에 두 번 쌓이면 안 된다');
 });

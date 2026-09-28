@@ -230,7 +230,7 @@ const next  = await core.send(first.interactionId, { input: { kind: 'text', text
 |---|---|---|
 | `events/schema.ts` | §8.1 이벤트 4종. 테넌트 없는 이벤트를 만들 수 없다 | `sessionStarted`, `turnCompleted`, `handoffRequested`, `sessionEnded` |
 | `events/bus.ts` | 멱등 발행·중복 제거·싱크 결과 집계 | `createEventBus`, `idempotencyKey`, `dedupeEvents` |
-| `events/store.ts` | 추가 전용 원장·JSONL·부분손상 복구·재전송 | `createMemoryEventLog`, `serializeJsonl`, `parseJsonl`, `replayUndelivered`, `verifyLogIntegrity` |
+| `events/store.ts` | 추가 전용 원장·JSONL·부분손상 복구·재전송·원장 위 완결 버스 | `createMemoryEventLog`, `createLogBackedEventBus`, `createLogBackedIdempotencyStore`, `createLogSink`, `serializeJsonl`, `parseJsonl`, `replayUndelivered`, `verifyLogIntegrity` |
 | `billing/usage.ts` | 사용량 집계·반올림·외부 명세 대조(§11.2) | `aggregateUsage`, `applyRounding`, `reconcile` |
 | `billing/reconcile.ts` | 대사 시나리오. 과다청구 방향 미해소 차이는 `blocked` | `runReconciliationScenario`, `formatReconciliationReport` |
 | `partner/rbac.ts` | 파트너 담당자 권한. 기본 거부·미결속 거부·역할 혼용 거부, 활성화는 **[승인 필요]** | `PARTNER_ROUTE_ALLOWLIST`, `partnerRbacEnabled`, `decidePartnerAccess`, `partnerActorFilter`, `filterForPartnerActor`, `recordPartnerAccess`, `partnerRbacSelfCheck` |

@@ -183,3 +183,138 @@ test('무결성 점검은 테넌트 위반·시각 역행을 각각 오류·경�
   assert.equal(r2.ok, false);
   assert.match(r2.errorsKo[0], /테넌트 격리 위반/);
 });
+
+// ── createLogBackedEventBus: 원장 위에서 완결되는 버스 ──────────────────────
+
+test('원장 위 버스는 정상 발행을 원장에 기록하고 delivered 를 돌려준다', b, async () => {
+  const log = m.createMemoryEventLog(scope);
+  const eventBus = m.createLogBackedEventBus({ scope, log });
+  const r = await eventBus.publish(started(1));
+  assert.equal(r.status, 'delivered');
+  assert.equal(log.size(), 1);
+  assert.equal(log.read()[0].event.event_id, 'e1');
+});
+
+test('같은 이벤트 재발행은 duplicate 이며 원장 크기가 늘지 않는다', b, async () => {
+  const log = m.createMemoryEventLog(scope);
+  const eventBus = m.createLogBackedEventBus({ scope, log });
+  const e = started(1);
+  assert.equal((await eventBus.publish(e)).status, 'delivered');
+  const again = await eventBus.publish(e);
+  assert.equal(again.status, 'duplicate');
+  assert.equal(log.size(), 1, '중복 발행이 원장에 두 번 쌓이면 안 된다');
+});
+
+test('publishAll 은 여러 이벤트를 순서대로 원장에 쌓는다', b, async () => {
+  const log = m.createMemoryEventLog(scope);
+  const eventBus = m.createLogBackedEventBus({ scope, log });
+  const results = await eventBus.publishAll([started(1), ended(2)]);
+  assert.deepEqual(results.map((r) => r.status), ['delivered', 'delivered']);
+  assert.equal(log.size(), 2);
+  assert.deepEqual(log.read().map((r) => r.event.event_id), ['e1', 'e2']);
+});
+
+test('원장 외 추가 싱크도 정상 발행 시 함께 불린다', b, async () => {
+  const log = m.createMemoryEventLog(scope);
+  const collector = bus.createCollectorSink('extra');
+  const eventBus = m.createLogBackedEventBus({ scope, log, sinks: [collector] });
+  await eventBus.publish(started(1));
+  assert.equal(collector.events.length, 1);
+  assert.equal(collector.events[0].event_id, 'e1');
+});
+
+test('중복 발행은 추가 싱크를 다시 부르지 않는다', b, async () => {
+  const log = m.createMemoryEventLog(scope);
+  const collector = bus.createCollectorSink('extra');
+  const eventBus = m.createLogBackedEventBus({ scope, log, sinks: [collector] });
+  const e = started(1);
+  await eventBus.publish(e);
+  await eventBus.publish(e);
+  assert.equal(collector.events.length, 1, '원장이 원천이므로 중복 재태우면 이중 집계가 난다');
+});
+
+test('재시작 시나리오: JSONL 로 복구한 원장 위 새 버스도 과거 이벤트를 중복으로 본다', b, async () => {
+  const log = m.createMemoryEventLog(scope);
+  const eventBus1 = m.createLogBackedEventBus({ scope, log });
+  const e = started(1);
+  assert.equal((await eventBus1.publish(e)).status, 'delivered');
+
+  const restored = m.restoreEventLog(scope, m.serializeJsonl(log.read())).log;
+  const eventBus2 = m.createLogBackedEventBus({ scope, log: restored });
+  const again = await eventBus2.publish(e);
+  assert.equal(again.status, 'duplicate', '재시작 후에도 재전송을 새 이벤트로 집계하면 안 된다(§11.2)');
+});
+
+test('회귀: createEventBus 에 attach 없이 원장 기반 저장소를 그대로 넘기면 던진다', b, async () => {
+  // 이 결함이 createLogBackedEventBus 가 필요한 이유다 — 실제 조립에서 재발하지 않는지 고정한다.
+  const log = m.createMemoryEventLog(scope);
+  const store = m.createLogBackedIdempotencyStore(log);
+  const broken = bus.createEventBus({
+    scope, sinks: [], releaseKeyOnSinkFailure: false,
+    store, // attach 를 부르지 않고 그대로 연결 — 실제로 흔히 저지르는 실수
+  });
+  await assert.rejects(() => broken.publish(started(1)), /attach/);
+});
+
+// ── 실패·경계 경로 ───────────────────────────────────────────────────────────
+
+test('다른 테넌트 이벤트는 rejected 로 돌아오고 원장에 남지 않는다(§11.1)', b, async () => {
+  const log = m.createMemoryEventLog(scope);
+  const eventBus = m.createLogBackedEventBus({ scope, log });
+  const foreign = schema.sessionStarted(meta(1, { tenantId: 't_other' }), {});
+  const r = await eventBus.publish(foreign);
+  assert.equal(r.status, 'rejected');
+  assert.match(r.reasonKo, /§11\.1/);
+  assert.deepEqual(r.sinks, []);
+  assert.equal(log.size(), 0);
+});
+
+test('event_id 없는 이벤트도 rejected 로 흡수한다(§8.1) — 통화를 끊지 않는다', b, async () => {
+  const log = m.createMemoryEventLog(scope);
+  const eventBus = m.createLogBackedEventBus({ scope, log });
+  const e = { ...started(1), event_id: '' };
+  const r = await eventBus.publish(e);
+  assert.equal(r.status, 'rejected');
+  assert.match(r.reasonKo, /event_id/);
+});
+
+test('원장이 EventLogRejected 가 아닌 오류를 던지면 삼키지 않고 올린다', b, async () => {
+  const log = m.createMemoryEventLog(scope);
+  const broken = { ...log, append() { throw new Error('디스크 가득 참'); } };
+  const eventBus = m.createLogBackedEventBus({ scope, log: broken });
+  await assert.rejects(() => eventBus.publish(started(1)), /디스크 가득 참/);
+});
+
+test('싱크 하나가 실패해도 나머지 싱크는 계속 가고 원장 기록은 delivered 로 남는다', b, async () => {
+  const log = m.createMemoryEventLog(scope);
+  const good = bus.createCollectorSink('good');
+  const flaky = { name: 'flaky', deliver() { throw new Error('브로커 거부'); } };
+  const eventBus = m.createLogBackedEventBus({ scope, log, sinks: [flaky, good] });
+  const r = await eventBus.publish(started(1));
+  assert.equal(r.status, 'delivered', '원장에는 이미 기록됐으므로 싱크 실패로 상태가 바뀌면 안 된다');
+  assert.equal(r.sinks.find((s) => s.sink === 'flaky').ok, false);
+  assert.equal(r.sinks.find((s) => s.sink === 'good').ok, true);
+  assert.equal(good.events.length, 1, '앞 싱크가 던져도 뒤 싱크는 불려야 한다');
+  assert.equal(log.size(), 1);
+});
+
+test('원장 스코프와 버스 스코프가 다르면 조립 시점에 거절한다(§11.1)', b, () => {
+  const log = m.createMemoryEventLog({ tenantId: 't_other' });
+  assert.throws(() => m.createLogBackedEventBus({ scope, log }), /§11\.1/);
+});
+
+test('빈 입력: sinks 를 생략해도 정상 동작하고, 빈 배열 발행은 무해하다', b, async () => {
+  const log = m.createMemoryEventLog(scope);
+  const eventBus = m.createLogBackedEventBus({ scope, log });
+  assert.deepEqual(await eventBus.publishAll([]), []);
+  assert.equal(log.size(), 0);
+});
+
+test('publishAll 은 이벤트 하나가 rejected 여도 나머지 이벤트는 계속 처리한다', b, async () => {
+  const log = m.createMemoryEventLog(scope);
+  const eventBus = m.createLogBackedEventBus({ scope, log });
+  const foreign = schema.sessionStarted(meta(9, { tenantId: 't_other', eventId: 'ex' }), {});
+  const results = await eventBus.publishAll([started(1), foreign, ended(2)]);
+  assert.deepEqual(results.map((r) => r.status), ['delivered', 'rejected', 'delivered']);
+  assert.equal(log.size(), 2, '거절된 한 건 때문에 나머지 배치가 막히면 안 된다');
+});
