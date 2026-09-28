@@ -103,6 +103,12 @@ export interface BridgeTurnPayload {
   events: unknown[];
   fallback?: unknown;
   handoff?: { queue?: string; summaryAvailable: boolean; summaryMasked?: string };
+  /**
+   * 이번 턴에 AI 고지를 냈다는 사실(§10.1). 문구는 `steps` 맨 앞 단계에 실려 있으므로 여기서
+   * 되풀이하지 않고 **감사 근거**(어느 매체에 어떤 버전으로)만 내보낸다 — 호스트가 steps 를
+   * 뒤져 찾아내게 두면 언어마다 각자 다르게 찾는다(§2).
+   */
+  disclosure?: { channel: string; placement: string; configVersion: number };
 }
 
 /** 처리 기록. 발화 원문·개인정보를 담지 않는다 — op·판정·마스킹된 사유만 남는다(§10.3). */
@@ -451,6 +457,9 @@ function projectTurn(r: ChannelTurnResult, opts: BridgeOptions): BridgeTurnPaylo
     }
     payload.handoff = handoff;
   }
+  // 고지 사실은 어떤 노출 스위치와도 무관하게 나간다 — 슬롯 값·상담사용 요약과 달리
+  // 여기에는 개인정보가 없고, 감추면 "고지했다"를 증명할 길이 호스트에 남지 않는다(§10.1).
+  if (r.disclosure !== undefined) payload.disclosure = { ...r.disclosure };
   return payload;
 }
 

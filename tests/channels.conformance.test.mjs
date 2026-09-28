@@ -273,3 +273,56 @@ test('CONNECTOR_WAIT: 모르는 단계 종류(Api)에 던지는 포트를 잡는
   const c = r.checks.find((x) => x.id === 'CONNECTOR_WAIT');
   assert.equal(c.passed, false);
 });
+
+// ── AI 고지 (§10.1·§7 7.4) ───────────────────────────────────────────────────
+// 고지를 켜는 것도 코드 배포가 아니라 설정 변경이다. 그 순간 첫 단계에서 전 통화가 깨지면 안 된다.
+
+test('AI_DISCLOSURE: 고지 단계를 흡수하는 구현은 3채널 모두 통과한다', b, async () => {
+  for (const id of ['callbot', 'chatbot', 'dars']) {
+    const port = m.createDryRunPort({ id });
+    const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+    const c = r.checks.find((x) => x.id === 'AI_DISCLOSURE');
+    assert.equal(c.passed, true, `${id}: ${c.messageKo}`);
+    assert.equal(c.severity, 'error');
+    assert.notEqual(c.skipped, true);
+  }
+});
+
+test('AI_DISCLOSURE: 단계를 flow.nodes 로 되짚는 포트를 잡는다 — 고지 단계는 시나리오에 없다', b, async () => {
+  // 문안 치환·화면 템플릿 선택에 흔한 구현이다. 고지가 꺼진 동안에는 아무 문제도 없고,
+  // 설정 하나를 바꾼 날 전 통화가 **첫 단계에서** 죽는다.
+  const nodes = { n_probe: { id: 'n_probe', kind: 'Say', text: '안녕' } };
+  const port = m.createDryRunPort({ id: 'callbot' });
+  port.present = async (_id, steps) => {
+    for (const s of steps) {
+      if (nodes[s.nodeId].kind === 'Say') continue;
+    }
+  };
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  assert.equal(r.checks.find((c) => c.id === 'AI_DISCLOSURE').passed, false);
+  assert.equal(r.passed, false);
+});
+
+test('AI_DISCLOSURE: 고지 마커를 지우는 포트를 잡는다 — 문구·버전은 감사 근거다', b, async () => {
+  const port = m.createDryRunPort({ id: 'dars' });
+  const inner = port.present.bind(port);
+  port.present = async (iid, steps) => {
+    for (const s of steps) delete s.disclosure;   // "모르는 필드니까 지운다"
+    return inner(iid, steps);
+  };
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  const c = r.checks.find((x) => x.id === 'AI_DISCLOSURE');
+  assert.equal(c.passed, false);
+  assert.match(c.messageKo, /변형/);
+});
+
+test('AI_DISCLOSURE: 한 턴에 단계가 둘 이상 올 수 있다 — 고지 + 첫 안내가 같이 나간다', b, async () => {
+  const port = m.createDryRunPort({ id: 'chatbot' });
+  const inner = port.present.bind(port);
+  port.present = async (iid, steps) => {
+    if (steps.length > 1) throw new Error('한 번에 한 단계만 처리합니다');
+    return inner(iid, steps);
+  };
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  assert.equal(r.checks.find((c) => c.id === 'AI_DISCLOSURE').passed, false);
+});

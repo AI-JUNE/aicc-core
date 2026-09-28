@@ -131,6 +131,10 @@ export interface DisclosureBindingIssues {
  * 문구가 없다고 경고가 나가고, 그 경고가 쌓이면 진짜 누락이 묻힌다.
  *
  * 판정 규칙은 `validateDisclosureConfig` 하나다 — 여기서 승인·문구·노출 시점을 다시 보지 않는다(§2).
+ *
+ * 워크스페이스는 보지 않는다 — `AiDisclosureConfig` 에 그 축이 없기 때문이다(고지 문구는 테넌트
+ * 단위 법무 문안이다). 사업부별로 다른 문구가 필요해지면 그건 검사 누락이 아니라 **설정 모델의
+ * 확장**이며, 그때까지 같은 테넌트의 워크스페이스는 같은 문구를 쓴다.
  */
 export function validateDisclosureBinding(
   config: AiDisclosureConfig,

@@ -296,6 +296,29 @@ test('상담사측 소비자가 명시적으로 켠 경우에만 요약이 나�
   assert.equal(typeof r.result.state.slots.customer_name, 'string');
 });
 
+test('AI 고지는 문구와 감사 근거가 함께 비-Node 호스트까지 간다(§10.1)', b, async () => {
+  // 브리지가 이 둘 중 하나만 흘리면 결함의 모양이 갈린다: 단계가 없으면 **고지가 안 나가고**,
+  // 사실만 없으면 호스트가 steps 를 뒤져 감사 기록을 만들게 되어 언어마다 다르게 틀린다(§2).
+  const disclosure = {
+    tenantId: 'goone', enabled: true, approved: true,
+    approvedAt: NOW, approvedBy: 'legal_kim', version: 7, updatedAt: NOW, updatedBy: 'admin_lee',
+    channels: { voice: { text: '본 상담은 AI 상담원이 진행합니다.', placement: 'before_first_response' } },
+  };
+  const { bridge } = build({}, { disclosure });
+  const r = await bridge.handleLine(line({ id: '1', op: 'start', req: { flowId: 'billing', entryPoint: 'inbound_call' } }));
+  assert.equal(r.ok, true);
+  assert.equal(r.result.steps[0].nodeId, '__disclosure');
+  assert.equal(r.result.steps[0].text, '본 상담은 AI 상담원이 진행합니다.');
+  assert.deepEqual(r.result.disclosure, { channel: 'voice', placement: 'before_first_response', configVersion: 7 });
+});
+
+test('고지 사실은 노출 스위치와 무관하게 나간다 — 개인정보가 없고 감추면 증명할 길이 없다', b, async () => {
+  const { bridge } = build();  // 배선 없음 — 종전과 완전히 같다(§13-3)
+  const r = await bridge.handleLine(line({ id: '1', op: 'start', req: { flowId: 'billing', entryPoint: 'inbound_call' } }));
+  assert.equal(r.result.disclosure, undefined);
+  assert.equal(r.result.steps.some((s) => s.nodeId === '__disclosure'), false);
+});
+
 // ── 설정 ────────────────────────────────────────────────────────────────────
 
 test('승인 근거 없는 live 브리지는 만들어지지 않는다 [승인 필요]', b, () => {

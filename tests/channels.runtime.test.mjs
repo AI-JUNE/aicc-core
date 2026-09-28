@@ -49,7 +49,7 @@ function fakePort(id = 'callbot', capsOver = {}, over = {}) {
   };
 }
 
-function build({ flows = [flowBilling], port = fakePort(), ports, samples = [], policy = {}, components, reprompt, timing, routing, connectors, channelSwitch } = {}) {
+function build({ flows = [flowBilling], port = fakePort(), ports, samples = [], policy = {}, components, reprompt, timing, routing, connectors, channelSwitch, disclosure } = {}) {
   const collector = B.createCollectorSink('t');
   const bus = B.createEventBus({
     scope: SCOPE, sinks: [collector],
@@ -73,6 +73,7 @@ function build({ flows = [flowBilling], port = fakePort(), ports, samples = [], 
     ...(routing !== undefined ? { routing } : {}),
     ...(connectors !== undefined ? { connectors } : {}),
     ...(channelSwitch !== undefined ? { channelSwitch } : {}),
+    ...(disclosure !== undefined ? { disclosure } : {}),
   });
   return { core, port, collector, health };
 }
@@ -947,4 +948,131 @@ test('원장 위 버스는 재개된 세션에서도 이벤트를 중복 없이 
   assert.ok(log.size() > beforeTurn, '턴 진행 이벤트가 원장에 추가돼야 한다');
   const keys = log.read().map((row) => row.key);
   assert.equal(new Set(keys).size, keys.length, '같은 멱등 키가 원장에 두 번 쌓이면 안 된다');
+});
+
+// ── AI 고지 배선(§10.1·§7 7.4·§13-3) ────────────────────────────────────────
+//
+// 여기서 고정하는 결함의 증상은 **아무 일도 일어나지 않는 것**이다. 배선이 없던 동안
+// 어떤 채널에서도 고지가 나가지 않았고, 통화·이벤트·적합성 검사가 모두 정상이었다.
+
+const DISC = (over = {}) => ({
+  tenantId: 'goone', enabled: true, approved: true,
+  approvedAt: '2026-08-20T00:00:00.000Z', approvedBy: 'legal_kim',
+  version: 4, updatedAt: '2026-08-19T00:00:00.000Z', updatedBy: 'admin_lee',
+  channels: {
+    voice: { text: '본 상담은 AI 상담원이 진행합니다.', placement: 'before_first_response' },
+    visual: { text: '이 화면은 AI가 안내합니다.', placement: 'persistent_banner' },
+    chat: { text: 'AI 상담원이 답변드립니다.', placement: 'session_start' },
+  },
+  ...over,
+});
+
+test('배선 없음: 고지가 어디에서도 나가지 않는다는 사실을 경고로 드러낸다(§10.1)', b, async () => {
+  const { core, port } = build();
+  const w = core.warnings().filter((i) => i.code === 'W_AI_DISCLOSURE_UNBOUND');
+  assert.equal(w.length, 1);
+  assert.match(w[0].messageKo, /승인 필요/);
+  // 종전과 완전히 같다 — 단계에 고지가 섞이지 않는다(§13-3).
+  const r = await core.start(req());
+  assert.equal(r.steps.some((s) => s.nodeId === '__disclosure'), false);
+  assert.equal(r.disclosure, undefined);
+  assert.equal(port.log[0][2].includes('__disclosure'), false);
+});
+
+test('배선 있음: 고지가 시나리오 첫 단계보다 앞에 나간다(§10.1)', b, async () => {
+  const { core, port } = build({ disclosure: DISC() });
+  assert.equal(core.warnings().some((i) => i.code === 'W_AI_DISCLOSURE_UNBOUND'), false);
+  const r = await core.start(req());
+  // 뒤에 붙으면 AI 가 먼저 말한 뒤에 고지가 나간다 — 순서가 곧 §10.1 준수다.
+  assert.equal(r.steps[0].nodeId, '__disclosure');
+  assert.equal(r.steps[0].text, '본 상담은 AI 상담원이 진행합니다.');
+  assert.deepEqual(r.steps[0].disclosure, { placement: 'before_first_response', configVersion: 4 });
+  assert.equal(r.steps[1].nodeId, 'greet');
+  // 채널에도 같은 순서로 나간다 — result 만 맞고 present 가 다르면 고지는 없던 일이 된다.
+  assert.deepEqual(port.log[0][2][0], '__disclosure');
+  assert.deepEqual(r.disclosure, { channel: 'voice', placement: 'before_first_response', configVersion: 4 });
+});
+
+test('배선 있음: 같은 채널에 턴마다 반복하지 않는다 — 안내가 잡음이 된다', b, async () => {
+  const { core } = build({ disclosure: DISC() });
+  await core.start(req());
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '홍길동' } });
+  assert.equal(r.steps.some((s) => s.nodeId === '__disclosure'), false);
+  assert.equal(r.disclosure, undefined);
+});
+
+test('배선 있음: 대기 안내가 첫 발화인 시나리오에서도 고지가 그 앞이다(§6.1)', b, async () => {
+  // Api 대기 안내는 커넥터 호출 **전에** present 되므로, 고지를 이행 뒤에 끼우면
+  // 고객은 "조회 중입니다"를 먼저 듣는다.
+  const w = wiring();
+  const { core, port } = build({ flows: [flowApiOk()], connectors: w.binding, disclosure: DISC() });
+  await core.start(req({ flowId: 'api', presetSlots: { account_no: '1234' } }));
+  assert.equal(port.log[0][2][0], '__disclosure');
+});
+
+test('배선 있음: 화면으로 합류하면 그 매체의 고지가 새로 나간다(§5.2)', b, async () => {
+  const dars = darsPort();
+  const { core } = build({ flows: [flowBilling], ports: [fakePort(), dars], disclosure: DISC() });
+  await core.start(req());
+  const joined = await core.start(req({ adapter: 'dars', joinInteractionId: 'i_test1' }));
+  assert.equal(joined.steps[0].nodeId, '__disclosure');
+  assert.equal(joined.steps[0].text, '이 화면은 AI가 안내합니다.');
+  assert.equal(joined.disclosure.channel, 'visual');
+  // 두 번째 합류에서는 이미 고지한 매체다.
+  const again = await core.start(req({ adapter: 'dars', joinInteractionId: 'i_test1' }));
+  assert.equal(again.steps.some((s) => s.nodeId === '__disclosure'), false);
+});
+
+test('배선 있음: 장애 폴백으로 상담사에게 넘길 때는 고지하지 않는다(§9.3)', b, async () => {
+  // AI 가 응대하지 않았으므로 고지 대상이 없다 — 이관 직전의 "AI 가 응대합니다"는 오안내다.
+  const { core, port } = build({
+    samples: [{ tenantId: 'goone', component: 'llm', state: 'down', observedAt: NOW }],
+    disclosure: DISC(),
+  });
+  const r = await core.start(req());
+  assert.equal(r.status, 'transferred');
+  assert.equal(r.steps.length, 0);
+  assert.equal(r.disclosure, undefined);
+  assert.equal(port.log.some((l) => l[0] === 'present'), false);
+});
+
+test('배선 거부: 미승인 문구는 생성 시점에 막는다 — 통화 중에 알면 늦다', b, () => {
+  assert.throws(() => build({ disclosure: DISC({ approved: false }) }), /AI 고지 배선 거부/);
+});
+
+test('배선 거부: 다른 테넌트의 고지 설정은 붙지 않는다(§11.1)', b, () => {
+  assert.throws(() => build({ disclosure: DISC({ tenantId: 'other' }) }), /§11.1/);
+});
+
+test('배선 거부: 등록된 채널의 빈 문구는 막고, 등록 안 된 채널은 경고도 만들지 않는다', b, () => {
+  assert.throws(
+    () => build({ disclosure: DISC({ channels: { voice: { text: '', placement: 'session_start' } } }) }),
+    /AI 고지 배선 거부/,
+  );
+  // callbot 하나만 등록된 상태 — visual·chat 문구가 없어도 경고가 생기지 않는다.
+  const { core } = build({ disclosure: DISC({ channels: { voice: { text: 'AI 안내입니다.', placement: 'session_start' } } }) });
+  assert.deepEqual(core.warnings().filter((i) => i.code === 'W_AI_DISCLOSURE'), []);
+});
+
+test('고지를 끈 설정은 붙되 경고로 남고 단계는 나가지 않는다', b, async () => {
+  const { core } = build({ disclosure: DISC({ enabled: false }) });
+  assert.equal(core.warnings().some((i) => i.code === 'W_AI_DISCLOSURE'), true);
+  const r = await core.start(req());
+  assert.equal(r.steps.some((s) => s.nodeId === '__disclosure'), false);
+});
+
+test('런타임에서 고지가 막히면 AI 응대를 시작하지 않는다', b, async () => {
+  // 배선 시점 검증을 지나온 뒤 설정 객체가 바뀐 경우(운영 중 문구 수정 → 승인 무효화)다.
+  // 고지 없이 계속하면 위반이 조용히 쌓이고, 드러나는 시점에는 지나간 통화 전부가 대상이다.
+  const config = DISC();
+  const { core } = build({ disclosure: config });
+  config.approved = false;
+  await assert.rejects(() => core.start(req()), /AI 고지 거부\(not_approved\)/);
+});
+
+test('고지 단계는 무음이 아니고 시나리오 노드도 아니다', b, async () => {
+  const { core } = build({ disclosure: DISC() });
+  const r = await core.start(req());
+  assert.equal(r.steps[0].silent, undefined);
+  assert.equal(Object.prototype.hasOwnProperty.call(flowBilling.nodes, '__disclosure'), false);
 });
