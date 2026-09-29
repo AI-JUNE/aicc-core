@@ -760,9 +760,75 @@
         `src/channels/conformance.ts`(`AI_DISCLOSURE`) · `tests/channels.conformance.test.mjs`(29건) ·
         `src/channels/bridge.ts`(`BridgeTurnPayload.disclosure`) · `tests/channels.bridge.test.mjs`(28건) ·
         `API.md` 반영
+      · Core 측 완료(23): **인텐트와 시나리오 사이의 빈 자리 — Core 는 아직 "무엇을 원하는지" 듣지 못했다(2026-09-29)** —
+        (13)~(22)가 메운 것과 같은 모양의 공백이 §5.1·§5.3 에 하나 더 있었고, 이것은 **대화의 첫 걸음**이다.
+        조각은 다 있었다: `createIntentClassifier` 는 발화에서 후보를, `decideIntent` 는 확정·명확화·미인식
+        판정을, `routeIntent` 는 그 판정을 시나리오로 옮긴다. 그런데 **셋을 순서대로 꿰는 코드가 저장소
+        어디에도 없었고**, `routeIntent` 를 부르는 곳도 테스트뿐이었다. 그래서 Core 를 소비하는 채널은
+        **"시작할 시나리오 id 를 이미 아는 경우"에만** Core 를 쓸 수 있었다 — 즉 "고객의 말을 듣고
+        시나리오를 고르는 일"은 여전히 저장소 3곳에 남아 각자 `switch (intent)` 를 쓰게 된다(§2).
+        세 자리를 각각 한 곳으로 모았다.
+        - 실행기(`src/nlu/executeIntentEntry.ts`): 막는 사고는 정해져 있다. (1) **분류기 장애를
+          "못 알아들었다"로 적는 것** — 엔진이 타임아웃 나면 후보가 0건이고 0건은 `unmatched` 가 된다.
+          고객은 재프롬프트만 세 번 듣고 끊는데 **장애는 어디에도 집계되지 않아** 그래프는 평온하다
+          ((16)의 `store_failed` vs `not_grounded` 와 같은 자리다). `classifierFailed` 로 반드시 갈라 적고,
+          규약 위반 응답(`unparsable`·`invalid_candidates`)도 빈 후보로 읽지 않는다. (2) **고객이 직접 고른
+          선택지에 신뢰도를 지어 넣는 것** — 명확화 답변은 엔진 실측이 아니다. 1.0 을 적으면 §7 품질
+          지표에 만점 구간이 생겨 실제 인식률을 가린다(§13-3). 그래서 `confidence` 를 **아예 싣지 않고**
+          `chosen` 으로만 구분한다. (3) **명확화 답변으로 엔진을 다시 부르는 것** — 고객은 이미 골랐다.
+          비용(§11.2)·지연이 붙고, 모델이 다른 답을 내면 고객이 고른 것과 **다른 시나리오로 간다**.
+          (4) **설정 누락(`unrouted`)을 정상 이관으로 적는 것** — `policy` 로 남기면 운영 통계에 섞여
+          어느 인텐트의 라우트가 빠졌는지 영영 안 보인다. `error` 로 갈라 적고 되묻지 않는다(같은 말을
+          다시 들어도 같은 인텐트가 나와 그대로 되풀이된다). 그 외: 빈 발화로 엔진을 부르지 않고 ·
+          선택지로 안 읽힌 답은 조용히 넘기지 않고 새 발화로 다시 분류하며(되묻기 한도는 `decideIntent`
+          하나가 본다) · 문구를 만들지 않고(명확화 질문이 없으면 되묻지 않는다, §13-3) · **판정을 복사하지
+          않으며**(임계값·모호성·한도·라우팅은 `decideIntent`·`routeIntent` 하나 — 검사가 이 파일에 그
+          설정 이름들이 없음을 고정한다) · **던지는 것은 테넌트 격리 위반 하나뿐**이고(§11.1) ·
+          **상태를 바꾸지 않는다**(판정과 부작용을 한 함수에 묶으면 실패했을 때 무엇이 남았는지 모른다).
+        - 진입 턴(`src/flow/runner.ts` 의 `switchFlow`·`handoffFromIntent`·`clarifyTurn` + 입력 `unrecognized`):
+          가장 비싼 한 줄은 **`start()` 를 다시 부르지 않는 것**이다 — 부르면 `session.started` 가 또 나가
+          유입 통계가 통화 수보다 커지고(§8.1 집계가 통째로 어긋난다) 이미 인증된 슬롯이 사라져 고객이
+          다시 답한다. 그 다음이 **미인식 입력을 `utterance` 로 넣지 않는 것**이다: 진입 노드는 `Collect`
+          라서 비어 있지 않은 텍스트를 **무조건 수락**한다 — "카드를 잃어버렸어요"가 슬롯 값으로 저장된 채
+          흐름이 넘어가고, 예외도 재프롬프트도 없이 고객만 엉뚱한 안내를 듣는다. `unrecognized` 는 어떤
+          노드에서도 수락되지 않으며 §5.1 사다리를 탄다(사다리 규칙은 여기서 다시 쓰지 않는다). 미인식에
+          `confidence` 를 지어 넣지 않는 것도 같은 이유다 — 넣으면 원인이 `low_confidence` 로 뒤바뀌어
+          "잘 안 들립니다" 문안이 나가고 고객은 또박또박 다시 말한다. 명확화는 **실패 카운트를 올리지
+          않고**(설계된 되물음이다 — 올리면 두 번 되묻는 것만으로 상담사로 떨어져 `maxClarifyAttempts` 가
+          무의미해진다) 노드도 옮기지 않는다. 인텐트 진입 노드는 **새 `NodeKind` 를 만들지 않고** 예약 슬롯
+          (`INTENT_SLOT` = `__intent__`)을 수집하는 `Collect` 로 표시한다 — 채널 3곳이 `step.kind` 로
+          분기하므로 새 종류를 내보내면 **설정을 바꾼 날** 전 통화가 첫 단계에서 깨진다.
+        - 배선(`channels/runtime.ts` 의 `intent`): 진입 노드의 입력만 가로채고 나머지는 **종전과 완전히
+          같다**(§13-3, 검사로 고정). **숫자는 인텐트가 아니다** — 되묻는 중이 아닐 때의 DTMF 는 분류기에
+          보내지 않고(비용이고 의미도 없다) 미인식으로 사다리에 태운다. 되묻는 중이면 "2번"이 곧 선택이다.
+          미인식으로 한 칸 내려가도 **명확화 시도 횟수는 이어받는다**(0 으로 되돌리면 한도를 넘겨 같은
+          질문을 계속 되묻는다). 카탈로그·정책·라우팅 표는 **생성 시점에** 거르고(다른 테넌트·형식 오류·
+          `validateIntentRouting` 오류는 거부), **라우트가 가리키는 시나리오도 `start()` 와 같은 규칙으로
+          미리 본다** — 안 보면 그 시나리오는 인텐트가 확정된 **통화 한복판에서** 처음 검증되고 그때 고객은
+          이미 회선에 있다. 엔진 헬스 샘플은 여기서 만들지 않는다(엔진 상태는 `adapters/resilience.ts` 가
+          이미 적는다 — 두 곳에서 적으면 한 번의 장애가 두 번 집계된다). 미배선은 `W_INTENT_UNBOUND`,
+          라우트 누락은 `W_INTENT_ROUTING` 으로 드러낸다.
+        - 채널 경계(`src/channels/conformance.ts` 의 `INTENT_CLARIFY`): 인텐트를 켜면 턴에 **시나리오에 없는
+          선택지 단계**가 나간다. `AI_DISCLOSURE` 와 같은 함정이지만 **잡는 구현이 다르다** — 고지는 `Say`
+          라서 흘려보내면서도 `Choice` 만은 `flow.nodes[nodeId].options` 로 되짚어 버튼을 다시 그리는 포트가
+          흔하다. 그런 포트는 고지 검사를 통과하고 **인텐트를 켜는 날** 첫 되물음에서 죽는다(검사가 그
+          조합을 그대로 재현한다). 선택지를 다시 정렬하는 포트도 잡는다 — 표시 번호는 Core 의 선택 해석과
+          짝이라 어긋나면 고객이 말한 번호와 **다른 인텐트가 확정된다**.
+        실호출이 없다(가짜 분류기로만 검증). 실엔진 연결은 여전히 **[승인 필요]**.
+        **변이 검증(도구 출력 그대로)**: `unrecognized` 거절을 없애면 6건 실패 · 명확화 시도 횟수 이어받기를
+        없애면 1건 실패 · 라우트 시나리오 사전 검사를 없애면 1건 실패 — 셋 모두 원본에 대고 돌리면 통과한다.
+        근거: `src/nlu/executeIntentEntry.ts` · `tests/nlu.executeIntentEntry.test.mjs`(27건) ·
+        `src/flow/runner.ts`(`switchFlow`·`handoffFromIntent`·`clarifyTurn`·`unrecognized`) ·
+        `src/flow/types.ts`(`INTENT_SLOT`·`isIntentEntryNode`) · `tests/flow.intentTurn.test.mjs`(20건) ·
+        `src/channels/runtime.ts`(`IntentBinding`·`runTurn`) · `tests/channels.runtime.test.mjs`(97건 —
+        인텐트 배선 17건 포함) · `src/channels/contract.ts`(`W_INTENT_UNBOUND`·`W_INTENT_ROUTING`) ·
+        `src/channels/conformance.ts`(`INTENT_CLARIFY`) · `tests/channels.conformance.test.mjs`(33건) ·
+        `API.md` 반영
       · 남은 것: **Callbot 저장소 쪽 배선** — 코드는 훅마다 한 줄(README 참조)이며 더 쓸 것이 없다.
         남은 것은 저장소 결정 사항이다: 현행 LLM 툴(welfare_apply 등)과 Core 시나리오의 역할 분담
         (어느 쪽이 화면 노드를 밀 것인가)·실운영 Core 모듈·Flow id 를 **사람이 정해야 한다**,
+        인텐트 카탈로그·라우팅 표·판정 임계값·분류 지시문·명확화 문구도 테넌트 값이라 **사람이 정한다**
+        (Core 는 기본값을 만들지 않는다, §13-3),
         챗봇·D-ARS CI 게이트 활성화를 위한 `AICC_CORE_TOKEN` 등록 **[승인 필요]**, 실회선·실메신저 연결 **[승인 필요]**
 - [x] **이벤트 버스 영속화 어댑터** — 추가 전용 이벤트 원장(`EventLog`)·원장 기반 멱등 저장소·
       JSONL 직렬화/부분손상 복구·커서 기반 재전송·무결성 점검.

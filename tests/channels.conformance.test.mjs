@@ -326,3 +326,59 @@ test('AI_DISCLOSURE: 한 턴에 단계가 둘 이상 올 수 있다 — 고지 +
   const r = await m.runChannelConformance({ port, timeoutMs: 500 });
   assert.equal(r.checks.find((c) => c.id === 'AI_DISCLOSURE').passed, false);
 });
+
+// ── 인텐트 명확화 (§5.1) ─────────────────────────────────────────────────────
+// 인텐트를 켜는 것도 설정 변경이다. 그 순간 첫 되물음에서 통화가 깨지면 안 된다.
+
+test('INTENT_CLARIFY: 선택지 단계를 흡수하는 구현은 3채널 모두 통과한다', b, async () => {
+  for (const id of ['callbot', 'chatbot', 'dars']) {
+    const port = m.createDryRunPort({ id });
+    const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+    const c = r.checks.find((x) => x.id === 'INTENT_CLARIFY');
+    assert.equal(c.passed, true, `${id}: ${c.messageKo}`);
+    assert.equal(c.severity, 'error');
+    assert.notEqual(c.skipped, true);
+  }
+});
+
+test('INTENT_CLARIFY: 선택지를 flow.nodes 에서 찾는 포트를 잡는다 — 고지 검사는 통과하는 구현이다', b, async () => {
+  // `Say` 는 흘려보내면서 `Choice` 만 시나리오에서 되짚어 버튼을 다시 그리는 흔한 구현이다.
+  const nodes = { n_probe: { id: 'n_probe', kind: 'Say', text: '안녕' } };
+  const port = m.createDryRunPort({ id: 'dars' });
+  port.present = async (_id, steps) => {
+    for (const s of steps) {
+      if (s.kind !== 'Choice') continue;
+      nodes[s.nodeId].options.map((o) => o.label);     // 여기서 터진다
+    }
+  };
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  assert.equal(r.checks.find((c) => c.id === 'AI_DISCLOSURE').passed, true);
+  assert.equal(r.checks.find((c) => c.id === 'INTENT_CLARIFY').passed, false);
+  assert.equal(r.passed, false);
+});
+
+test('INTENT_CLARIFY: 선택지를 다시 정렬하는 포트를 잡는다 — 번호가 어긋나면 다른 인텐트가 확정된다', b, async () => {
+  const port = m.createDryRunPort({ id: 'chatbot' });
+  const inner = port.present.bind(port);
+  port.present = async (iid, steps) => {
+    for (const s of steps) {
+      if (s.ui?.items) s.ui.items.reverse();           // "가나다순이 보기 좋다"
+    }
+    return inner(iid, steps);
+  };
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  const c = r.checks.find((x) => x.id === 'INTENT_CLARIFY');
+  assert.equal(c.passed, false);
+  assert.match(c.messageKo, /다른 인텐트가 확정됩니다/);
+});
+
+test('INTENT_CLARIFY: 음성은 번호 안내와 DTMF 수용이 실린다', b, async () => {
+  const seen = [];
+  const port = m.createDryRunPort({ id: 'callbot' });
+  const inner = port.present.bind(port);
+  port.present = async (iid, steps) => { seen.push(...steps); return inner(iid, steps); };
+  await m.runChannelConformance({ port, timeoutMs: 500 });
+  const clarify = seen.find((s) => s.nodeId === '__clarify');
+  assert.equal(clarify.acceptDtmf, true);
+  assert.match(clarify.text, /1번 잔액 조회/);
+});

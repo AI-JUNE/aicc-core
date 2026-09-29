@@ -1034,6 +1034,14 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
         // 렌더 불가 노드를 가진 시나리오는 시작하지 않는다 — 통화 중간에 막히는 것이 더 나쁘다(§5.3).
         throw new Error(`${req.adapter} 채널에서 실행할 수 없는 시나리오입니다: ${unsupported.map((i) => i.messageKo).join(' / ')}`);
       }
+      if (opts.intent === undefined && Object.values(flow.nodes).some((n) => isIntentEntryNode(n))) {
+        // 인텐트 진입 노드가 있는데 배선이 없다. 종전 동작이므로 막지 않되 조용히 두지도 않는다 —
+        // 이 상태에서 고객의 "카드를 잃어버렸어요"는 **슬롯 값으로 저장된 채** 흐름이 그대로 진행된다.
+        // 예외도 재프롬프트도 없어 어디서도 터지지 않고, 증상은 "봇이 엉뚱한 안내를 한다" 뿐이다.
+        warnOnce('W_INTENT_UNBOUND',
+          `시나리오 ${flow.id} v${flow.version} 에 인텐트 진입 노드가 있으나 인텐트 배선(intent)이 없습니다 — `
+          + '고객의 답이 인텐트가 아니라 슬롯 값으로 저장됩니다(§5.1·§5.3).');
+      }
       if (opts.connectors) {
         // 렌더 불가 노드와 같은 이유로 **시작 전에** 본다(§5.3). 커넥터 id 오타·미배포는 통화 중에
         // 예외가 아니라 조회 실패로만 나타나고, 그때는 이미 고객이 회선에 있다.

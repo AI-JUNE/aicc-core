@@ -49,7 +49,7 @@ function fakePort(id = 'callbot', capsOver = {}, over = {}) {
   };
 }
 
-function build({ flows = [flowBilling], port = fakePort(), ports, samples = [], policy = {}, components, reprompt, timing, routing, connectors, channelSwitch, disclosure } = {}) {
+function build({ flows = [flowBilling], port = fakePort(), ports, samples = [], policy = {}, components, reprompt, timing, routing, connectors, channelSwitch, disclosure, intent } = {}) {
   const collector = B.createCollectorSink('t');
   const bus = B.createEventBus({
     scope: SCOPE, sinks: [collector],
@@ -74,6 +74,7 @@ function build({ flows = [flowBilling], port = fakePort(), ports, samples = [], 
     ...(connectors !== undefined ? { connectors } : {}),
     ...(channelSwitch !== undefined ? { channelSwitch } : {}),
     ...(disclosure !== undefined ? { disclosure } : {}),
+    ...(intent !== undefined ? { intent } : {}),
   });
   return { core, port, collector, health };
 }
@@ -1075,4 +1076,292 @@ test('고지 단계는 무음이 아니고 시나리오 노드도 아니다', b,
   const r = await core.start(req());
   assert.equal(r.steps[0].silent, undefined);
   assert.equal(Object.prototype.hasOwnProperty.call(flowBilling.nodes, '__disclosure'), false);
+});
+
+// ── 인텐트 진입 배선(§5.1·§5.3) ──────────────────────────────────────────────
+// 이 배선이 없으면 "고객의 말을 듣고 시나리오를 고르는 일"이 채널 3곳에 남는다(§2).
+// 막는 사고는 대부분 예외가 아니라 조용한 오답이라 검사로 고정하지 않으면 드러나지 않는다.
+
+const INTENT_SLOT = '__intent__';
+
+const flowTriage = {
+  id: 'triage', version: 1, startNodeId: 'ask',
+  nodes: { ask: { id: 'ask', kind: 'Collect', slot: INTENT_SLOT, prompt: '무엇을 도와드릴까요?' } },
+};
+const flowBalance = {
+  id: 'f_balance', version: 1, startNodeId: 'say',
+  nodes: { say: { id: 'say', kind: 'Say', text: '잔액을 안내합니다.' } },
+};
+const flowReissue = {
+  id: 'f_reissue', version: 1, startNodeId: 'say',
+  nodes: { say: { id: 'say', kind: 'Say', text: '재발급을 안내합니다.' } },
+};
+const INTENT_FLOWS = [flowTriage, flowBalance, flowReissue];
+
+function classifierOf(result, opts = {}) {
+  const calls = [];
+  return {
+    calls,
+    contractVersion: 1,
+    engine: { name: 'fake', residency: 'onprem' },
+    plan: () => ({ messages: [], utteranceMasked: '', promptChars: 0 }),
+    async classify(r) {
+      calls.push(r);
+      if (opts.throws) throw new Error('boom');
+      const res = typeof result === 'function' ? result(calls.length) : result;
+      return {
+        status: 'ok', candidates: [], hallucinated: [], reasonKo: '판정',
+        engine: { name: 'fake', residency: 'onprem' }, utteranceMasked: '', piiMasked: false,
+        ...res,
+      };
+    },
+  };
+}
+
+const INTENT_CATALOG = {
+  tenantId: 'goone',
+  intents: [
+    { id: 'balance', titleKo: '잔액조회' },
+    { id: 'reissue', titleKo: '카드재발급' },
+    { id: 'complaint', titleKo: '불만접수', handoffOnly: true },
+  ],
+};
+const INTENT_POLICY = {
+  tenantId: 'goone', acceptThreshold: 0.7, rejectThreshold: 0.3,
+  ambiguityMargin: 0.1, maxClarifyOptions: 3, maxClarifyAttempts: 1,
+};
+const INTENT_TABLE = {
+  tenantId: 'goone',
+  routes: [{ intent: 'balance', flowId: 'f_balance' }, { intent: 'reissue', flowId: 'f_reissue' }],
+};
+
+const intentBinding = (classifier, over = {}) => ({
+  catalog: INTENT_CATALOG, policy: INTENT_POLICY, table: INTENT_TABLE,
+  classifier, clarifyPrompt: '어떤 업무를 도와드릴까요?', ...over,
+});
+
+const triageReq = (over = {}) => req({ flowId: 'triage', ...over });
+
+test('인텐트 미배선: 종전과 완전히 같고(§13-3) 그 사실이 경고로 남는다', b, async () => {
+  const { core } = build({ flows: INTENT_FLOWS });
+  const r = await core.start(triageReq());
+  const after = await core.send(r.interactionId, { input: { kind: 'utterance', text: '잔액 알려줘' } });
+  // 배선이 없으면 발화가 인텐트가 아니라 **슬롯 값**으로 저장된다 — 바로 그 상태를 경고로 드러낸다.
+  assert.equal(after.state.slots[INTENT_SLOT], '잔액 알려줘');
+  assert.equal(after.state.flowId, 'triage');
+  assert.equal(core.warnings().some((i) => i.code === 'W_INTENT_UNBOUND'), true);
+});
+
+test('배선하면 발화가 시나리오를 고르고 그 단계가 채널로 나간다', b, async () => {
+  const c = classifierOf({ candidates: [{ intent: 'balance', confidence: 0.95 }] });
+  const { core, port, collector } = build({ flows: INTENT_FLOWS, intent: intentBinding(c) });
+  const r = await core.start(triageReq());
+  const after = await core.send(r.interactionId, { input: { kind: 'utterance', text: '잔액 알려줘' } });
+  assert.equal(after.state.flowId, 'f_balance');
+  assert.equal(after.state.slots[INTENT_SLOT], 'balance');
+  assert.deepEqual(after.steps.map((s) => s.nodeId), ['say']);
+  assert.deepEqual(port.log.at(-1), ['present', 'i_test1', ['say']]);
+  // 유입은 한 번만 집계되어야 한다 — 시나리오를 갈아탔다고 통화가 하나 더 생기지 않는다.
+  assert.equal(collector.events.filter((e) => e.type === 'session.started').length, 1);
+  assert.equal(core.warnings().some((i) => i.code === 'W_INTENT_UNBOUND'), false);
+});
+
+test('모호하면 되묻고, 다음 턴의 DTMF 는 선택지 번호로 읽는다', b, async () => {
+  const c = classifierOf({
+    candidates: [{ intent: 'balance', confidence: 0.8 }, { intent: 'reissue', confidence: 0.78 }],
+  });
+  const { core, port } = build({ flows: INTENT_FLOWS, intent: intentBinding(c) });
+  const r = await core.start(triageReq());
+  const asked = await core.send(r.interactionId, { input: { kind: 'utterance', text: '그거요' } });
+  assert.deepEqual(asked.steps.map((s) => s.nodeId), ['__clarify']);
+  assert.equal(asked.state.currentNodeId, 'ask');     // 노드를 옮기지 않았다
+  assert.equal(asked.state.failCount, 0);             // 명확화는 실패가 아니다
+
+  const picked = await core.send(r.interactionId, { input: { kind: 'dtmf', digits: '2' } });
+  assert.equal(picked.state.flowId, 'f_reissue');
+  assert.equal(c.calls.length, 1);                    // 선택지 답변으로 엔진을 다시 부르지 않았다
+  assert.deepEqual(port.log.at(-1), ['present', 'i_test1', ['say']]);
+});
+
+test('되묻는 중이 아닌 DTMF 는 분류기를 부르지 않는다 — 숫자는 인텐트가 아니다', b, async () => {
+  const c = classifierOf({ candidates: [{ intent: 'balance', confidence: 0.95 }] });
+  const { core } = build({ flows: INTENT_FLOWS, intent: intentBinding(c) });
+  const r = await core.start(triageReq());
+  const after = await core.send(r.interactionId, { input: { kind: 'dtmf', digits: '1' } });
+  assert.equal(c.calls.length, 0);
+  assert.equal(after.state.failCount, 1);             // §5.1 사다리로 갔다
+  assert.equal(after.state.slots[INTENT_SLOT], undefined);
+});
+
+test('무입력은 인텐트 경로를 타지 않는다 — 종전 사다리 그대로다', b, async () => {
+  const c = classifierOf({ candidates: [] });
+  const { core } = build({ flows: INTENT_FLOWS, intent: intentBinding(c) });
+  const r = await core.start(triageReq());
+  const after = await core.send(r.interactionId, { input: { kind: 'timeout' } });
+  assert.equal(c.calls.length, 0);
+  assert.equal(after.state.lastFailureReason, 'no_input');
+});
+
+test('상담사 전용 인텐트는 시나리오를 타지 않고 이관된다(§2)', b, async () => {
+  const c = classifierOf({ candidates: [{ intent: 'complaint', confidence: 0.99 }] });
+  const { core, port } = build({ flows: INTENT_FLOWS, intent: intentBinding(c) });
+  const r = await core.start(triageReq());
+  const after = await core.send(r.interactionId, { input: { kind: 'utterance', text: '불만 있어요' } });
+  assert.equal(after.status, 'transferred');
+  assert.equal(after.state.flowId, 'triage');
+  assert.equal(port.log.some((l) => l[0] === 'transfer'), true);
+  assert.equal(after.handoff.summaryMasked !== undefined, true);
+});
+
+test('설정 누락(라우트 없음)은 이관으로 살리되 원인을 드러낸다', b, async () => {
+  const c = classifierOf({ candidates: [{ intent: 'balance', confidence: 0.95 }] });
+  const issues = [];
+  const { core } = build({
+    flows: INTENT_FLOWS,
+    intent: intentBinding(c, {
+      table: { tenantId: 'goone', routes: [{ intent: 'reissue', flowId: 'f_reissue' }] },
+      onIssue: (i) => issues.push(i),
+    }),
+  });
+  const r = await core.start(triageReq());
+  const after = await core.send(r.interactionId, { input: { kind: 'utterance', text: '잔액' } });
+  assert.equal(after.status, 'transferred');
+  assert.equal(after.events.find((e) => e.type === 'handoff.requested').reason, 'error');
+  assert.equal(core.warnings().some((i) => i.code === 'W_INTENT_ROUTING'), true);
+  assert.deepEqual(issues.map((i) => i.kind), ['unrouted']);
+});
+
+test('분류기가 죽어도 통화는 끊기지 않고, 미인식과 갈라서 보고된다(§9.3)', b, async () => {
+  const issues = [];
+  const c = classifierOf({ status: 'engine_error', reasonKo: '타임아웃' });
+  const { core } = build({
+    flows: INTENT_FLOWS,
+    intent: intentBinding(c, { onIssue: (i) => issues.push(i) }),
+    reprompt: { sharedLines: [{ text: '다시 한 번 말씀해 주시겠어요?' }] },
+  });
+  const r = await core.start(triageReq());
+  const after = await core.send(r.interactionId, { input: { kind: 'utterance', text: '잔액' } });
+  assert.equal(after.status, 'running');
+  assert.equal(after.steps[0].text, '다시 한 번 말씀해 주시겠어요?');
+  assert.deepEqual(issues.map((i) => i.kind), ['classifier_failed']);
+  assert.equal(issues[0].status, 'engine_error');
+});
+
+test('분류기가 던져도 통화가 끊기지 않는다', b, async () => {
+  const { core } = build({
+    flows: INTENT_FLOWS, intent: intentBinding(classifierOf({}, { throws: true })),
+  });
+  const r = await core.start(triageReq());
+  const after = await core.send(r.interactionId, { input: { kind: 'utterance', text: '잔액' } });
+  assert.equal(after.status, 'running');
+  assert.equal(after.state.failCount, 1);
+});
+
+test('미인식으로 내려가도 명확화 시도 횟수는 이어받는다', b, async () => {
+  // 1턴: 모호 → 되묻기(attempt 1). 2턴: 선택지로 안 읽히는 답 → 다시 분류 → 한도 소진이라 미인식.
+  // 3턴: 또 모호해도 되묻지 않는다 — 0 으로 되돌리면 같은 질문을 계속 되묻게 된다.
+  const ambiguous = { candidates: [{ intent: 'balance', confidence: 0.8 }, { intent: 'reissue', confidence: 0.78 }] };
+  const c = classifierOf(() => ambiguous);
+  const { core } = build({ flows: INTENT_FLOWS, intent: intentBinding(c) });
+  const r = await core.start(triageReq());
+  const t1 = await core.send(r.interactionId, { input: { kind: 'utterance', text: '그거' } });
+  assert.deepEqual(t1.steps.map((s) => s.nodeId), ['__clarify']);
+  const t2 = await core.send(r.interactionId, { input: { kind: 'utterance', text: '음 그거요' } });
+  assert.equal(t2.steps.some((s) => s.nodeId === '__clarify'), false);
+  const t3 = await core.send(r.interactionId, { input: { kind: 'utterance', text: '아 그거' } });
+  assert.equal(t3.steps.some((s) => s.nodeId === '__clarify'), false);
+});
+
+test('과금 근거는 인텐트 턴의 고객 발화에 붙는다(§11.2)', b, async () => {
+  const c = classifierOf({ candidates: [{ intent: 'balance', confidence: 0.95 }] });
+  const { core } = build({ flows: INTENT_FLOWS, intent: intentBinding(c) });
+  const r = await core.start(triageReq());
+  const after = await core.send(r.interactionId, {
+    input: { kind: 'utterance', text: '잔액' }, usage: { llm_prompt_tokens: 12 },
+  });
+  const cust = after.events.find((e) => e.type === 'turn.completed' && e.speaker === 'customer');
+  assert.equal(cust.usage.llm_prompt_tokens, 12);
+  assert.equal(cust.intent, 'balance');
+});
+
+test('배선 거부: 분류기·명확화 문구가 없으면 붙지 않는다', b, () => {
+  assert.throws(
+    () => build({ flows: INTENT_FLOWS, intent: intentBinding(undefined) }),
+    /인텐트 배선 거부/,
+  );
+  assert.throws(
+    () => build({ flows: INTENT_FLOWS, intent: intentBinding(classifierOf({}), { clarifyPrompt: '  ' }) }),
+    /§13-3/,
+  );
+});
+
+test('배선 거부: 다른 테넌트의 카탈로그·정책·라우팅 표(§11.1)', b, () => {
+  for (const over of [
+    { catalog: { ...INTENT_CATALOG, tenantId: 'other' } },
+    { policy: { ...INTENT_POLICY, tenantId: 'other' } },
+    { table: { ...INTENT_TABLE, tenantId: 'other' } },
+  ]) {
+    assert.throws(() => build({ flows: INTENT_FLOWS, intent: intentBinding(classifierOf({}), over) }), /§11.1/);
+  }
+});
+
+test('배선 거부: 없는 시나리오·상담사 전용 인텐트에 걸린 라우트는 통화 전에 막는다', b, () => {
+  assert.throws(
+    () => build({
+      flows: INTENT_FLOWS,
+      intent: intentBinding(classifierOf({}), {
+        table: { tenantId: 'goone', routes: [{ intent: 'balance', flowId: 'f_nope' }] },
+      }),
+    }),
+    /인텐트 라우팅 거부/,
+  );
+  assert.throws(
+    () => build({
+      flows: INTENT_FLOWS,
+      intent: intentBinding(classifierOf({}), {
+        table: { tenantId: 'goone', routes: [{ intent: 'complaint', flowId: 'f_balance' }] },
+      }),
+    }),
+    /인텐트 라우팅 거부/,
+  );
+});
+
+test('배선 거부: 라우트가 가리키는 시나리오를 이 채널에서 못 돌리면 통화 전에 막는다(§5.3)', b, () => {
+  // 이관 불가 채널에 Transfer 노드를 가진 시나리오가 걸려 있으면, 인텐트가 확정된 **통화 한복판**에서
+  // 처음 막힌다 — 그때 고객은 이미 회선에 있다.
+  const flowTransfer = {
+    id: 'f_transfer', version: 1, startNodeId: 'go',
+    nodes: { go: { id: 'go', kind: 'Transfer', queue: 'q1' } },
+  };
+  assert.throws(
+    () => build({
+      flows: [...INTENT_FLOWS, flowTransfer],
+      port: fakePort('chatbot', { transferToAgent: false, routeToLegacyIvr: false }),
+      intent: intentBinding(classifierOf({}), {
+        table: { tenantId: 'goone', routes: [{ intent: 'balance', flowId: 'f_transfer' }] },
+      }),
+    }),
+    /인텐트 라우팅 거부/,
+  );
+});
+
+test('라우트 없는 활성 인텐트는 막지 않되 반드시 드러낸다', b, () => {
+  const { core } = build({
+    flows: INTENT_FLOWS,
+    intent: intentBinding(classifierOf({}), {
+      table: { tenantId: 'goone', routes: [{ intent: 'balance', flowId: 'f_balance' }] },
+    }),
+  });
+  const w = core.warnings().filter((i) => i.code === 'W_INTENT_ROUTING');
+  assert.equal(w.length, 1);
+  assert.match(w[0].messageKo, /reissue/);
+});
+
+test('인텐트 진입 노드가 아니면 종전 경로 그대로다(§13-3)', b, async () => {
+  const c = classifierOf({ candidates: [{ intent: 'balance', confidence: 0.95 }] });
+  const { core } = build({ flows: [flowBilling, flowBalance, flowReissue], intent: intentBinding(c) });
+  const r = await core.start(req());
+  const after = await core.send(r.interactionId, { input: { kind: 'utterance', text: '홍길동' } });
+  assert.equal(c.calls.length, 0);
+  assert.equal(after.state.slots['customer_name'], '홍길동');
 });

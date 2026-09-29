@@ -18,6 +18,7 @@ import type { Flow, RenderedStep } from '../flow/types.ts';
 import { maskPii } from '../core/policyGuard.ts';
 import type { SwitchTicket } from '../core/executeSwitch.ts';
 import { DISCLOSURE_NODE_ID } from '../core/executeDisclosure.ts';
+import { CLARIFY_NODE_ID, renderClarifyStep } from '../nlu/executeIntentEntry.ts';
 import type {
   ChannelAdapterId, ChannelCapabilities, ChannelPort, ChannelRegistration,
 } from './contract.ts';
@@ -40,7 +41,8 @@ export type ConformanceCheckId =
   | 'TURN_HINTS'          // 재시도·타이밍 힌트가 붙은 단계를 흡수하는가(§5.1)
   | 'CONNECTOR_WAIT'      // 한 턴에 present 가 두 번 와도(대기 안내 → 결과) 되는가(§6.1)
   | 'CHANNEL_INVITE'      // 전환 초대에 티켓이 실려도 흡수하는가 — 링크는 토큰으로 만든다(§5.2·§10.3)
-  | 'AI_DISCLOSURE';      // 시나리오 노드가 아닌 AI 고지 단계를 그대로 내보내는가(§10.1·§7 7.4)
+  | 'AI_DISCLOSURE'       // 시나리오 노드가 아닌 AI 고지 단계를 그대로 내보내는가(§10.1·§7 7.4)
+  | 'INTENT_CLARIFY';     // 시나리오에 없는 **선택지 단계**(명확화)를 렌더할 수 있는가(§5.1)
 
 export interface ConformanceCheck {
   id: ConformanceCheckId;
@@ -457,7 +459,40 @@ export async function runChannelConformance(opts: ConformanceOptions): Promise<C
     });
   }
 
-  // 14) 시나리오 렌더 가능성(§5.3) — 능력 선언과 실제 시나리오가 어긋나면 배포 후에야 드러난다.
+  // 14) 인텐트 명확화(§5.1) — 인텐트를 배선하면 **시나리오에 없는 선택지 단계**가 나간다.
+  //     AI_DISCLOSURE 와 같은 함정이지만 잡는 구현이 다르다: 고지는 `Say` 라서 흘려보내면서도,
+  //     `Choice` 만은 `flow.nodes[nodeId].options` 로 되짚어 버튼을 다시 그리는 포트가 흔하다
+  //     (선택지 라벨·값이 시나리오에 있다고 가정하는 구현이다). 그런 포트는 고지 검사를 통과하고
+  //     **인텐트를 켜는 날** 첫 되물음에서 죽는다 — 역시 코드 배포가 아니라 설정 변경이다.
+  //     단계는 실제 렌더 함수로 만든다 — 검사용으로 손수 지으면 진짜 단계와 모양이 갈라진다.
+  {
+    const steps: RenderedStep[] = [renderClarifyStep(
+      '어떤 업무를 도와드릴까요?',
+      [
+        { intent: 'balance', labelKo: '잔액 조회', confidence: 0.8, position: 1 },
+        { intent: 'reissue', labelKo: '카드 재발급', confidence: 0.78, position: 2 },
+      ],
+      channel,
+    )];
+    const snapshot = JSON.stringify(steps);
+    const r = await withBudget(() => port.present('i_probe_clarify', steps), budget);
+    const unchanged = JSON.stringify(steps) === snapshot;
+    add({
+      id: 'INTENT_CLARIFY',
+      passed: r.ok === true && unchanged,
+      severity: 'error',
+      messageKo: r.ok === true && unchanged
+        ? '명확화 선택지 단계를 흡수하고 변형하지 않습니다(§5.1). 이 단계는 시나리오 노드가 아니므로 '
+          + `\`flow.nodes['${CLARIFY_NODE_ID}']\` 는 없습니다 — 단계에 실린 선택지를 그대로 쓰세요.`
+        : !unchanged
+          ? '명확화 단계를 present 가 변형했습니다. 표시 번호는 Core 의 선택 해석과 짝이므로 채널이 다시 정렬하면 '
+            + '고객이 말한 번호와 **다른 인텐트가 확정됩니다**(§5.1).'
+          : `명확화 단계에서 실패했습니다: ${'timeout' in r ? '예산 초과' : errText((r as { error: unknown }).error)}. `
+            + '이 단계의 nodeId 는 시나리오에 없습니다 — 선택지를 flow.nodes 에서 찾지 마세요(§5.1).',
+    });
+  }
+
+  // 15) 시나리오 렌더 가능성(§5.3) — 능력 선언과 실제 시나리오가 어긋나면 배포 후에야 드러난다.
   if (!opts.flows || opts.flows.length === 0) {
     add({ id: 'FLOW_SUPPORT', passed: true, skipped: true, severity: 'warning', messageKo: 'flows 미지정 — 시나리오 렌더 가능 여부를 검사하지 않았습니다(§5.3).' });
   } else {
