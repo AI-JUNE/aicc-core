@@ -3,7 +3,7 @@
 // 실엔진·실회선은 호출하지 않는다(입력은 상위 계층이 어댑터로부터 받아 전달).
 import type { ChannelKind, Handoff, Outcome } from '../domain/types.ts';
 import type { Flow, FlowNode, RenderedStep } from './types.ts';
-import { renderNode } from './types.ts';
+import { INTENT_SLOT, renderNode } from './types.ts';
 import { decideFallback, type FallbackAction } from '../core/session.ts';
 import { buildReprompt, classifyFailure, type FailureSignal, type RepromptPolicy, type RepromptReason } from './reprompt.ts';
 import { resolveTurnTiming, type TurnTimingPolicy } from './timing.ts';
@@ -18,6 +18,16 @@ export type FlowInput =
   | { kind: 'utterance'; text: string; confidence?: number; latency?: LatencyMs }
   | { kind: 'dtmf'; digits: string; latency?: LatencyMs }
   | { kind: 'timeout' }
+  /**
+   * 고객은 말했지만 **무엇을 원하는지 확정하지 못했다**(§5.1). 분류는 Core 밖(엔진)과
+   * `nlu/` 판정 모듈이 하고, Runner 는 그 결과만 받는다(§6.2).
+   *
+   * `utterance` 로 넣지 않는 이유: `Collect` 노드는 비어 있지 않은 텍스트를 **무조건 수락**한다.
+   * 미인식 발화를 그대로 넣으면 "카드를 잃어버렸어요"가 슬롯 값으로 저장된 채 다음 노드로 넘어간다 —
+   * 예외도 없고 재프롬프트도 없어, 고객은 엉뚱한 안내를 듣고 그 사실은 어디에도 남지 않는다.
+   * 이 입력은 항상 실패로 판정되어 §5.1 사다리를 탄다(사다리 규칙은 여기서 다시 쓰지 않는다).
+   */
+  | { kind: 'unrecognized'; text: string; latency?: LatencyMs }
   /**
    * 외부 연동 호출 결과(§6.1). Runner는 순수·동기 함수이므로 커넥터를 직접 부르지 않는다.
    * 호스트가 Api 단계를 보고 호출한 뒤, 결과만 이 입력으로 되돌려준다.
@@ -108,6 +118,7 @@ function clone(s: FlowState): FlowState {
 function inputText(input: FlowInput): string {
   if (input.kind === 'utterance') return input.text.trim();
   if (input.kind === 'dtmf') return input.digits.trim();
+  if (input.kind === 'unrecognized') return input.text.trim();
   return '';
 }
 
@@ -123,6 +134,9 @@ function failureSignal(input: FlowInput): FailureSignal {
       : { kind: 'utterance', text: input.text, confidence: input.confidence };
   }
   if (input.kind === 'dtmf') return { kind: 'dtmf', text: input.digits };
+  // 미인식은 **신뢰도 문제가 아니다**(인식은 됐고 의미를 못 찾았다). confidence 를 지어내 넣으면
+  // 원인이 low_confidence 로 뒤바뀌어 "잘 안 들립니다" 문안이 나간다 — 고객은 또박또박 다시 말한다.
+  if (input.kind === 'unrecognized') return { kind: 'utterance', text: input.text };
   return { kind: 'timeout' };
 }
 
@@ -199,11 +213,123 @@ export function start(flow: Flow, ctx: RunnerContext): RunResult {
   return { state: s, steps, events };
 }
 
+// ── 인텐트 진입 턴 (§5.1·§5.3) ───────────────────────────────────────────────
+// 인텐트 판정은 Runner 밖에서 끝난다(엔진은 §6.2 어댑터 뒤, 판정은 `nlu/`). Runner 가 맡는 것은
+// 그 결과를 **세션 상태와 §8.1 이벤트로 옮기는 일**뿐이다. 이 세 함수가 없으면 그 자리를
+// 채널 런타임이 직접 채우게 되고, 그러면 turn 번호·eventSeq·종료 판정이 두 곳에서 만들어진다.
+
+/** 인텐트 진입 턴의 고객 입력. 확정된 인텐트가 있으면 함께 싣는다(§4 Turn.intent). */
+export interface IntentTurnInput {
+  input: FlowInput;
+  intent?: string;
+  /**
+   * 엔진이 준 **실측** 신뢰도만 싣는다(§13-3). 고객이 명확화 선택지에서 직접 고른 경우에는
+   * 넣지 않는다 — 1.0 을 적으면 §7 품질 지표에 "확신도 만점" 구간이 생겨 실제 인식률을 가린다.
+   */
+  confidence?: number;
+}
+
+/**
+ * 인텐트 진입 턴의 고객 발화 이벤트. **한 곳에서만 만든다** — 두 곳에서 만들면 한쪽이
+ * `intent` 를 빠뜨리고, 그 차이는 예외가 아니라 §7 인텐트 분포 통계의 구멍으로만 나타난다.
+ */
+function intentCustomerTurn(s: FlowState, ctx: RunnerContext, events: InteractionEvent[], t: IntentTurnInput): void {
+  const nodeId = s.currentNodeId;
+  events.push(turnCompleted(meta(s, ctx), {
+    turnId: `t_${++s.turnCount}`,
+    speaker: 'customer',
+    utterance: inputText(t.input),
+    ...(nodeId !== null ? { nodeId } : {}),
+    ...(t.intent !== undefined ? { intent: t.intent } : {}),
+    ...(t.confidence !== undefined ? { confidence: t.confidence } : {}),
+    latency: inputLatency(t.input),
+  }));
+}
+
+/**
+ * 같은 Interaction 안에서 **다른 시나리오로 갈아탄다**(§5.3).
+ *
+ * `start()` 를 다시 부르지 않는 이유가 이 함수의 존재 이유다 — `start()` 는 `session.started` 를
+ * 만들고 슬롯을 비운다. 인텐트가 확정될 때마다 그것을 부르면 유입 통계가 통화 수보다 커지고
+ * (§8.1 집계가 통째로 어긋난다), 이미 인증된 회원번호 같은 슬롯이 사라져 고객이 다시 답하게 된다.
+ *
+ * 실패 카운트·마지막 실패 원인은 초기화한다 — 새 시나리오의 첫 질문은 아직 실패한 적이 없다.
+ * 확정된 인텐트는 예약 슬롯(`INTENT_SLOT`)에 남아 이관 요약·분석의 근거가 된다.
+ */
+export function switchFlow(
+  flow: Flow, prev: FlowState, ctx: RunnerContext, entryNodeId: string, t: IntentTurnInput,
+): RunResult {
+  const s = clone(prev);
+  const steps: RenderedStep[] = [];
+  const events: InteractionEvent[] = [];
+  if (s.status !== 'running') return { state: s, steps, events };
+
+  // 발화는 **갈아타기 전** 시나리오에서 일어났다 — 이벤트의 flow_id 도 그쪽이어야 한다.
+  intentCustomerTurn(s, ctx, events, t);
+  s.flowId = flow.id;
+  s.flowVersion = flow.version;
+  s.currentNodeId = entryNodeId;
+  s.visited = [];
+  s.failCount = 0;
+  delete s.lastFallback;
+  delete s.lastFailureReason;
+  delete s.pendingConnectorId;
+  if (t.intent !== undefined) s.slots[INTENT_SLOT] = t.intent;
+  advance(flow, s, ctx, steps, events);
+  return { state: s, steps, events };
+}
+
+/**
+ * 인텐트 판정 결과로 **곧바로 상담사에게 넘긴다**(§2). 시나리오를 타지 않는다.
+ *
+ * 큐를 정하지 않는다 — 목적지는 §9.3 라우팅·폴백이 정하고, 여기서 고르면 그 판정이 두 곳이 된다.
+ */
+export function handoffFromIntent(
+  prev: FlowState, ctx: RunnerContext, reason: Handoff['reason'], t: IntentTurnInput,
+): RunResult {
+  const s = clone(prev);
+  const steps: RenderedStep[] = [];
+  const events: InteractionEvent[] = [];
+  if (s.status !== 'running') return { state: s, steps, events };
+
+  intentCustomerTurn(s, ctx, events, t);
+  s.handoff = { reason };
+  events.push(handoffRequested(meta(s, ctx), { reason }));
+  terminate(s, ctx, events, 'transferred', 'TRANSFERRED');
+  return { state: s, steps, events };
+}
+
+/**
+ * 되묻는다(§5.1 명확화). **노드를 옮기지 않는다** — 고객의 다음 답도 같은 인텐트 진입 노드가 받는다.
+ *
+ * 실패 카운트를 올리지 않는 이유: 명확화는 실패가 아니라 설계된 되물음이다. 여기서 사다리를
+ * 올리면 두 번 되묻는 것만으로 상담사로 떨어져, 테넌트가 정한 `maxClarifyAttempts` 가 무의미해진다.
+ * 무한 되물음은 그 한도(`decideIntent`)가 막는다 — 한도 규칙을 여기서 다시 쓰지 않는다.
+ */
+export function clarifyTurn(
+  prev: FlowState, ctx: RunnerContext, step: RenderedStep, t: IntentTurnInput,
+): RunResult {
+  const s = clone(prev);
+  const steps: RenderedStep[] = [];
+  const events: InteractionEvent[] = [];
+  if (s.status !== 'running') return { state: s, steps, events };
+
+  intentCustomerTurn(s, ctx, events, t);
+  steps.push(step);
+  events.push(turnCompleted(meta(s, ctx), {
+    turnId: `t_${++s.turnCount}`, speaker: 'bot', utterance: step.text, nodeId: step.nodeId,
+  }));
+  return { state: s, steps, events };
+}
+
 interface Resolution { ok: boolean; next?: string | null; slot?: { key: string; value: string } }
 
 function resolve(node: FlowNode, input: FlowInput, ctx: RunnerContext): Resolution {
   const v = inputText(input);
   if (input.kind === 'timeout' || v === '' || !confidenceOk(input, ctx)) return { ok: false };
+  // 미인식은 어떤 노드에서도 수락되지 않는다. Collect 가 비어 있지 않은 텍스트를 무조건 받는 탓에
+  // 이 한 줄이 없으면 "무엇을 원하는지 모르겠다"가 슬롯 값으로 저장되고 흐름은 그대로 진행된다.
+  if (input.kind === 'unrecognized') return { ok: false };
 
   switch (node.kind) {
     case 'Collect':

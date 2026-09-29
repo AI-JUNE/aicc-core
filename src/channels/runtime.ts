@@ -12,9 +12,12 @@
 import type { ChannelKind, Handoff, Interaction, Turn } from '../domain/types.ts';
 import { resolveOutcome } from '../domain/types.ts';
 import type { Flow, RenderedStep } from '../flow/types.ts';
-import { renderNode } from '../flow/types.ts';
-import type { FlowInput, FlowState, RunResult, RunStatus, RunnerContext } from '../flow/runner.ts';
-import { start as runnerStart, send as runnerSend } from '../flow/runner.ts';
+import { isIntentEntryNode, renderNode } from '../flow/types.ts';
+import type { FlowInput, FlowState, IntentTurnInput, RunResult, RunStatus, RunnerContext } from '../flow/runner.ts';
+import {
+  start as runnerStart, send as runnerSend,
+  clarifyTurn, handoffFromIntent, switchFlow,
+} from '../flow/runner.ts';
 import type { RepromptPolicy } from '../flow/reprompt.ts';
 import { repromptPolicyOk, validateRepromptPolicy } from '../flow/reprompt.ts';
 import type { TurnTimingPolicy } from '../flow/timing.ts';
@@ -38,6 +41,13 @@ import type { AiDisclosureConfig } from '../portal/aiDisclosure.ts';
 import { planDisclosure, validateDisclosureBinding } from '../core/executeDisclosure.ts';
 import type { ConnectorPumpBinding } from '../integration/connectorPump.ts';
 import { connectorHopLimit, hopLimitInput, missingConnectors, pumpConnectorHop } from '../integration/connectorPump.ts';
+import type { IntentCatalog, IntentPolicy } from '../nlu/intent.ts';
+import { validateIntentCatalog, validateIntentPolicy } from '../nlu/intent.ts';
+import type { IntentRoutingTable } from '../nlu/intentRouting.ts';
+import { intentRoutingOk, validateIntentRouting } from '../nlu/intentRouting.ts';
+import type { ClassifyStatus, IntentClassifier } from '../nlu/llmClassifier.ts';
+import type { PendingClarify } from '../nlu/executeIntentEntry.ts';
+import { resolveIntentEntry } from '../nlu/executeIntentEntry.ts';
 import type {
   ChannelAdapterId, ChannelHealthReport, ChannelRegistration, ChannelSessionRequest,
   ChannelTurnInput, ChannelTurnResult, ConversationCorePort, ContractIssue, ChannelCapabilities,
@@ -95,6 +105,12 @@ export interface SessionRecord {
    * 채널이 바뀌면(§5.2) 새 매체에서는 아직 고지하지 않은 것이므로 채널 단위로 센다.
    */
   disclosedChannels?: ChannelKind[];
+  /**
+   * 인텐트 진입 노드(§5.1)의 진행 상태. `options` 가 비어 있으면 **되묻는 중이 아니다** —
+   * 시도 횟수만 이어받는다. 미인식으로 사다리를 한 칸 내려갔다고 명확화 한도가 0 으로
+   * 되돌아가면, 테넌트가 정한 `maxClarifyAttempts` 를 넘겨 같은 질문을 계속 되묻게 된다.
+   */
+  intentClarify?: PendingClarify;
 }
 
 /** 세션 저장소. 인메모리는 단일 프로세스용 — 영속 구현은 이 인터페이스 뒤로 교체한다(§6.2). */
@@ -163,6 +179,41 @@ export interface ChannelSwitchBinding {
   reason?: SwitchReason;
 }
 
+/**
+ * 인텐트 진입 배선(§5.1·§5.3·§2). **주지 않으면 종전과 완전히 같다**(§13-3) —
+ * 채널은 시작할 시나리오 id 를 **이미 알고 있어야** 하고, 인텐트 진입 노드
+ * (`INTENT_SLOT` 을 수집하는 Collect)는 평범한 Collect 로 동작한다.
+ *
+ * 주면 Core 가 고객의 답을 인텐트로 해석해 시나리오를 고른다
+ * (`nlu/executeIntentEntry.ts` → 분류 → `decideIntent` → `routeIntent`).
+ * 이 배선이 없으면 "무엇을 원하는지 듣고 시나리오를 고르는 일"이 채널 3곳에 남고,
+ * 각자 `switch (intent)` 를 쓰면서 각자 다르게 틀린다(§2).
+ */
+export interface IntentBinding {
+  catalog: IntentCatalog;
+  policy: IntentPolicy;
+  table: IntentRoutingTable;
+  /** 발화 → 후보(§6.2). 주입이다 — Core 는 엔진을 모르고, 실호출 승인도 호스트 쪽에 있다 **[승인 필요]**. */
+  classifier: IntentClassifier;
+  /** 명확화 질문 문구. Core 는 문안을 만들지 않는다(§13-3) — 없으면 배선 자체를 거부한다. */
+  clarifyPrompt: string;
+  /**
+   * 인텐트 턴에서 드러난 것을 호스트에 그대로 올린다(삼키지 않는다).
+   * 분류기 장애와 "고객이 이상한 말을 했다"를 **여기서 갈라서** 받는다 — 합치면
+   * 지식베이스가 통째로 내려가 있어도 그래프는 평온하다.
+   *
+   * 엔진 헬스 샘플은 여기서 만들지 않는다 — 엔진 상태는 `adapters/resilience.ts` 가
+   * 이미 적는다. 두 곳에서 적으면 한 번의 장애가 두 번 집계된다(§2·§9.3).
+   */
+  onIssue?: (issue: {
+    interactionId: string;
+    kind: 'classifier_failed' | 'unrouted' | 'unmatched';
+    reasonKo: string;
+    intent?: string;
+    status?: ClassifyStatus;
+  }) => void;
+}
+
 export interface ConversationCoreOptions {
   scope: TenantScope;
   flows: FlowRegistry;
@@ -199,6 +250,8 @@ export interface ConversationCoreOptions {
   connectors?: ConnectorPumpBinding;
   /** 채널 전환 초대(§5.2). 미지정 시 종전 동작 — 합류에 토큰을 요구하지 않는다(§13-3). */
   channelSwitch?: ChannelSwitchBinding;
+  /** 인텐트 진입(§5.1·§5.3). 미지정 시 인텐트 진입 노드는 평범한 Collect 로 동작한다(§13-3). */
+  intent?: IntentBinding;
   /**
    * AI 고지(§10.1·§7 7.4). **주지 않으면 종전과 완전히 같다**(§13-3) — 고지는 나가지 않고,
    * 그 사실이 `W_AI_DISCLOSURE_UNBOUND` 경고로 남는다.
@@ -307,6 +360,64 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     warnings.push(...issues.filter((i) => i.severity === 'warning'));
     regs.set(reg.port.id, reg);
     declared.set(reg.port.id, new Set(reg.reportsComponents));
+  }
+
+  // 인텐트 배선도 **배포 시점에** 거른다. 통화 중에 "카탈로그에 없는 인텐트"로 터지면 이미 늦고,
+  // 형태 오류를 통과로 두면 오타 하나로 인텐트 진입이 조용히 꺼진 채 "적용했다"로 남는다
+  // (라우팅·전환·요청 제한기와 같은 규칙). 라우팅 표 검증은 `validateIntentRouting` 하나만 쓴다(§2).
+  if (opts.intent !== undefined) {
+    const it = opts.intent;
+    if (!it.classifier || typeof it.classifier.classify !== 'function') {
+      throw new Error('인텐트 배선 거부: 분류기(classifier)가 없습니다 — Core 는 엔진을 직접 부르지 않습니다 (설계서 §6.2)');
+    }
+    if (typeof it.clarifyPrompt !== 'string' || it.clarifyPrompt.trim() === '') {
+      throw new Error('인텐트 배선 거부: 명확화 문구(clarifyPrompt)가 없습니다 — Core 는 질문 문안을 만들지 않습니다 (설계서 §13-3)');
+    }
+    for (const [label, owner] of [['카탈로그', it.catalog], ['정책', it.policy], ['라우팅 표', it.table]] as const) {
+      if (owner.tenantId !== opts.scope.tenantId) {
+        throw new Error(`인텐트 배선 거부: 다른 테넌트의 ${label} 입니다 — 고객이 남의 회사 시나리오를 듣게 됩니다 (설계서 §11.1)`);
+      }
+      if (owner.workspaceId !== undefined && owner.workspaceId !== opts.scope.workspaceId) {
+        throw new Error(`인텐트 배선 거부: 다른 워크스페이스의 ${label} 입니다 (설계서 §11.1)`);
+      }
+    }
+    const catalogErrors = validateIntentCatalog(it.catalog);
+    if (catalogErrors.length > 0) throw new Error(`인텐트 카탈로그 거부: ${catalogErrors.join(' / ')}`);
+    const policyErrors = validateIntentPolicy(it.policy);
+    if (policyErrors.length > 0) throw new Error(`인텐트 정책 거부: ${policyErrors.join(' / ')}`);
+
+    const rIssues = validateIntentRouting(it.table, it.catalog, opts.flows);
+    if (!intentRoutingOk(rIssues)) {
+      throw new Error(`인텐트 라우팅 거부: ${rIssues.filter((i) => i.severity === 'error').map((i) => i.messageKo).join(' / ')}`);
+    }
+    // 라우트 없는 활성 인텐트는 막지 않되 **반드시 드러낸다** — 확정돼도 갈 곳이 없다.
+    for (const i of rIssues) warnings.push({ code: 'W_INTENT_ROUTING', severity: 'warning', messageKo: i.messageKo });
+
+    // 라우트가 가리키는 시나리오도 `start()` 와 **같은 규칙**으로 미리 본다(§5.3).
+    // 여기서 안 보면 그 시나리오는 **인텐트가 확정된 통화 한복판에서** 처음 검증되고,
+    // 렌더 불가 노드·오타 커넥터는 그때 막힌다 — 고객은 이미 회선에 있다.
+    for (const route of it.table.routes) {
+      const flow = opts.flows.get(route.flowId, route.flowVersion);
+      if (!flow) continue;                       // 위 검증이 이미 오류로 잡았다
+      for (const reg of opts.channels) {
+        const unsupported = checkFlowSupported(flow, reg.port.capabilities).filter((i) => i.severity === 'error');
+        if (unsupported.length > 0) {
+          throw new Error(
+            `인텐트 라우팅 거부: ${route.intent} → ${flow.id} 를 ${reg.port.id} 채널에서 실행할 수 없습니다: `
+            + unsupported.map((i) => i.messageKo).join(' / '),
+          );
+        }
+      }
+      if (opts.connectors) {
+        const missing = missingConnectors(flow, opts.connectors.connectors);
+        if (missing.length > 0) {
+          throw new Error(
+            `인텐트 라우팅 거부: ${route.intent} → ${flow.id} 에 선언되지 않은 커넥터가 있습니다: `
+            + missing.map((m) => `${m.nodeId}→${m.connectorId}`).join(', ') + ' (설계서 §6.1)',
+          );
+        }
+      }
+    }
   }
 
   // AI 고지도 **배포 시점에** 거른다(§10.1). 미승인 문구·음성에 배너 같은 설정 오류를 통과시키면
@@ -585,6 +696,87 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     }
     sessions.put(rec);
     return { steps, events, presented };
+  }
+
+  /**
+   * 이번 턴의 시나리오 진행. 인텐트 진입 노드(§5.1)가 아니면 **종전과 완전히 같다** —
+   * `runnerSend` 하나를 그대로 부른다(§13-3, 검사로 고정).
+   *
+   * 여기서 지키는 것:
+   * - **분류 결과를 슬롯으로 저장하지 않는다.** 진입 노드는 `Collect` 라서 Runner 에 그냥
+   *   넘기면 "카드를 잃어버렸어요"가 슬롯 값이 된 채 다음 노드로 넘어간다 — 예외도,
+   *   재프롬프트도 없이 고객만 엉뚱한 안내를 듣는다. 그래서 이 노드의 입력은 가로챈다.
+   * - **숫자는 인텐트가 아니다.** 되묻는 중이 아닐 때의 DTMF 는 분류기에 보내지 않는다
+   *   (엔진 비용이고 의미도 없다, §11.2). 번호 메뉴가 필요하면 `Choice` 노드를 쓴다.
+   *   되묻는 중이면 "2번"이 곧 선택이므로 그때는 선택지 해석으로 간다.
+   * - **격리 위반은 삼키지 않는다**(§11.1) — 실행기가 던지는 유일한 경우이며 그대로 올린다.
+   */
+  async function runTurn(rec: SessionRecord, ctx: RunnerContext, input: FlowInput): Promise<RunResult> {
+    const binding = opts.intent;
+    const node = rec.state.currentNodeId === null ? undefined : rec.flow.nodes[rec.state.currentNodeId];
+    if (!binding || !isIntentEntryNode(node)) return runnerSend(rec.flow, rec.state, input, ctx);
+    if (input.kind !== 'utterance' && input.kind !== 'dtmf') {
+      // 무입력(timeout)·커넥터 결과는 인텐트가 아니다 — 종전 경로(§5.1 무입력 사다리)로 간다.
+      return runnerSend(rec.flow, rec.state, input, ctx);
+    }
+
+    const text = input.kind === 'utterance' ? input.text : input.digits;
+    const latency = input.latency !== undefined ? { latency: input.latency } : {};
+    const clarifying = (rec.intentClarify?.options.length ?? 0) > 0;
+    if (input.kind === 'dtmf' && !clarifying) {
+      return runnerSend(rec.flow, rec.state, { kind: 'unrecognized', text, ...latency }, ctx);
+    }
+
+    const outcome = await resolveIntentEntry(
+      {
+        catalog: binding.catalog, policy: binding.policy, table: binding.table,
+        flows: opts.flows, classifier: binding.classifier, clarifyPrompt: binding.clarifyPrompt,
+      },
+      {
+        scope: rec.scope, channel: rec.state.channel, text,
+        ...(rec.intentClarify !== undefined ? { pending: rec.intentClarify } : {}),
+        ...(opts.timing !== undefined ? { timing: opts.timing } : {}),
+      },
+    );
+
+    const turn: IntentTurnInput = { input };
+    switch (outcome.kind) {
+      case 'start_flow': {
+        delete rec.intentClarify;
+        return switchFlow(outcome.flow, rec.state, ctx, outcome.entryNodeId, {
+          ...turn,
+          intent: outcome.intent,
+          ...(outcome.confidence !== undefined ? { confidence: outcome.confidence } : {}),
+        });
+      }
+      case 'handoff': {
+        delete rec.intentClarify;
+        if (outcome.cause === 'unrouted') {
+          // 설정 누락이다. 조용히 두면 "봇이 못 알아듣더라"로만 남는다 — 통화는 이관으로 살리되
+          // 원인은 운영 화면과 호스트 양쪽에 드러낸다.
+          warnOnce('W_INTENT_ROUTING', `확정된 인텐트에 연결된 시나리오가 없어 상담사로 넘겼습니다: ${outcome.intent}`);
+          binding.onIssue?.({
+            interactionId: rec.interactionId, kind: 'unrouted', reasonKo: outcome.reasonKo, intent: outcome.intent,
+          });
+        }
+        return handoffFromIntent(rec.state, ctx, outcome.reason, { ...turn, intent: outcome.intent });
+      }
+      case 'clarify': {
+        rec.intentClarify = outcome.pending;
+        return clarifyTurn(rec.state, ctx, outcome.step, turn);
+      }
+      case 'fallback': {
+        // 선택지는 버리고 **시도 횟수만 이어받는다** — 0 으로 되돌리면 명확화 한도가 무의미해진다.
+        rec.intentClarify = { options: [], attempt: rec.intentClarify?.attempt ?? 0 };
+        binding.onIssue?.({
+          interactionId: rec.interactionId,
+          kind: outcome.classifierFailed ? 'classifier_failed' : 'unmatched',
+          reasonKo: outcome.reasonKo,
+          ...(outcome.classifierStatus !== undefined ? { status: outcome.classifierStatus } : {}),
+        });
+        return runnerSend(rec.flow, rec.state, { kind: 'unrecognized', text, ...latency }, ctx);
+      }
+    }
   }
 
   /**
@@ -921,7 +1113,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
 
       const prevChannel = rec.state.channel;
       const ctx = runnerCtx(rec, reg.port.capabilities);
-      const run = runnerSend(rec.flow, rec.state, turn.input, ctx);
+      const run = await runTurn(rec, ctx, turn.input);
       rec.state = run.state;
 
       if (turn.usage !== undefined) {

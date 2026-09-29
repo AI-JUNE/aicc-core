@@ -23,6 +23,24 @@ export type FlowNode = SayNode | CollectNode | ChoiceNode | ConfirmNode | Transf
 
 export interface Flow { id: string; version: number; startNodeId: string; nodes: Record<string, FlowNode> }
 
+/**
+ * 인텐트 진입 노드 표시(§5.1·§5.3). 이 슬롯을 수집하는 `Collect` 노드는 "무엇을 도와드릴까요?"이며,
+ * 고객의 답은 **슬롯 값이 아니라 인텐트**로 해석된다 — 런타임에 인텐트가 배선된 경우에 한한다.
+ *
+ * 왜 새 노드 종류(`NodeKind`)를 만들지 않았는가: 채널 3곳이 `step.kind` 로 분기하고 있어
+ * 새 종류를 내보내는 순간 **설정을 바꾼 날** 전 통화가 첫 단계에서 깨진다(코드 배포가 아니라
+ * 원인을 찾기도 어렵다). 예약 슬롯이면 채널이 보는 것은 종전과 같은 `Collect` 단계뿐이다.
+ *
+ * 배선이 없으면 종전과 완전히 같다(§13-3) — 평범한 Collect 로 동작해 답을 이 슬롯에 담고 다음 노드로 간다.
+ * 확정된 인텐트 id 도 같은 슬롯에 담긴다(예약 슬롯이라 채널이 덮어쓸 수 없다).
+ */
+export const INTENT_SLOT = '__intent__';
+
+/** 이 노드가 인텐트 진입 노드인가. 판정은 한 곳에만 둔다 — 문자열 비교가 흩어지면 오타가 조용히 기능을 끈다. */
+export function isIntentEntryNode(node: FlowNode | undefined): node is CollectNode {
+  return node !== undefined && node.kind === 'Collect' && node.slot === INTENT_SLOT;
+}
+
 /** 채널별 렌더 결과 — Voice는 발화, Visual은 화면, Chat은 말풍선으로 변환된다 */
 export interface RenderedStep {
   channel: ChannelKind;
