@@ -1,13 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-let R = null, F = null, B = null, P = null, EV = null;
+let R = null, F = null, B = null, P = null, EV = null, DF = null, LC = null;
 try {
   R = await import('../src/channels/runtime.ts');
   F = await import('../src/ops/fallback.ts');
   B = await import('../src/events/bus.ts');
   P = await import('../src/channels/profiles.ts');
   EV = await import('../src/events/store.ts');
+  DF = await import('../src/flow/deployedFlows.ts');
+  LC = await import('../src/flow/lifecycle.ts');
 } catch { /* 구형 런타임 */ }
 const b = { skip: R ? false : '타입 스트리핑 미지원 런타임' };
 
@@ -49,7 +51,7 @@ function fakePort(id = 'callbot', capsOver = {}, over = {}) {
   };
 }
 
-function build({ flows = [flowBilling], port = fakePort(), ports, samples = [], policy = {}, components, reprompt, timing, routing, connectors, channelSwitch, disclosure, intent } = {}) {
+function build({ flows = [flowBilling], registry, port = fakePort(), ports, samples = [], policy = {}, components, reprompt, timing, routing, connectors, channelSwitch, disclosure, intent } = {}) {
   const collector = B.createCollectorSink('t');
   const bus = B.createEventBus({
     scope: SCOPE, sinks: [collector],
@@ -58,7 +60,7 @@ function build({ flows = [flowBilling], port = fakePort(), ports, samples = [], 
   const health = F.createHealthRegistry(samples);
   const core = R.createConversationCore({
     scope: SCOPE,
-    flows: R.createMemoryFlowRegistry(flows),
+    flows: registry ?? R.createMemoryFlowRegistry(flows),
     channels: (ports ?? [port]).map((p) => ({
       port: p, reportsComponents: components ?? P.CHANNEL_COMPONENTS[p.id], contractVersion: 1,
     })),
@@ -1364,4 +1366,186 @@ test('인텐트 진입 노드가 아니면 종전 경로 그대로다(§13-3)', 
   const after = await core.send(r.interactionId, { input: { kind: 'utterance', text: '홍길동' } });
   assert.equal(c.calls.length, 0);
   assert.equal(after.state.slots['customer_name'], '홍길동');
+});
+
+// ── 채널별 배포본 배선(§5.3) ─────────────────────────────────────────────────
+//
+// 배선이 없으면 버전 선택이 **stage 와 무관하게 가장 높은 번호**로 이루어진다. 아래 첫 검사가
+// 그 상태 자체를 고정한다 — 고쳤다는 말이 아니라 **고치기 전에 무슨 일이 일어나는지**를 적어 둔다.
+
+const sayFlow = (id, version, text) => ({
+  id, version, startNodeId: 'say', nodes: { say: { id: 'say', kind: 'Say', text } },
+});
+const billingV1 = sayFlow('billing', 1, '승인된 v1');
+const billingV9 = sayFlow('billing', 9, '편집 중 v9');
+
+/** 리비전·배포 레지스트리를 lifecycle 함수로만 만든다(손으로 쓰면 게이트 검사가 느슨해진다). */
+function lifecycleRegistry(specs) {
+  let reg = LC.emptyRegistry();
+  for (const { flow, channels } of specs) {
+    const ref = { scope: SCOPE, flowId: flow.id, version: flow.version };
+    let r = LC.createDraft(reg, { scope: SCOPE, flow, by: 'author_kim', at: NOW });
+    assert.equal(r.ok, true, r.ok ? '' : r.message);
+    reg = r.value;
+    if (channels === undefined) continue;          // 편집본으로 둔다
+    r = LC.submitForReview(reg, ref, 'author_kim', NOW);
+    assert.equal(r.ok, true, r.ok ? '' : r.message);
+    r = LC.approve(r.value, ref, 'reviewer_lee', NOW);
+    assert.equal(r.ok, true, r.ok ? '' : r.message);
+    reg = r.value;
+    if (channels.length === 0) continue;           // 승인만 하고 배포하지 않는다
+    r = LC.publish(reg, { scope: SCOPE, flowId: flow.id, version: flow.version, channels, by: 'ops_park', at: NOW });
+    assert.equal(r.ok, true, r.ok ? '' : r.message);
+    reg = r.value;
+  }
+  return reg;
+}
+
+/** 배포 레지스트리를 **그때그때 읽는** 런타임 조회. 스냅샷을 붙들면 롤백이 닿지 않는다. */
+function deployed(specs) {
+  const box = { reg: lifecycleRegistry(specs) };
+  return {
+    box,
+    registry: DF.createDeployedFlowRegistry({ registry: () => box.reg, scope: SCOPE }),
+  };
+}
+
+test('배선이 없으면 편집본이 번호만 높아도 운영에 나간다 — 바로 그 상태를 경고로 드러낸다', b, async () => {
+  const { core, port } = build({ flows: [billingV1, billingV9] });
+  const r = await core.start(req());
+  // 종전 동작이다(§13-3). 막지 않지만 조용히 두지도 않는다.
+  assert.equal(r.steps[0].text, '편집 중 v9');
+  assert.equal(r.state.flowVersion, 9);
+  assert.equal(port.log[0][2].length, 1);
+  const w = core.warnings().filter((i) => i.code === 'W_FLOW_DEPLOYMENT_UNBOUND');
+  assert.equal(w.length, 1);
+  assert.match(w[0].messageKo, /draft/);
+});
+
+test('배선하면 배포본이 나가고 편집본은 어떤 경우에도 나가지 않는다', b, async () => {
+  const { registry } = deployed([{ flow: billingV1, channels: ['voice'] }, { flow: billingV9 }]);
+  const { core } = build({ registry });
+  const r = await core.start(req());
+  assert.equal(r.steps[0].text, '승인된 v1');
+  assert.equal(r.state.flowVersion, 1);
+  assert.equal(core.warnings().some((i) => i.code === 'W_FLOW_DEPLOYMENT_UNBOUND'), false);
+  // 채널이 편집본을 **지정해도** 시작하지 않는다.
+  await assert.rejects(() => core.start(req({ flowVersion: 9 })), /not_approved/);
+});
+
+test('미배포 채널은 시작을 막고 사유를 "찾을 수 없습니다"로 뭉개지 않는다', b, async () => {
+  const { registry } = deployed([{ flow: billingV1, channels: ['voice'] }]);
+  const { core } = build({ registry, port: fakePort('chatbot') });
+  await assert.rejects(
+    () => core.start(req({ adapter: 'chatbot' })),
+    (e) => /not_deployed/.test(e.message) && /배포된 버전이 없습니다/.test(e.message),
+  );
+});
+
+test('롤백은 신규 통화에 닿고, 진행 중인 통화의 버전은 바꾸지 않는다(§5.3)', b, async () => {
+  const { box, registry } = deployed([
+    { flow: billingV1, channels: ['voice'] },
+    { flow: sayFlow('billing', 2, '승인된 v2'), channels: ['voice'] },
+  ]);
+  const { core } = build({ registry });
+  const first = await core.start(req());
+  assert.equal(first.state.flowVersion, 2);
+
+  const rolled = LC.rollback(box.reg, { scope: SCOPE, flowId: 'billing', channel: 'voice', toVersion: 1, by: 'ops_park', at: NOW });
+  assert.equal(rolled.ok, true);
+  box.reg = rolled.value;
+
+  // 진행 중 세션은 시작 시점의 시나리오를 그대로 들고 간다 — 통화 한복판에 바뀌면 상태가 갈라진다.
+  assert.equal(core.sessions.get(first.interactionId).flow.version, 2);
+  const next = await core.start(req());
+  assert.equal(next.state.flowVersion, 1);
+});
+
+test('실행 경로는 forChannel 만 쓴다 — 미배포를 get 으로 되묻지 않는다', b, async () => {
+  // get 이 다른 시나리오를 돌려주는 레지스트리. 두 경로를 섞으면 배포 게이트가 무의미해진다.
+  const calls = [];
+  const registry = {
+    get(flowId, version) { calls.push(['get', flowId, version]); return billingV9; },
+    forChannel(flowId, channel, version) { calls.push(['forChannel', flowId, channel, version]); return billingV1; },
+  };
+  const { core } = build({ registry });
+  const r = await core.start(req());
+  assert.equal(r.steps[0].text, '승인된 v1');
+  assert.deepEqual(calls, [['forChannel', 'billing', 'voice', undefined]]);
+});
+
+test('사유 조회가 예외로 끝나도 통화가 끊기지 않는다', b, async () => {
+  const registry = {
+    get: () => undefined,
+    forChannel: () => undefined,
+    explain() { throw new Error('explain 폭발'); },
+  };
+  const { core } = build({ registry });
+  await assert.rejects(() => core.start(req()), (e) => /시나리오를 찾을 수 없습니다/.test(e.message) && !/폭발/.test(e.message));
+});
+
+test('지정본으로 실행하면 배포·롤백이 그 채널에 닿지 않는다는 사실을 드러낸다', b, async () => {
+  const { registry } = deployed([
+    { flow: billingV1, channels: ['voice'] },
+    { flow: sayFlow('billing', 2, '승인된 v2'), channels: [] },   // 승인만, 배포 전
+  ]);
+  const { core } = build({ registry });
+  const r = await core.start(req({ flowVersion: 2 }));
+  assert.equal(r.state.flowVersion, 2);
+  const w = core.warnings().filter((i) => i.code === 'W_FLOW_NOT_DEPLOYED');
+  assert.equal(w.length, 1);
+  assert.match(w[0].messageKo, /배포본\(v1\)이 아닌 지정본 v2/);
+});
+
+test('인텐트가 고른 시나리오도 배포본 경로로 고른다', b, async () => {
+  const balanceV1 = sayFlow('f_balance', 1, '배포된 잔액 안내');
+  // v4 는 승인까지만 됐고 배포 전이다 — 채널 없는 조회(get)로는 v4 가 나오므로, 라우팅이
+  // 그 경로를 타면 **아직 배포하지 않은 버전**이 통화 한복판에 들어간다.
+  const balanceV4 = sayFlow('f_balance', 4, '배포 전 잔액 안내');
+  const { registry } = deployed([
+    { flow: flowTriage, channels: ['voice'] },
+    { flow: balanceV1, channels: ['voice'] },
+    { flow: balanceV4, channels: [] },
+    { flow: flowReissue, channels: ['voice'] },
+  ]);
+  const c = classifierOf({ candidates: [{ intent: 'balance', confidence: 0.95 }] });
+  const { core } = build({ registry, intent: intentBinding(c) });
+  const r = await core.start(triageReq());
+  const after = await core.send(r.interactionId, { input: { kind: 'utterance', text: '잔액 알려줘' } });
+  assert.equal(after.state.flowId, 'f_balance');
+  assert.equal(after.state.flowVersion, 1);
+  assert.equal(after.steps[0].text, '배포된 잔액 안내');
+});
+
+test('편집본만 있는 라우트는 "없는 시나리오"가 아니라 승인 누락으로 막는다', b, () => {
+  const { registry } = deployed([
+    { flow: flowTriage, channels: ['voice'] },
+    { flow: flowBalance, channels: ['voice'] },
+    { flow: flowReissue },                                // 편집본만 있다
+  ]);
+  assert.throws(
+    () => build({ registry, intent: intentBinding(classifierOf({})) }),
+    (e) => /인텐트 라우팅 거부/.test(e.message) && /not_approved/.test(e.message) && !/없는 시나리오/.test(e.message),
+  );
+});
+
+test('라우트가 어떤 채널에 미배포면 등록 시 드러내고, 통화 중엔 이관으로 살린다', b, async () => {
+  const { registry } = deployed([
+    { flow: flowTriage, channels: ['voice'] },
+    { flow: flowBalance, channels: ['voice'] },
+    { flow: flowReissue, channels: [] },                 // 승인만, 어느 채널에도 배포 전
+  ]);
+  const issues = [];
+  const c = classifierOf({ candidates: [{ intent: 'reissue', confidence: 0.95 }] });
+  const { core, port } = build({ registry, intent: intentBinding(c, { onIssue: (i) => issues.push(i) }) });
+  const w = core.warnings().filter((i) => i.code === 'W_FLOW_NOT_DEPLOYED');
+  assert.equal(w.length, 1);
+  assert.match(w[0].messageKo, /reissue → f_reissue/);
+  assert.match(w[0].messageKo, /not_deployed/);
+
+  const r = await core.start(triageReq());
+  const after = await core.send(r.interactionId, { input: { kind: 'utterance', text: '재발급' } });
+  assert.equal(after.status, 'transferred');
+  assert.deepEqual(issues.map((i) => i.kind), ['unrouted']);
+  assert.equal(port.log.some((l) => l[0] === 'transfer'), true);
 });

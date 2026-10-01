@@ -147,6 +147,16 @@ export function resolveDeployedFlow(
   }
 
   if (!dep) {
+    // **원인을 배포 누락으로 단정하지 않는다.** 승인된 리비전이 하나도 없으면 배포는 애초에
+    // 불가능했으므로 원인은 승인이다 — 둘을 뭉개면 운영자가 배포 화면을 들여다보며
+    // "왜 배포가 안 걸리지"를 묻게 된다(`retrieval.ts` 가 장애와 무근거를 가른 것과 같은 자리다).
+    if (!all.some((r) => gatePassed(r))) {
+      return {
+        code: 'not_approved',
+        reasonKo: `승인 기록이 있는 리비전이 없습니다: ${flowId}(리비전 ${all.length}건, 모두 편집·검토 단계) `
+          + '(설계서 §5.3·§10)',
+      };
+    }
     // **최신으로 대신하지 않는다.** 그 한 줄이 이 모듈이 메우려는 결함의 전부다(§13-3).
     return {
       code: 'not_deployed',

@@ -321,6 +321,76 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
   const regs = new Map<ChannelAdapterId, ChannelRegistration>();
   const declared = new Map<ChannelAdapterId, Set<ComponentId>>();
 
+  /**
+   * 실행할 시나리오 조회 — **배포본 경로가 있으면 그것만 쓴다**(§5.3).
+   *
+   * 두 경로를 섞지 않는 것이 요점이다. `forChannel` 이 미배포라고 답했을 때 `get` 으로
+   * 되물으면, 배포하지 않은 버전이 "그래도 하나 있으니" 통화에 나간다 — 배포 게이트를
+   * 둔 의미가 사라지고, 그 사고는 예외 없이 "왜 이 버전이 돌고 있지"로만 나타난다.
+   */
+  function resolveFlow(flowId: string, channel: ChannelKind, version?: number): Flow | undefined {
+    const reg = opts.flows;
+    if (typeof reg.forChannel === 'function') return reg.forChannel(flowId, channel, version);
+    return reg.get(flowId, version);
+  }
+
+  /** 조회 실패 사유. 사유를 모르는 조회면 빈 문자열이다 — 없는 사유를 지어내지 않는다(§13-3). */
+  function flowResolution(flowId: string, channel: ChannelKind, version?: number): FlowResolution | undefined {
+    const reg = opts.flows;
+    if (typeof reg.explain !== 'function') return undefined;
+    try {
+      return reg.explain(flowId, channel, version);
+    } catch {
+      // 사유 조회가 예외로 끝난 것 때문에 세션이 끊기면 안 된다 — 사유가 없는 것으로 본다.
+      return undefined;
+    }
+  }
+
+  function flowReasonKo(flowId: string, channel: ChannelKind, version?: number): string {
+    const r = flowResolution(flowId, channel, version);
+    return r === undefined || r.code === 'ok' ? '' : `${r.code}: ${r.reasonKo}`;
+  }
+
+  /**
+   * 배포본으로 골랐는데 어긋난 사실이 있으면 드러낸다. 실행을 막지는 않는다 —
+   * 지정본 실행과 단계 불일치는 운영 판단일 수 있지만, **아무도 모르는 채로 돌아가는 것**은 아니다.
+   */
+  function noteFlowResolution(flowId: string, channel: ChannelKind, version?: number): void {
+    const r = flowResolution(flowId, channel, version);
+    if (r === undefined || r.code !== 'ok') return;
+    if (r.pinned && r.deployedVersion !== undefined && r.deployedVersion !== r.version) {
+      warnOnce('W_FLOW_NOT_DEPLOYED',
+        `${channel} 채널이 배포본(v${r.deployedVersion})이 아닌 지정본 v${r.version} 으로 ${flowId} 를 실행했습니다 — `
+        + '채널이 버전을 지정하면 배포·롤백이 그 채널에 닿지 않습니다(§5.3).');
+    }
+    if (r.staleStage !== undefined) {
+      warnOnce('W_FLOW_NOT_DEPLOYED',
+        `${channel} 채널 배포가 가리키는 ${flowId} v${r.version} 의 단계가 published 가 아닙니다(stage=${r.staleStage}) — `
+        + '배포 기록과 리비전 단계가 어긋나 있습니다(§5.3).');
+    }
+  }
+
+  /**
+   * 인텐트 라우팅이 쓰는 채널 고정 조회. 라우트가 가리키는 시나리오도 세션 시작과 **같은 경로**로
+   * 고른다 — 여기만 빠뜨리면 시작은 배포본인데 인텐트로 갈아탄 시나리오는 미배포 편집본이 된다.
+   */
+  function channelFlows(channel: ChannelKind): FlowLookup {
+    return { get: (flowId, version) => resolveFlow(flowId, channel, version) };
+  }
+
+  if (typeof opts.flows.forChannel !== 'function') {
+    // 종전 동작이므로 막지 않는다. 다만 이 상태에서 일어나는 일은 조용하고 되돌리기 어렵다 —
+    // 편집본이 저장되는 순간 신규 통화에 나가고, 롤백을 눌러도 런타임은 여전히 번호가 가장
+    // 높은 버전을 돌린다(운영자는 "되돌렸다"를 보고 있다).
+    warnings.push({
+      code: 'W_FLOW_DEPLOYMENT_UNBOUND',
+      severity: 'warning',
+      messageKo: '시나리오 조회에 채널별 배포본 경로(forChannel)가 없습니다 — 버전 선택이 stage 와 무관하게 '
+        + '가장 높은 번호로 이루어집니다(§5.3). 이 상태에서는 스튜디오 편집본(draft)이 신규 통화에 나갈 수 있고, '
+        + '검증·승인 게이트와 채널별 롤백이 런타임에 닿지 않습니다. 배포를 Core 밖에서 관리한다면 이 경고는 그 사실의 기록입니다.',
+    });
+  }
+
   // 잘못된 재프롬프트 정책은 통화 중이 아니라 여기서 걸러야 한다 —
   // 빈 대본은 고객에게 무음으로 나가고, 무음은 장애와 구분되지 않는다.
   if (opts.reprompt !== undefined) {
@@ -410,6 +480,18 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     const policyErrors = validateIntentPolicy(it.policy);
     if (policyErrors.length > 0) throw new Error(`인텐트 정책 거부: ${policyErrors.join(' / ')}`);
 
+    // 라우트가 가리키는 시나리오의 **사유를 아는** 조회면 `validateIntentRouting` 보다 먼저 본다.
+    // 그 함수는 조회가 비면 "없는 시나리오"라고 적는데, 편집본만 있거나 버전이 어긋난 경우
+    // 그건 **틀린 진단**이다 — 운영자는 오타를 찾으러 가고 원인은 승인 누락이다.
+    // `not_deployed` 는 단계적 배포(§5.3)의 정상 상태이므로 여기서 막지 않는다(아래에서 경고로 남는다).
+    for (const route of it.table.routes) {
+      for (const reg of opts.channels) {
+        const r = flowResolution(route.flowId, reg.port.capabilities.channel, route.flowVersion);
+        if (r === undefined || r.code === 'ok' || r.code === 'not_deployed' || r.code === 'no_revision') continue;
+        throw new Error(`인텐트 라우팅 거부: ${route.intent} → ${route.flowId} (${r.code}: ${r.reasonKo})`);
+      }
+    }
+
     const rIssues = validateIntentRouting(it.table, it.catalog, opts.flows);
     if (!intentRoutingOk(rIssues)) {
       throw new Error(`인텐트 라우팅 거부: ${rIssues.filter((i) => i.severity === 'error').map((i) => i.messageKo).join(' / ')}`);
@@ -421,9 +503,28 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     // 여기서 안 보면 그 시나리오는 **인텐트가 확정된 통화 한복판에서** 처음 검증되고,
     // 렌더 불가 노드·오타 커넥터는 그때 막힌다 — 고객은 이미 회선에 있다.
     for (const route of it.table.routes) {
-      const flow = opts.flows.get(route.flowId, route.flowVersion);
-      if (!flow) continue;                       // 위 검증이 이미 오류로 잡았다
+      // 채널마다 따로 본다 — 배포 단위가 "(Flow, 채널)"이므로 같은 라우트가 콜봇에서는 되고
+      // 챗봇에서는 안 되는 상태가 §5.3 의 **정상** 운영이다(단계적 배포).
+      const resolved = new Set<Flow>();
       for (const reg of opts.channels) {
+        const ch = reg.port.capabilities.channel;
+        const flow = resolveFlow(route.flowId, ch, route.flowVersion);
+        if (!flow) {
+          // 리비전이 아예 없는 경우는 위 `validateIntentRouting` 이 이미 오류로 잡았다.
+          // 여기 남는 것은 "있는데 이 채널에 배포되지 않았다" — 막지 않고 드러낸다.
+          // 그 채널에서 이 인텐트가 확정되면 `unrouted` 로 이관되며, 그때 원인을 알 수 있어야 한다.
+          const reasonKo = flowReasonKo(route.flowId, ch, route.flowVersion);
+          if (reasonKo !== '') {
+            warnings.push({
+              code: 'W_FLOW_NOT_DEPLOYED',
+              severity: 'warning',
+              messageKo: `인텐트 ${route.intent} → ${route.flowId} 를 ${ch} 채널에서 시작할 수 없습니다(${reasonKo}). `
+                + '그 채널에서 이 인텐트가 확정되면 상담사 이관으로 떨어집니다(§5.3).',
+            });
+          }
+          continue;
+        }
+        resolved.add(flow);
         const unsupported = checkFlowSupported(flow, reg.port.capabilities).filter((i) => i.severity === 'error');
         if (unsupported.length > 0) {
           throw new Error(
@@ -433,12 +534,14 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
         }
       }
       if (opts.connectors) {
-        const missing = missingConnectors(flow, opts.connectors.connectors);
-        if (missing.length > 0) {
-          throw new Error(
-            `인텐트 라우팅 거부: ${route.intent} → ${flow.id} 에 선언되지 않은 커넥터가 있습니다: `
-            + missing.map((m) => `${m.nodeId}→${m.connectorId}`).join(', ') + ' (설계서 §6.1)',
-          );
+        for (const flow of resolved) {
+          const missing = missingConnectors(flow, opts.connectors.connectors);
+          if (missing.length > 0) {
+            throw new Error(
+              `인텐트 라우팅 거부: ${route.intent} → ${flow.id} 에 선언되지 않은 커넥터가 있습니다: `
+              + missing.map((m) => `${m.nodeId}→${m.connectorId}`).join(', ') + ' (설계서 §6.1)',
+            );
+          }
         }
       }
     }
@@ -754,7 +857,9 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     const outcome = await resolveIntentEntry(
       {
         catalog: binding.catalog, policy: binding.policy, table: binding.table,
-        flows: opts.flows, classifier: binding.classifier, clarifyPrompt: binding.clarifyPrompt,
+        // 인텐트로 갈아타는 시나리오도 세션 시작과 **같은 경로**로 고른다 — 여기만 빠뜨리면
+        // 시작은 배포본인데 인텐트가 고른 시나리오는 미배포 편집본이 된다.
+        flows: channelFlows(rec.state.channel), classifier: binding.classifier, clarifyPrompt: binding.clarifyPrompt,
       },
       {
         scope: rec.scope, channel: rec.state.channel, text,
@@ -1049,10 +1154,19 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       const reg = registration(req.adapter);
       if (req.joinInteractionId !== undefined) return join(req, req.joinInteractionId);
 
-      const flow = opts.flows.get(req.flowId, req.flowVersion);
+      const channel = ADAPTER_CHANNEL[req.adapter];
+      // 배포본 경로가 있으면 **이 채널에 걸린 버전**을 고른다(§5.3). 없으면 종전과 같다(§13-3).
+      const flow = resolveFlow(req.flowId, channel, req.flowVersion);
       if (!flow) {
-        throw new Error(`시나리오를 찾을 수 없습니다: ${req.flowId}${req.flowVersion !== undefined ? ` v${req.flowVersion}` : ''} (§5.3)`);
+        // 사유를 아는 조회면 그대로 싣는다 — "찾을 수 없습니다" 하나로 미배포·미승인·오타를
+        // 뭉개면 운영자는 오타를 찾으러 가고 원인은 배포 누락이다.
+        const reasonKo = flowReasonKo(req.flowId, channel, req.flowVersion);
+        throw new Error(
+          `시나리오를 찾을 수 없습니다: ${req.flowId}${req.flowVersion !== undefined ? ` v${req.flowVersion}` : ''}`
+          + `${reasonKo !== '' ? ` — ${reasonKo}` : ''} (§5.3)`,
+        );
       }
+      noteFlowResolution(req.flowId, channel, req.flowVersion);
       const unsupported = checkFlowSupported(flow, reg.port.capabilities).filter((i) => i.severity === 'error');
       if (unsupported.length > 0) {
         // 렌더 불가 노드를 가진 시나리오는 시작하지 않는다 — 통화 중간에 막히는 것이 더 나쁘다(§5.3).
@@ -1077,7 +1191,6 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
         }
       }
 
-      const channel = ADAPTER_CHANNEL[req.adapter];
       const interactionId = newId(req);
       const rec: SessionRecord = {
         interactionId, adapter: req.adapter, scope: req.scope, flow,
