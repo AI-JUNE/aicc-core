@@ -13,6 +13,7 @@ import type { ChannelKind, Handoff, Interaction, Turn } from '../domain/types.ts
 import { resolveOutcome } from '../domain/types.ts';
 import type { Flow, RenderedStep } from '../flow/types.ts';
 import { isIntentEntryNode, renderNode } from '../flow/types.ts';
+import type { FlowResolution } from '../flow/deployedFlows.ts';
 import type { FlowInput, FlowState, IntentTurnInput, RunResult, RunStatus, RunnerContext } from '../flow/runner.ts';
 import {
   start as runnerStart, send as runnerSend,
@@ -43,7 +44,7 @@ import type { ConnectorPumpBinding } from '../integration/connectorPump.ts';
 import { connectorHopLimit, hopLimitInput, missingConnectors, pumpConnectorHop } from '../integration/connectorPump.ts';
 import type { IntentCatalog, IntentPolicy } from '../nlu/intent.ts';
 import { validateIntentCatalog, validateIntentPolicy } from '../nlu/intent.ts';
-import type { IntentRoutingTable } from '../nlu/intentRouting.ts';
+import type { FlowLookup, IntentRoutingTable } from '../nlu/intentRouting.ts';
 import { intentRoutingOk, validateIntentRouting } from '../nlu/intentRouting.ts';
 import type { ClassifyStatus, IntentClassifier } from '../nlu/llmClassifier.ts';
 import type { PendingClarify } from '../nlu/executeIntentEntry.ts';
@@ -54,11 +55,34 @@ import type {
 } from './contract.ts';
 import { ADAPTER_CHANNEL, CHANNEL_CONTRACT_VERSION, checkFlowSupported, registrationOk, validateRegistration } from './contract.ts';
 
-/** 시나리오 조회. 버전을 지정하지 않으면 가장 높은 버전을 준다(§5.3 배포 수명주기와 맞물린다). */
+/**
+ * 시나리오 조회(§5.3).
+ *
+ * `forChannel` 이 있으면 **실행 경로는 그것만 쓴다** — 배포 단위가 "(Flow, 채널)"이므로
+ * 채널을 모르는 조회로는 "지금 무엇이 돌고 있는가"에 답할 수 없다. `aicc-core/internal/flow/
+ * deployedFlows` 의 `createDeployedFlowRegistry` 가 그 구현이다.
+ *
+ * `get` 만 있는 구현(아래 `createMemoryFlowRegistry` 포함)도 **종전과 완전히 같이** 동작한다 —
+ * 다만 그 경로는 stage 를 보지 않으므로 편집본(draft)이 번호만 높으면 그대로 운영에 나가고,
+ * 채널별 배포·롤백이 런타임에 닿지 않는다. 그 사실은 등록 시 `W_FLOW_DEPLOYMENT_UNBOUND`
+ * 경고로 남긴다(§13-3 — 막지는 않되 조용히 두지도 않는다).
+ */
 export interface FlowRegistry {
   get(flowId: string, version?: number): Flow | undefined;
+  /** 채널별 배포본. 있으면 세션 시작·인텐트 라우팅이 모두 이 경로를 쓴다. */
+  forChannel?(flowId: string, channel: ChannelKind, version?: number): Flow | undefined;
+  /**
+   * 조회 실패 사유. 없으면 런타임은 "찾을 수 없습니다"로만 적는데, 그러면 **미배포와 오타가
+   * 같은 문장으로 남는다** — 운영자는 오타를 찾으러 가고 원인은 미배포다.
+   */
+  explain?(flowId: string, channel: ChannelKind, version?: number): FlowResolution;
 }
 
+/**
+ * 단일 프로세스·고정 시나리오용 조회. 같은 flowId 의 리비전이 여럿이면 **가장 높은 번호**를
+ * 돌려주며 **stage 를 보지 않는다** — 배포 수명주기(§5.3)를 Core 밖에서 관리하는 호스트용이다.
+ * 스튜디오 편집·승인·채널별 배포를 Core 가 관리해야 하면 `createDeployedFlowRegistry` 를 쓴다.
+ */
 export function createMemoryFlowRegistry(flows: Flow[]): FlowRegistry {
   const byId = new Map<string, Flow[]>();
   for (const f of flows) {
