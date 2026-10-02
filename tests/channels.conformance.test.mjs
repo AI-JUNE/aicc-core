@@ -382,3 +382,67 @@ test('INTENT_CLARIFY: 음성은 번호 안내와 DTMF 수용이 실린다', b, a
   assert.equal(clarify.acceptDtmf, true);
   assert.match(clarify.text, /1번 잔액 조회/);
 });
+
+// ── 지식 응대 답변 (§5.2) ────────────────────────────────────────────────────
+// 지식 응대를 켜는 것도 설정 변경이다. 그 순간 첫 답변에서 통화가 깨지면 안 되고,
+// 각주 번호가 본문과 어긋나면 고객은 **다른 출처**를 보게 된다(예외 없이 일어난다).
+
+test('KNOWLEDGE_ANSWER: 각주가 붙은 답변 단계를 흡수하는 구현은 3채널 모두 통과한다', b, async () => {
+  for (const id of ['callbot', 'chatbot', 'dars']) {
+    const port = m.createDryRunPort({ id });
+    const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+    const c = r.checks.find((x) => x.id === 'KNOWLEDGE_ANSWER');
+    assert.equal(c.passed, true, `${id}: ${c.messageKo}`);
+    assert.equal(c.severity, 'error');
+    assert.notEqual(c.skipped, true);
+  }
+});
+
+test('KNOWLEDGE_ANSWER: 모르는 필드에서 던지는 포트를 잡는다 — 고지·명확화 검사는 통과하는 구현이다', b, async () => {
+  // 단계 스키마를 엄격히 잠근 구현이다. 지식 응대를 켜는 날 첫 답변에서만 죽는다.
+  const port = m.createDryRunPort({ id: 'chatbot' });
+  port.present = async (_id, steps) => {
+    for (const s of steps) {
+      for (const k of Object.keys(s)) {
+        if (!['channel', 'nodeId', 'kind', 'text', 'ui', 'acceptDtmf', 'reprompt', 'inputTimeoutMs', 'bargeIn', 'disclosure', 'silent', 'awaitConnectorId', 'transferTo'].includes(k)) {
+          throw new Error(`알 수 없는 필드: ${k}`);
+        }
+      }
+    }
+  };
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  assert.equal(r.checks.find((c) => c.id === 'AI_DISCLOSURE').passed, true);
+  assert.equal(r.checks.find((c) => c.id === 'INTENT_CLARIFY').passed, true);
+  const c = r.checks.find((x) => x.id === 'KNOWLEDGE_ANSWER');
+  assert.equal(c.passed, false);
+  assert.match(c.messageKo, /모르는 필드\(citations\)는 무시하세요/);
+  assert.equal(r.passed, false);
+});
+
+test('KNOWLEDGE_ANSWER: 각주를 다시 번호 매기는 포트를 잡는다 — 본문의 [n] 과 어긋난다', b, async () => {
+  const port = m.createDryRunPort({ id: 'dars' });
+  const inner = port.present.bind(port);
+  port.present = async (iid, steps) => {
+    for (const s of steps) {
+      // "표시 순서대로 1번부터 다시 매기는 게 보기 좋다" — 본문은 그대로다.
+      if (s.citations) s.citations.forEach((c, i) => { c.marker = i + 10; });
+    }
+    return inner(iid, steps);
+  };
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  const c = r.checks.find((x) => x.id === 'KNOWLEDGE_ANSWER');
+  assert.equal(c.passed, false);
+  assert.match(c.messageKo, /인용 번호는 답변 본문과 짝이므로/);
+});
+
+test('KNOWLEDGE_ANSWER: 답변 단계의 nodeId 는 시나리오에 없고 각주는 최소한만 싣는다', b, async () => {
+  const seen = [];
+  const port = m.createDryRunPort({ id: 'chatbot' });
+  const inner = port.present.bind(port);
+  port.present = async (iid, steps) => { seen.push(...steps); return inner(iid, steps); };
+  await m.runChannelConformance({ port, timeoutMs: 500, flows: [flow()] });
+  const answer = seen.find((s) => s.nodeId === '__answer');
+  assert.equal(answer.kind, 'Say');
+  assert.equal(flow().nodes[answer.nodeId], undefined);
+  assert.deepEqual(Object.keys(answer.citations[0]).sort(), ['marker', 'sourceUri', 'title']);
+});

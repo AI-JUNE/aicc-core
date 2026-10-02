@@ -19,6 +19,7 @@ import { maskPii } from '../core/policyGuard.ts';
 import type { SwitchTicket } from '../core/executeSwitch.ts';
 import { DISCLOSURE_NODE_ID } from '../core/executeDisclosure.ts';
 import { CLARIFY_NODE_ID, renderClarifyStep } from '../nlu/executeIntentEntry.ts';
+import { ANSWER_NODE_ID, renderAnswerStep } from '../knowledge/executeKnowledge.ts';
 import type {
   ChannelAdapterId, ChannelCapabilities, ChannelPort, ChannelRegistration,
 } from './contract.ts';
@@ -42,7 +43,8 @@ export type ConformanceCheckId =
   | 'CONNECTOR_WAIT'      // 한 턴에 present 가 두 번 와도(대기 안내 → 결과) 되는가(§6.1)
   | 'CHANNEL_INVITE'      // 전환 초대에 티켓이 실려도 흡수하는가 — 링크는 토큰으로 만든다(§5.2·§10.3)
   | 'AI_DISCLOSURE'       // 시나리오 노드가 아닌 AI 고지 단계를 그대로 내보내는가(§10.1·§7 7.4)
-  | 'INTENT_CLARIFY';     // 시나리오에 없는 **선택지 단계**(명확화)를 렌더할 수 있는가(§5.1)
+  | 'INTENT_CLARIFY'      // 시나리오에 없는 **선택지 단계**(명확화)를 렌더할 수 있는가(§5.1)
+  | 'KNOWLEDGE_ANSWER';   // 각주(`citations`)가 붙은 지식 응대 답변 단계를 흡수하는가(§5.2)
 
 export interface ConformanceCheck {
   id: ConformanceCheckId;
@@ -492,7 +494,41 @@ export async function runChannelConformance(opts: ConformanceOptions): Promise<C
     });
   }
 
-  // 15) 시나리오 렌더 가능성(§5.3) — 능력 선언과 실제 시나리오가 어긋나면 배포 후에야 드러난다.
+  // 15) 지식 응대 답변(§5.2) — 지식 배선을 켜면 **시나리오에 없는 답변 단계**가 나가고,
+  //     그 단계에는 각주(`citations`)가 더 붙는다. AI_DISCLOSURE·INTENT_CLARIFY 와 같은 함정이지만
+  //     여기서 깨지는 구현은 또 다르다: 모르는 필드를 보고 검증 예외를 던지는 포트(스키마를 엄격히
+  //     잠근 구현)는 **지식 응대를 켜는 날** 첫 답변에서 죽고, 그것도 코드 배포가 아니라 설정 변경으로
+  //     죽는다. 더 조용한 실패는 그 다음이다 — 각주를 **다시 번호 매기는** 포트는 예외 없이 동작하면서
+  //     본문의 `[1]` 과 화면의 각주를 어긋나게 만들어, 고객이 다른 출처를 보게 된다. 그건 포트 안에서
+  //     일어나는 일이라 검사할 수 없으므로 실패 문구에 못박아 둔다.
+  //     단계는 실제 렌더 함수로 만든다 — 검사용으로 손수 지으면 진짜 단계와 모양이 갈라진다.
+  {
+    const steps: RenderedStep[] = [renderAnswerStep(
+      '수수료는 면제입니다 [1]. 자세한 내용은 안내문을 확인해 주세요 [2].',
+      [
+        { marker: 1, chunkId: 'c1', docId: 'd1', title: '수수료 안내', sourceUri: 'kb://fee', score: 0.91 },
+        { marker: 2, chunkId: 'c2', docId: 'd2', title: '이용 안내', score: 0.82 },
+      ],
+      channel,
+    )];
+    const snapshot = JSON.stringify(steps);
+    const r = await withBudget(() => port.present('i_probe_answer', steps), budget);
+    const unchanged = JSON.stringify(steps) === snapshot;
+    add({
+      id: 'KNOWLEDGE_ANSWER',
+      passed: r.ok === true && unchanged,
+      severity: 'error',
+      messageKo: r.ok === true && unchanged
+        ? '각주가 붙은 지식 응대 답변 단계를 흡수하고 변형하지 않습니다(§5.2). 이 단계는 시나리오 노드가 아니므로 '
+          + `\`flow.nodes['${ANSWER_NODE_ID}']\` 는 없습니다 — 각주를 쓰려면 \`citations\` 의 번호를 그대로 쓰세요(다시 매기면 본문의 [n] 과 어긋납니다).`
+        : !unchanged
+          ? '답변 단계를 present 가 변형했습니다. 인용 번호는 답변 본문과 짝이므로 채널이 고쳐 쓸 수 없습니다(§5.2).'
+          : `지식 응대 답변 단계에서 실패했습니다: ${'timeout' in r ? '예산 초과' : errText((r as { error: unknown }).error)}. `
+            + '모르는 필드(citations)는 무시하세요 — 지식 응대를 켜는 순간 전 답변이 깨집니다(§5.2).',
+    });
+  }
+
+  // 16) 시나리오 렌더 가능성(§5.3) — 능력 선언과 실제 시나리오가 어긋나면 배포 후에야 드러난다.
   if (!opts.flows || opts.flows.length === 0) {
     add({ id: 'FLOW_SUPPORT', passed: true, skipped: true, severity: 'warning', messageKo: 'flows 미지정 — 시나리오 렌더 가능 여부를 검사하지 않았습니다(§5.3).' });
   } else {

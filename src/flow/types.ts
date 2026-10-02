@@ -41,6 +41,34 @@ export function isIntentEntryNode(node: FlowNode | undefined): node is CollectNo
   return node !== undefined && node.kind === 'Collect' && node.slot === INTENT_SLOT;
 }
 
+/**
+ * 지식 응대 진입 노드 표시(§5.2·§5.3). 이 슬롯을 수집하는 `Collect` 노드는 "무엇이 궁금하신가요?"이며,
+ * 고객의 답은 **슬롯 값이 아니라 질문**으로 해석된다 — 런타임에 지식 응대가 배선된 경우에 한한다.
+ *
+ * 인텐트 진입 노드와 **같은 이유로** 새 노드 종류를 만들지 않았다(위 `INTENT_SLOT` 참고):
+ * 채널 3곳이 `step.kind` 로 분기하고 있어 새 종류를 내보내는 순간 설정을 바꾼 날 전 통화가 깨진다.
+ *
+ * 배선이 없으면 종전과 완전히 같다(§13-3) — 평범한 Collect 로 동작해 질문을 이 슬롯에 담고
+ * 다음 노드로 간다. 배선이 있으면 **마스킹을 지난 질문**이 같은 슬롯에 담긴다(§10.3).
+ */
+export const KNOWLEDGE_SLOT = '__question__';
+
+/** 이 노드가 지식 응대 진입 노드인가. 판정은 한 곳에만 둔다(위와 같은 이유). */
+export function isKnowledgeEntryNode(node: FlowNode | undefined): node is CollectNode {
+  return node !== undefined && node.kind === 'Collect' && node.slot === KNOWLEDGE_SLOT;
+}
+
+/**
+ * 답변 각주(§5.2). 화면·말풍선에 "[1] 수수료 안내"로 붙는 값이며 **최소한만 싣는다** —
+ * 청크 id·문서 id·점수는 채널이 쓸 일이 없고, 각주에 내부 식별자가 섞이면 되돌릴 수 없다.
+ */
+export interface StepCitation {
+  /** 답변 본문의 `[n]` 과 같은 번호. 번호를 다시 매기면 본문과 각주가 어긋난다. */
+  marker: number;
+  title: string;
+  sourceUri?: string;
+}
+
 /** 채널별 렌더 결과 — Voice는 발화, Visual은 화면, Chat은 말풍선으로 변환된다 */
 export interface RenderedStep {
   channel: ChannelKind;
@@ -79,6 +107,15 @@ export interface RenderedStep {
    * (화면 상단 고정 배너·첫 발화 전) 표현을 달리할 수 있다.
    */
   disclosure?: { placement: DisclosurePlacement; configVersion: number };
+  /**
+   * 지식 응대 답변의 근거 각주(§5.2). 지식 응대가 배선된 테넌트의 답변 단계에만 실린다 —
+   * 이 필드가 없으면 종전과 완전히 같다(§13-3).
+   *
+   * 이 단계도 **시나리오 노드가 아니다**(`nodeId` 가 `flow.nodes` 에 없다). 모르는 포트는
+   * 텍스트만 내보내면 되고, 각주를 쓰는 포트는 이 목록 그대로 쓴다 — 번호를 다시 매기면
+   * 본문의 `[n]` 과 어긋나 고객이 다른 출처를 보게 된다.
+   */
+  citations?: StepCitation[];
 }
 
 export function renderNode(node: FlowNode, channel: ChannelKind): RenderedStep {

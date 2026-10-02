@@ -12,12 +12,12 @@
 import type { ChannelKind, Handoff, Interaction, Turn } from '../domain/types.ts';
 import { resolveOutcome } from '../domain/types.ts';
 import type { Flow, RenderedStep } from '../flow/types.ts';
-import { isIntentEntryNode, renderNode } from '../flow/types.ts';
+import { isIntentEntryNode, isKnowledgeEntryNode, renderNode } from '../flow/types.ts';
 import type { FlowResolution } from '../flow/deployedFlows.ts';
 import type { FlowInput, FlowState, IntentTurnInput, RunResult, RunStatus, RunnerContext } from '../flow/runner.ts';
 import {
   start as runnerStart, send as runnerSend,
-  clarifyTurn, handoffFromIntent, switchFlow,
+  clarifyTurn, handoffFromIntent, knowledgeTurn, switchFlow,
 } from '../flow/runner.ts';
 import type { RepromptPolicy } from '../flow/reprompt.ts';
 import { repromptPolicyOk, validateRepromptPolicy } from '../flow/reprompt.ts';
@@ -25,7 +25,7 @@ import type { TurnTimingPolicy } from '../flow/timing.ts';
 import { turnTimingPolicyOk, validateTurnTimingPolicy } from '../flow/timing.ts';
 import type { TenantScope } from '../core/tenancy.ts';
 import { assertTenantScope } from '../core/tenancy.ts';
-import type { EventMeta, InteractionEvent, TurnCompletedEvent, HandoffRequestedEvent } from '../events/schema.ts';
+import type { EventMeta, InteractionEvent, LatencyMs, TurnCompletedEvent, HandoffRequestedEvent } from '../events/schema.ts';
 import { sessionStarted, sessionEnded, handoffRequested } from '../events/schema.ts';
 import type { EventBus, PublishResult } from '../events/bus.ts';
 import type { ComponentId, FallbackDecision, FallbackPolicy, HealthRegistry, HealthSample } from '../ops/fallback.ts';
@@ -49,6 +49,12 @@ import { intentRoutingOk, validateIntentRouting } from '../nlu/intentRouting.ts'
 import type { ClassifyStatus, IntentClassifier } from '../nlu/llmClassifier.ts';
 import type { PendingClarify } from '../nlu/executeIntentEntry.ts';
 import { resolveIntentEntry } from '../nlu/executeIntentEntry.ts';
+import type { RetrievalPolicy } from '../knowledge/rag.ts';
+import { assertRetrievalPolicy } from '../knowledge/rag.ts';
+import type { Answerer } from '../knowledge/answer.ts';
+import type { Retriever } from '../knowledge/retrieval.ts';
+import type { KnowledgeFailureCause, KnowledgeUsage } from '../knowledge/executeKnowledge.ts';
+import { resolveKnowledgeTurn } from '../knowledge/executeKnowledge.ts';
 import type {
   ChannelAdapterId, ChannelHealthReport, ChannelRegistration, ChannelSessionRequest,
   ChannelTurnInput, ChannelTurnResult, ConversationCorePort, ContractIssue, ChannelCapabilities,
@@ -238,6 +244,49 @@ export interface IntentBinding {
   }) => void;
 }
 
+/**
+ * 지식 응대 배선(§5.2·§2). **주지 않으면 종전과 완전히 같다**(§13-3) —
+ * 지식 응대 진입 노드(`KNOWLEDGE_SLOT` 을 수집하는 Collect)는 평범한 Collect 로 동작해
+ * 고객의 질문을 슬롯 값으로 담고 다음 노드로 간다. 즉 **아무도 답하지 않는다**.
+ *
+ * 주면 Core 가 질문을 받아 근거를 찾고 인용까지 검증된 답변을 만든다
+ * (`knowledge/executeKnowledge.ts` → `retriever` → `answerer`).
+ * 이 배선이 없으면 `knowledge/retrieval.ts`·`knowledge/answer.ts` 는 저장소에 있으나
+ * **아무도 부르지 않는** 상태로 남고, 채널 3곳이 각자 프롬프트와 실패 처리를 짜게 된다(§2).
+ */
+export interface KnowledgeBinding {
+  /** 질의 → 근거(§6.2). 주입이다 — 실엔진·실 벡터 DB 연결은 호스트 쪽이다 **[승인 필요]**. */
+  retriever: Retriever;
+  /** 근거 → 답변(§6.2). 같은 이유로 주입이다 **[승인 필요]**. */
+  answerer: Answerer;
+  /** 근거 판정 정책(§5.2). 기본값 없음 — 성립하지 않는 정책은 **생성 시점에** 거부한다(§13-3). */
+  policy: RetrievalPolicy;
+  /**
+   * 이번 지식 턴에 드러난 것을 호스트에 그대로 올린다(삼키지 않는다).
+   * **성공한 턴도 올린다** — 실측(§11.2)은 성공 경로에만 있고, 실패만 올리면 임베딩·LLM
+   * 비용 근거가 사라진다. 실측은 문자·건수뿐이다(토큰은 어댑터가 주지 않으므로 만들지 않는다).
+   *
+   * `cause` 는 **장애와 '근거 없음'을 갈라서** 받는다 — 합치면 지식베이스가 통째로
+   * 내려가 있어도 운영 화면은 "고객이 없는 걸 물어봤다"로만 보인다.
+   *
+   * 엔진 헬스 샘플은 여기서 만들지 않는다 — 엔진 상태는 `adapters/resilience.ts` 가
+   * 이미 적는다. 두 곳에서 적으면 한 번의 장애가 두 번 집계된다(§2·§9.3).
+   */
+  onResult?: (r: {
+    interactionId: string;
+    answered: boolean;
+    /** 답하지 못한 경우에만 실린다. */
+    cause?: KnowledgeFailureCause;
+    /** 지식 응대 경로가 고장난 것인가. 설정 오류는 **장애가 아니다**. */
+    infraFailed: boolean;
+    /** 일부 지식베이스가 빠진 채 판정·응답했다. */
+    partial: boolean;
+    citations: number;
+    reasonKo: string;
+    usage: KnowledgeUsage;
+  }) => void;
+}
+
 export interface ConversationCoreOptions {
   scope: TenantScope;
   flows: FlowRegistry;
@@ -276,6 +325,12 @@ export interface ConversationCoreOptions {
   channelSwitch?: ChannelSwitchBinding;
   /** 인텐트 진입(§5.1·§5.3). 미지정 시 인텐트 진입 노드는 평범한 Collect 로 동작한다(§13-3). */
   intent?: IntentBinding;
+  /**
+   * 지식 응대(§5.2). 미지정 시 지식 응대 진입 노드는 평범한 Collect 로 동작하며,
+   * 그 사실이 `W_KNOWLEDGE_UNBOUND` 경고로 남는다(§13-3) — 증상은 예외가 아니라
+   * **고객의 질문이 슬롯 값으로 저장된 채 흐름이 넘어가는 것**이다.
+   */
+  knowledge?: KnowledgeBinding;
   /**
    * AI 고지(§10.1·§7 7.4). **주지 않으면 종전과 완전히 같다**(§13-3) — 고지는 나가지 않고,
    * 그 사실이 `W_AI_DISCLOSURE_UNBOUND` 경고로 남는다.
@@ -544,6 +599,25 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
           }
         }
       }
+    }
+  }
+
+  // 지식 응대 배선도 **배포 시점에** 거른다. 성립하지 않는 정책(minHits > topK 등)을 통과시키면
+  // 통화 중에 `config_error` 로만 나타나고, 그 상태의 증상은 "모든 질문에 답을 못 한다"다 —
+  // 장애로 보이지 않아서 더 오래 산다(라우팅·전환·인텐트 배선과 같은 규칙).
+  if (opts.knowledge !== undefined) {
+    const kb = opts.knowledge;
+    if (!kb.retriever || typeof kb.retriever.retrieve !== 'function') {
+      throw new Error('지식 응대 배선 거부: 검색기(retriever)가 없습니다 — Core 는 벡터 스토어를 직접 부르지 않습니다 (설계서 §6.2)');
+    }
+    if (!kb.answerer || typeof kb.answerer.answer !== 'function') {
+      throw new Error('지식 응대 배선 거부: 답변기(answerer)가 없습니다 — Core 는 엔진을 직접 부르지 않습니다 (설계서 §6.2)');
+    }
+    try {
+      // 판정 규칙을 복사하지 않는다 — 정책 검증은 `assertRetrievalPolicy` 하나다(§2).
+      assertRetrievalPolicy(kb.policy);
+    } catch (e) {
+      throw new Error(`지식 응대 배선 거부: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -838,9 +912,58 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
    *   되묻는 중이면 "2번"이 곧 선택이므로 그때는 선택지 해석으로 간다.
    * - **격리 위반은 삼키지 않는다**(§11.1) — 실행기가 던지는 유일한 경우이며 그대로 올린다.
    */
+  /**
+   * 지식 응대 턴(§5.2). 배선이 없으면 호출되지 않는다 — 그러면 질문은 슬롯 값이 된다(§13-3).
+   *
+   * 답하지 못했을 때 **문안을 만들지 않고** 미인식 입력으로 §5.1 사다리에 태운다.
+   * 사다리 규칙(몇 번 실패하면 화면·상담사로 가는가)은 `decideFallback` 하나이며 여기서
+   * 다시 쓰지 않는다(§2) — 지식 응대가 자기 사다리를 가지면 같은 통화에서 재시도 한도가
+   * 두 개가 되고, 고객은 어느 쪽 규칙으로 이관됐는지 알 수 없는 상태로 넘겨진다.
+   */
+  async function runKnowledgeTurn(
+    binding: NonNullable<ConversationCoreOptions['knowledge']>,
+    rec: SessionRecord, ctx: RunnerContext, input: FlowInput, text: string,
+    latency: { latency?: LatencyMs },
+  ): Promise<RunResult> {
+    const outcome = await resolveKnowledgeTurn(
+      { retriever: binding.retriever, answerer: binding.answerer, policy: binding.policy },
+      { scope: rec.scope, channel: rec.state.channel, text },
+    );
+    binding.onResult?.({
+      interactionId: rec.interactionId,
+      answered: outcome.kind === 'answer',
+      ...(outcome.kind === 'no_answer' ? { cause: outcome.cause, infraFailed: outcome.infraFailed } : { infraFailed: false }),
+      partial: outcome.partial,
+      citations: outcome.kind === 'answer' ? outcome.citations.length : 0,
+      reasonKo: outcome.reasonKo,
+      usage: outcome.usage,
+    });
+    if (outcome.kind === 'answer') {
+      return knowledgeTurn(rec.flow, rec.state, ctx, outcome.step, {
+        input, questionMasked: outcome.questionMasked,
+      });
+    }
+    return runnerSend(rec.flow, rec.state, { kind: 'unrecognized', text, ...latency }, ctx);
+  }
+
   async function runTurn(rec: SessionRecord, ctx: RunnerContext, input: FlowInput): Promise<RunResult> {
     const binding = opts.intent;
     const node = rec.state.currentNodeId === null ? undefined : rec.flow.nodes[rec.state.currentNodeId];
+    const knowledge = opts.knowledge;
+    if (knowledge && isKnowledgeEntryNode(node)) {
+      // 무입력·커넥터 결과는 질문이 아니다 — 종전 경로(§5.1 무입력 사다리)로 간다.
+      // **숫자도 질문이 아니다**: DTMF 로 지식베이스를 검색하면 비용(§11.2)만 쓰고 언제나
+      // 근거를 못 찾는다(번호 메뉴가 필요하면 `Choice` 노드를 쓴다).
+      if (input.kind === 'utterance') {
+        const latency = input.latency !== undefined ? { latency: input.latency } : {};
+        return runKnowledgeTurn(knowledge, rec, ctx, input, input.text, latency);
+      }
+      if (input.kind === 'dtmf') {
+        const latency = input.latency !== undefined ? { latency: input.latency } : {};
+        return runnerSend(rec.flow, rec.state, { kind: 'unrecognized', text: input.digits, ...latency }, ctx);
+      }
+      return runnerSend(rec.flow, rec.state, input, ctx);
+    }
     if (!binding || !isIntentEntryNode(node)) return runnerSend(rec.flow, rec.state, input, ctx);
     if (input.kind !== 'utterance' && input.kind !== 'dtmf') {
       // 무입력(timeout)·커넥터 결과는 인텐트가 아니다 — 종전 경로(§5.1 무입력 사다리)로 간다.
@@ -1179,6 +1302,14 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
         warnOnce('W_INTENT_UNBOUND',
           `시나리오 ${flow.id} v${flow.version} 에 인텐트 진입 노드가 있으나 인텐트 배선(intent)이 없습니다 — `
           + '고객의 답이 인텐트가 아니라 슬롯 값으로 저장됩니다(§5.1·§5.3).');
+      }
+      if (opts.knowledge === undefined && Object.values(flow.nodes).some((n) => isKnowledgeEntryNode(n))) {
+        // 지식 응대 진입 노드가 있는데 배선이 없다. 종전 동작이므로 막지 않되 조용히 두지도 않는다 —
+        // 이 상태에서 고객의 "수수료가 얼마예요"는 **슬롯 값으로 저장된 채** 흐름이 그대로 진행되고,
+        // **아무도 답하지 않는다**. 예외도 재프롬프트도 없어 어디서도 터지지 않는다(§5.2).
+        warnOnce('W_KNOWLEDGE_UNBOUND',
+          `시나리오 ${flow.id} v${flow.version} 에 지식 응대 진입 노드가 있으나 지식 배선(knowledge)이 없습니다 — `
+          + '고객의 질문이 답변 대신 슬롯 값으로 저장됩니다(§5.2).');
       }
       if (opts.connectors) {
         // 렌더 불가 노드와 같은 이유로 **시작 전에** 본다(§5.3). 커넥터 id 오타·미배포는 통화 중에

@@ -51,7 +51,7 @@ function fakePort(id = 'callbot', capsOver = {}, over = {}) {
   };
 }
 
-function build({ flows = [flowBilling], registry, port = fakePort(), ports, samples = [], policy = {}, components, reprompt, timing, routing, connectors, channelSwitch, disclosure, intent } = {}) {
+function build({ flows = [flowBilling], registry, port = fakePort(), ports, samples = [], policy = {}, components, reprompt, timing, routing, connectors, channelSwitch, disclosure, intent, knowledge } = {}) {
   const collector = B.createCollectorSink('t');
   const bus = B.createEventBus({
     scope: SCOPE, sinks: [collector],
@@ -77,6 +77,7 @@ function build({ flows = [flowBilling], registry, port = fakePort(), ports, samp
     ...(channelSwitch !== undefined ? { channelSwitch } : {}),
     ...(disclosure !== undefined ? { disclosure } : {}),
     ...(intent !== undefined ? { intent } : {}),
+    ...(knowledge !== undefined ? { knowledge } : {}),
   });
   return { core, port, collector, health };
 }
@@ -1548,4 +1549,183 @@ test('라우트가 어떤 채널에 미배포면 등록 시 드러내고, 통화
   assert.equal(after.status, 'transferred');
   assert.deepEqual(issues.map((i) => i.kind), ['unrouted']);
   assert.equal(port.log.some((l) => l[0] === 'transfer'), true);
+});
+
+// ── 지식 응대 배선(§5.2) ─────────────────────────────────────────────────────
+// 이 배선이 없으면 `knowledge/retrieval.ts`·`knowledge/answer.ts` 는 저장소에 있으나
+// **아무도 부르지 않는다** — 고객의 질문은 슬롯 값으로 저장되고 아무도 답하지 않는다.
+// 막는 사고는 대부분 예외가 아니라 조용한 오답이라 검사로 고정하지 않으면 드러나지 않는다.
+
+const KNOWLEDGE_SLOT = '__question__';
+const RAW_Q = '제 번호 010-1234-5678 수수료가 얼마예요?';
+const MASKED_Q = '제 번호 010-****-**** 수수료가 얼마예요?';
+const KB_CITATIONS = [{ marker: 1, chunkId: 'c1', docId: 'd1', title: '수수료 안내', sourceUri: 'kb://fee', score: 0.9 }];
+
+const flowFaq = {
+  id: 'faq', version: 1, startNodeId: 'ask',
+  nodes: {
+    ask: { id: 'ask', kind: 'Collect', slot: KNOWLEDGE_SLOT, prompt: '무엇이 궁금하신가요?', next: 'bye' },
+    bye: { id: 'bye', kind: 'Say', text: '감사합니다.' },
+  },
+};
+
+function retrieverOf(over = {}) {
+  const calls = [];
+  return {
+    calls,
+    contractVersion: 1,
+    engine: { name: 'fake-embed', residency: 'onprem' },
+    knowledgeBaseIds: ['kb_faq'],
+    async retrieve(query, policy) {
+      calls.push({ query, policy });
+      return {
+        status: 'grounded',
+        grounding: { grounded: true, context: '[1] 수수료는 면제입니다', citations: KB_CITATIONS, droppedForLength: 0 },
+        failures: [], partial: false, reasonKo: '근거 1건',
+        queryMasked: MASKED_Q, piiMasked: true,
+        usage: { embedChars: 20, storeQueries: 1, hits: 1, duplicatesDropped: 0 },
+        engine: { name: 'fake-embed', residency: 'onprem' },
+        ...over,
+      };
+    },
+  };
+}
+
+function answererOf(over = {}) {
+  const calls = [];
+  return {
+    calls,
+    contractVersion: 1,
+    engine: { name: 'fake-llm', residency: 'onprem' },
+    plan: () => ({ messages: [], promptChars: 0 }),
+    async answer(r) {
+      calls.push(r);
+      return {
+        status: 'ok', answerKo: '수수료는 면제입니다 [1].',
+        citations: KB_CITATIONS, usedMarkers: [1], unusedMarkers: [], invalidMarkers: [],
+        reasonKo: '근거 1건 중 1건을 인용한 답변',
+        engine: { name: 'fake-llm', residency: 'onprem' },
+        piiMaskedInAnswer: false, promptChars: 120, responseChars: 40,
+        ...over,
+      };
+    },
+  };
+}
+
+const KB_POLICY = { topK: 3, minScore: 0.5, minHits: 1, maxContextChars: 2000 };
+const kbBinding = (retriever, answerer, over = {}) => ({ retriever, answerer, policy: KB_POLICY, ...over });
+const faqReq = (over = {}) => req({ flowId: 'faq', ...over });
+
+test('지식 미배선: 종전과 완전히 같고(§13-3) 그 사실이 경고로 남는다', b, async () => {
+  const { core } = build({ flows: [flowFaq] });
+  const r = await core.start(faqReq());
+  const after = await core.send(r.interactionId, { input: { kind: 'utterance', text: RAW_Q } });
+  // 배선이 없으면 질문이 **슬롯 값**으로 저장되고 아무도 답하지 않는다 — 그 상태를 경고로 드러낸다.
+  assert.equal(after.state.slots[KNOWLEDGE_SLOT], RAW_Q);
+  assert.deepEqual(after.steps.map((s) => s.nodeId), ['bye']);
+  assert.equal(core.warnings().some((i) => i.code === 'W_KNOWLEDGE_UNBOUND'), true);
+});
+
+test('배선하면 질문에 답하고 그 단계가 채널로 나간다(§5.2)', b, async () => {
+  const rt = retrieverOf();
+  const an = answererOf();
+  const { core, port } = build({ flows: [flowFaq], knowledge: kbBinding(rt, an) });
+  const r = await core.start(faqReq());
+  const after = await core.send(r.interactionId, { input: { kind: 'utterance', text: RAW_Q } });
+  assert.deepEqual(after.steps.map((s) => s.nodeId), ['__answer', 'bye']);
+  assert.equal(after.steps[0].text, '수수료는 면제입니다 [1].');
+  assert.deepEqual(after.steps[0].citations, [{ marker: 1, title: '수수료 안내', sourceUri: 'kb://fee' }]);
+  assert.deepEqual(port.log.at(-1), ['present', 'i_test1', ['__answer', 'bye']]);
+  // 세션에는 **마스킹된 질문만** 남는다(§10.3) — 슬롯은 이관 요약으로 흘러간다.
+  assert.equal(after.state.slots[KNOWLEDGE_SLOT], MASKED_Q);
+  assert.equal(JSON.stringify(after.state.slots).includes('010-1234-5678'), false);
+  assert.equal(core.warnings().some((i) => i.code === 'W_KNOWLEDGE_UNBOUND'), false);
+  // 프롬프트로 나간 질문도 마스킹을 지난 값이다.
+  assert.equal(an.calls[0].questionMasked, MASKED_Q);
+});
+
+test('스토어 장애는 답변기를 부르지 않고 장애로 보고된다 — 통화는 §5.1 사다리로 살린다', b, async () => {
+  const reports = [];
+  const an = answererOf();
+  const rt = retrieverOf({
+    status: 'store_failed', grounding: undefined, errorCode: 'E_TIMEOUT',
+    failures: [{ knowledgeBaseId: 'kb_faq', code: 'E_TIMEOUT', reasonKo: '시간 초과' }],
+    reasonKo: '지식베이스 조회가 모두 실패했다(1곳) — 근거 없음이 아니다',
+  });
+  const { core } = build({ flows: [flowFaq], knowledge: kbBinding(rt, an, { onResult: (x) => reports.push(x) }) });
+  const r = await core.start(faqReq());
+  const after = await core.send(r.interactionId, { input: { kind: 'utterance', text: RAW_Q } });
+  assert.equal(an.calls.length, 0);
+  assert.equal(after.state.failCount, 1);                 // 사다리 한 칸 — 규칙은 Core 한 곳에만 있다
+  assert.equal(after.state.lastFailureReason, 'no_match');
+  assert.equal(after.state.currentNodeId, 'ask');         // 답하지 못했으니 넘어가지 않는다
+  assert.deepEqual(reports.map((x) => [x.answered, x.cause, x.infraFailed]), [[false, 'store_failed', true]]);
+});
+
+test('근거 없음은 장애로 보고하지 않는다 — 둘을 같은 값으로 적으면 장애가 묻힌다', b, async () => {
+  const reports = [];
+  const rt = retrieverOf({
+    status: 'not_grounded', grounding: undefined, reasonKo: '근거 신뢰도 미달',
+    notGrounded: { grounded: false, reason: 'below_threshold', reasonKo: '미달', filtered: {} },
+  });
+  const { core } = build({ flows: [flowFaq], knowledge: kbBinding(rt, answererOf(), { onResult: (x) => reports.push(x) }) });
+  const r = await core.start(faqReq());
+  await core.send(r.interactionId, { input: { kind: 'utterance', text: RAW_Q } });
+  assert.deepEqual(reports.map((x) => [x.cause, x.infraFailed]), [['not_grounded', false]]);
+});
+
+test('성공한 턴도 실측과 함께 보고된다 — 실패만 올리면 비용 근거가 사라진다(§11.2)', b, async () => {
+  const reports = [];
+  const { core } = build({ flows: [flowFaq], knowledge: kbBinding(retrieverOf(), answererOf(), { onResult: (x) => reports.push(x) }) });
+  const r = await core.start(faqReq());
+  await core.send(r.interactionId, { input: { kind: 'utterance', text: RAW_Q } });
+  assert.equal(reports.length, 1);
+  assert.equal(reports[0].answered, true);
+  assert.equal(reports[0].citations, 1);
+  assert.deepEqual(reports[0].usage, { embedChars: 20, storeQueries: 1, hits: 1, promptChars: 120, responseChars: 40 });
+  assert.equal(JSON.stringify(reports[0].usage).includes('token'), false);
+});
+
+test('숫자·무입력은 지식베이스를 검색하지 않는다 — 비용만 쓰고 언제나 근거가 없다(§11.2)', b, async () => {
+  const rt = retrieverOf();
+  const { core } = build({ flows: [flowFaq], knowledge: kbBinding(rt, answererOf()) });
+  const r = await core.start(faqReq());
+  const dtmf = await core.send(r.interactionId, { input: { kind: 'dtmf', digits: '1' } });
+  assert.equal(rt.calls.length, 0);
+  assert.equal(dtmf.state.failCount, 1);
+  const to = await core.send(r.interactionId, { input: { kind: 'timeout' } });
+  assert.equal(rt.calls.length, 0);
+  assert.equal(to.state.lastFailureReason, 'no_input');
+});
+
+test('지식 진입 노드가 아니면 종전 경로 그대로다(§13-3)', b, async () => {
+  const rt = retrieverOf();
+  const { core } = build({ knowledge: kbBinding(rt, answererOf()) });   // 평범한 Collect 시나리오
+  const r = await core.start(req());
+  const after = await core.send(r.interactionId, { input: { kind: 'utterance', text: '홍길동' } });
+  assert.equal(rt.calls.length, 0);
+  assert.equal(after.state.slots['customer_name'], '홍길동');
+});
+
+test('과금 근거는 지식 턴의 고객 발화에 붙는다(§11.2)', b, async () => {
+  const { core } = build({ flows: [flowFaq], knowledge: kbBinding(retrieverOf(), answererOf()) });
+  const r = await core.start(faqReq());
+  const after = await core.send(r.interactionId, {
+    input: { kind: 'utterance', text: RAW_Q }, usage: { llm_prompt_tokens: 7 },
+  });
+  const withUsage = after.events.filter((e) => e.type === 'turn.completed' && e.usage !== undefined);
+  assert.equal(withUsage.length, 1);
+  assert.equal(withUsage[0].speaker, 'customer');
+});
+
+test('배선 거부: 검색기·답변기 부재와 성립하지 않는 정책은 통화 전에 막는다', b, () => {
+  assert.throws(() => build({ flows: [flowFaq], knowledge: { answerer: answererOf(), policy: KB_POLICY } }), /지식 응대 배선 거부/);
+  assert.throws(() => build({ flows: [flowFaq], knowledge: { retriever: retrieverOf(), policy: KB_POLICY } }), /지식 응대 배선 거부/);
+  assert.throws(
+    () => build({
+      flows: [flowFaq],
+      knowledge: kbBinding(retrieverOf(), answererOf(), { policy: { topK: 2, minScore: 0.5, minHits: 5, maxContextChars: 100 } }),
+    }),
+    /지식 응대 배선 거부/,
+  );
 });

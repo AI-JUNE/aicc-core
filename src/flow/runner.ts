@@ -3,7 +3,7 @@
 // 실엔진·실회선은 호출하지 않는다(입력은 상위 계층이 어댑터로부터 받아 전달).
 import type { ChannelKind, Handoff, Outcome } from '../domain/types.ts';
 import type { Flow, FlowNode, RenderedStep } from './types.ts';
-import { INTENT_SLOT, renderNode } from './types.ts';
+import { INTENT_SLOT, KNOWLEDGE_SLOT, renderNode } from './types.ts';
 import { decideFallback, type FallbackAction } from '../core/session.ts';
 import { buildReprompt, classifyFailure, type FailureSignal, type RepromptPolicy, type RepromptReason } from './reprompt.ts';
 import { resolveTurnTiming, type TurnTimingPolicy } from './timing.ts';
@@ -319,6 +319,62 @@ export function clarifyTurn(
   events.push(turnCompleted(meta(s, ctx), {
     turnId: `t_${++s.turnCount}`, speaker: 'bot', utterance: step.text, nodeId: step.nodeId,
   }));
+  return { state: s, steps, events };
+}
+
+// ── 지식 응대 턴 (§5.2·§5.3) ─────────────────────────────────────────────────
+// 근거 검색·답변 생성·인용 검증은 Runner 밖에서 끝난다(엔진은 §6.2 어댑터 뒤, 판정은 `knowledge/`).
+// Runner 가 맡는 것은 그 결과를 **세션 상태와 §8.1 이벤트로 옮기는 일**뿐이다.
+
+/**
+ * 지식 응대로 답한 턴을 세션에 반영한다(§5.2).
+ *
+ * `clarifyTurn` 과 달리 **노드를 옮긴다** — 되묻는 것이 아니라 답한 것이므로, 다음에 무엇을
+ * 할지(추가 질문을 받을지·설문으로 넘길지)는 시나리오가 정한다. 그 판단을 Core 에 두면
+ * "한 번 더 물어보시겠어요?"라는 문안과 반복 한도가 Core 에 생기고, 둘 다 테넌트 값이다(§13-3).
+ *
+ * `questionMasked` 만 받는 이유: 세션 슬롯은 이관 요약·분석으로 흘러가므로(§2) 원문 질문이
+ * 들어가면 그 경로 전체가 마스킹 밖이 된다(§10.3). 마스킹은 검색 단계가 이미 했다 —
+ * 여기서 다시 하면 `maskPii` 가 멱등이 아니라 치환된 토큰이 또 뭉개진다.
+ *
+ * 실패 카운트는 **성공처럼 초기화한다**. 답을 받은 고객은 실패한 적이 없고, 남겨 두면
+ * 다음 턴의 첫 실패가 곧바로 사다리 두 칸째(화면 전환·이관)로 떨어진다.
+ */
+export function knowledgeTurn(
+  flow: Flow, prev: FlowState, ctx: RunnerContext, step: RenderedStep,
+  t: { input: FlowInput; questionMasked: string },
+): RunResult {
+  const s = clone(prev);
+  const steps: RenderedStep[] = [];
+  const events: InteractionEvent[] = [];
+  if (s.status !== 'running' || s.currentNodeId === null) return { state: s, steps, events };
+
+  const node: FlowNode | undefined = flow.nodes[s.currentNodeId];
+  if (!node) {
+    s.error = `정의되지 않은 노드: ${s.currentNodeId}`;
+    terminate(s, ctx, events, 'failed', 'FAILED');
+    return { state: s, steps, events };
+  }
+
+  // 고객 발화는 turnCompleted 내부에서 마스킹된다(§10.3).
+  events.push(turnCompleted(meta(s, ctx), {
+    turnId: `t_${++s.turnCount}`, speaker: 'customer', utterance: inputText(t.input), nodeId: node.id,
+    ...(s.failCount > 0 ? { retryCount: s.failCount } : {}),
+    latency: inputLatency(t.input),
+  }));
+
+  s.slots[KNOWLEDGE_SLOT] = t.questionMasked;
+  s.failCount = 0;
+  delete s.lastFallback;
+  delete s.lastFailureReason;
+
+  steps.push(step);
+  events.push(turnCompleted(meta(s, ctx), {
+    turnId: `t_${++s.turnCount}`, speaker: 'bot', utterance: step.text, nodeId: step.nodeId,
+  }));
+
+  s.currentNodeId = node.next ?? null;
+  advance(flow, s, ctx, steps, events);
   return { state: s, steps, events };
 }
 
