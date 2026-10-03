@@ -71,6 +71,23 @@ export interface UsageBucket {
   sessionsMissingBillableMs: number;
   /** 사용량(usage)이 붙지 않은 turn 수 — 어댑터가 실측을 채우지 않은 구간. */
   turnsMissingUsage: number;
+  /**
+   * 음성이 **아닌** 채널로 끝났는데 billable_ms 실측이 실려 있어 통화 시간 집계에서 제외한 세션 수.
+   *
+   * §5.2 전환으로 통화가 화면 채널에서 끝나면 `session.ended.channel` 이 voice 가 아니게 되고,
+   * 그 통화의 과금 구간은 여기로 떨어진다. **자동으로 통화 시간에 넣지 않는다** — 잘못 선언된
+   * 채팅 세션까지 통화로 청구하는 과다청구 경로가 열리기 때문이다. 대신 조용히 버리지도 않는다:
+   * 건수가 0 이 아니면 매출 누락이거나 채널의 선언 오류이며, 둘 다 사람이 봐야 한다(§13-3).
+   */
+  sessionsBillableMsOnNonVoice: number;
+  /**
+   * 실측으로 볼 수 없어 집계에서 뺀 사용량 **항목** 수(음수·NaN·무한·숫자 아님).
+   *
+   * 이벤트는 §8.1 원장에서 오고 원장에는 과거 호스트가 넣은 값도 남아 있다. 여기가 청구 직전의
+   * 마지막 방어선이라 0 으로도 그대로도 집계하지 않는다 — NaN 하나가 합계 전체를 NaN 으로 만들고,
+   * 그 상태에서는 `withinTolerance` 가 언제나 거짓이라 **과다청구 차단 판정까지 비껴간다**.
+   */
+  usageValuesRejected: number;
 }
 
 export interface UsageAggregate {
@@ -106,6 +123,8 @@ function newBucket(tenantId: string, bucket: string, channel: ChannelKind): Usag
     quantities: emptyQuantities(),
     sessionsMissingBillableMs: 0,
     turnsMissingUsage: 0,
+    sessionsBillableMsOnNonVoice: 0,
+    usageValuesRejected: 0,
   };
 }
 
@@ -146,14 +165,22 @@ export function aggregateUsage(events: InteractionEvent[], opts: AggregateOption
       const ended = e as SessionEndedEvent;
       const b = get(ended);
       b.quantities.sessions += 1;
+      // 실측이 있는지를 먼저 본다. NaN·Infinity 는 "있다"가 아니다 — 하나라도 합계에 들어가면
+      // 그 달의 모든 수량이 NaN 이 되고, NaN 비교는 언제나 거짓이라 과다청구 차단까지 비껴간다.
+      const measured = typeof ended.billable_ms === 'number'
+        && Number.isFinite(ended.billable_ms)
+        && ended.billable_ms >= 0;
       if (ended.channel === 'voice') {
-        if (typeof ended.billable_ms === 'number' && ended.billable_ms >= 0) {
-          const secs = ended.billable_ms / 1000;
+        if (measured) {
+          const secs = (ended.billable_ms as number) / 1000;
           b.quantities.voice_seconds += secs;
           b.quantities.voice_units += applyRounding(secs, opts.rounding);
         } else {
           b.sessionsMissingBillableMs += 1;
         }
+      } else if (measured) {
+        // 음성이 아닌 채널로 끝난 통화(§5.2 전환). 집계에 넣지 않되 버리지도 않는다 — 위 필드 주석 참조.
+        b.sessionsBillableMsOnNonVoice += 1;
       }
       continue;
     }
@@ -165,10 +192,19 @@ export function aggregateUsage(events: InteractionEvent[], opts: AggregateOption
         b.turnsMissingUsage += 1;
         continue;
       }
-      b.quantities.llm_prompt_tokens += u.llm_prompt_tokens ?? 0;
-      b.quantities.llm_completion_tokens += u.llm_completion_tokens ?? 0;
-      b.quantities.stt_seconds += (u.stt_audio_ms ?? 0) / 1000;
-      b.quantities.tts_seconds += (u.tts_audio_ms ?? 0) / 1000;
+      // 없는 값과 못 쓰는 값을 구분한다 — 전자는 0 이고 후자는 거부다(거부 건수는 따로 남긴다).
+      const take = (v: number | undefined): number => {
+        if (v === undefined) return 0;
+        if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) {
+          b.usageValuesRejected += 1;
+          return 0;
+        }
+        return v;
+      };
+      b.quantities.llm_prompt_tokens += take(u.llm_prompt_tokens);
+      b.quantities.llm_completion_tokens += take(u.llm_completion_tokens);
+      b.quantities.stt_seconds += take(u.stt_audio_ms) / 1000;
+      b.quantities.tts_seconds += take(u.tts_audio_ms) / 1000;
     }
   }
 

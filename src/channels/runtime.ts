@@ -25,7 +25,7 @@ import type { TurnTimingPolicy } from '../flow/timing.ts';
 import { turnTimingPolicyOk, validateTurnTimingPolicy } from '../flow/timing.ts';
 import type { TenantScope } from '../core/tenancy.ts';
 import { assertTenantScope } from '../core/tenancy.ts';
-import type { EventMeta, InteractionEvent, LatencyMs, TurnCompletedEvent, HandoffRequestedEvent } from '../events/schema.ts';
+import type { EventMeta, InteractionEvent, LatencyMs, TurnCompletedEvent, HandoffRequestedEvent, UsageMetrics } from '../events/schema.ts';
 import { sessionStarted, sessionEnded, handoffRequested } from '../events/schema.ts';
 import type { EventBus, PublishResult } from '../events/bus.ts';
 import type { ComponentId, FallbackDecision, FallbackPolicy, HealthRegistry, HealthSample } from '../ops/fallback.ts';
@@ -55,8 +55,10 @@ import type { Answerer } from '../knowledge/answer.ts';
 import type { Retriever } from '../knowledge/retrieval.ts';
 import type { KnowledgeFailureCause, KnowledgeUsage } from '../knowledge/executeKnowledge.ts';
 import { resolveKnowledgeTurn } from '../knowledge/executeKnowledge.ts';
+import type { TurnBillingNote } from '../billing/turnUsage.ts';
+import { attachTurnUsage, billingNoteOrUndefined, checkBillableMs, mergeTurnUsage, usageNote } from '../billing/turnUsage.ts';
 import type {
-  ChannelAdapterId, ChannelHealthReport, ChannelRegistration, ChannelSessionRequest,
+  ChannelAdapterId, ChannelEndInput, ChannelHealthReport, ChannelRegistration, ChannelSessionRequest,
   ChannelTurnInput, ChannelTurnResult, ConversationCorePort, ContractIssue, ChannelCapabilities,
 } from './contract.ts';
 import { ADAPTER_CHANNEL, CHANNEL_CONTRACT_VERSION, checkFlowSupported, registrationOk, validateRegistration } from './contract.ts';
@@ -690,6 +692,50 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       if (t.confidence !== undefined) turn.confidence = t.confidence;
       rec.turns.push(turn);
     }
+  }
+
+  /**
+   * 채널이 선언한 §11.2 실측을 이번 턴 이벤트에 싣는다.
+   *
+   * 검증·충돌 판정은 `billing/turnUsage.ts` 한 곳에서 한다 — 브리지(JSONL) 경로는 사용량을
+   * 검사했지만 TypeScript 호스트가 `ChannelTurnInput.usage` 로 바로 넘기는 이 경로는 **아무 검사도
+   * 없었다**. 그 비대칭의 결과는 같은 값이 경로에 따라 다르게 집계되는 것이고(§2), `NaN` 하나가
+   * 그 테넌트의 월 집계 전체를 NaN 으로 만든다.
+   *
+   * 실을 자리가 없으면 **조용히 버리지 않는다** — 버려진 실측은 원장에도 집계에도 없는데 공급사
+   * 청구서에는 남아 있어서, 대사에서 '이벤트 유실'로 오진된다.
+   */
+  function attachUsage(events: InteractionEvent[], declared: UsageMetrics | undefined): TurnBillingNote | undefined {
+    if (declared === undefined) return undefined;
+    const merged = mergeTurnUsage([{ origin: 'channel', usage: declared }]);
+    const note = usageNote(merged, merged.usage === undefined ? undefined : attachTurnUsage(events, merged.usage));
+    if (merged.usage === undefined) {
+      note.usageAttached = false;
+      note.usageReasonKo = '선언된 사용량에 실측으로 쓸 수 있는 항목이 없어 이벤트에 싣지 않았습니다(§11.2).';
+    }
+    return billingNoteOrUndefined(note);
+  }
+
+  /**
+   * 종료 시 넘어온 통화 과금 구간의 처리 결과(§11.2). 사실만 적는다 — 보정·추정이 없다(§13-3).
+   *
+   * 음성이 아닌 채널로 **끝난** 세션을 따로 적는 이유: `aggregateUsage` 는 `channel === 'voice'` 인
+   * 세션만 통화 시간으로 센다. §5.2 전환으로 통화가 화면 채널에서 끝나면 `session.ended.channel` 이
+   * `visual` 이 되어 **그 통화의 billable_ms 가 집계에서 통째로 빠진다**. 여기서 채널을 음성으로
+   * 고쳐 적지도, 집계 규칙을 바꾸지도 않는다 — 앞의 것은 거짓이고 뒤의 것은 잘못 선언된 채팅 세션을
+   * 통화로 청구하는 과다청구 경로를 연다. 정책은 사람이 정하고, Core 는 사실을 드러낸다.
+   */
+  function endBillingNote(rec: SessionRecord, check: ReturnType<typeof checkBillableMs> | undefined): TurnBillingNote | undefined {
+    if (check === undefined) return undefined;
+    if (!check.ok) {
+      return { billableMsRecorded: false, billableMsReasonKo: `${check.reasonKo} 통화 구간을 싣지 않고 종료는 그대로 진행했습니다(§11.2).` };
+    }
+    const note: TurnBillingNote = { billableMsRecorded: true };
+    if (rec.state.channel !== 'voice') {
+      note.billableMsReasonKo = `이벤트에는 실었으나 세션이 ${rec.state.channel} 채널로 끝나 통화 분 집계에서는 제외됩니다 `
+        + `— 과금 집계는 음성 세션만 통화 시간으로 셉니다(§11.2·§5.2 전환).`;
+    }
+    return note;
   }
 
   function interactionOf(rec: SessionRecord, reason: Handoff['reason']): Interaction {
@@ -1412,24 +1458,28 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
 
       const decision = health(rec.state.channel);
       const outage = await applyOutage(rec, decision, reg);
-      if (outage) return outage;
+      if (outage) {
+        // 폴백으로 조기 종료된 턴에는 고객 발화 이벤트가 없다 — 그런데 채널은 이 입력을 만들려고
+        // 이미 STT 를 돌렸고 그 비용은 공급사 청구서에 남는다. 지금까지는 그 실측이 조용히
+        // 사라져 대사에서 '이벤트 유실'로 오진됐다. 싣지 못한다는 사실을 그대로 돌려준다(§11.2).
+        if (turn.usage === undefined) return outage;
+        return {
+          ...outage,
+          billing: {
+            usageAttached: false,
+            usageReasonKo: `장애 폴백(${decision.mode})으로 이 턴에 고객 발화 이벤트가 만들어지지 않아 실측을 실을 자리가 없었습니다 — 그 사용량은 과금 집계에 들어가지 않습니다(§9.3·§11.2).`,
+          },
+        };
+      }
 
       const prevChannel = rec.state.channel;
       const ctx = runnerCtx(rec, reg.port.capabilities);
       const run = await runTurn(rec, ctx, turn.input, decision);
       rec.state = run.state;
 
-      if (turn.usage !== undefined) {
-        // §11.2 과금 근거는 실측만 싣는다. 이번 턴의 고객 발화 이벤트에 붙인다.
-        // 커넥터 이행 **전에** 붙인다 — 이행이 만든 봇 발화가 뒤에 쌓여도 대상이 흔들리지 않게.
-        for (let idx = run.events.length - 1; idx >= 0; idx--) {
-          const e = run.events[idx];
-          if (e && e.type === 'turn.completed' && (e as TurnCompletedEvent).speaker === 'customer') {
-            run.events[idx] = { ...(e as TurnCompletedEvent), usage: turn.usage };
-            break;
-          }
-        }
-      }
+      // §11.2 과금 근거는 실측만 싣는다. 커넥터 이행 **전에** 붙인다 —
+      // 이행이 만든 봇 발화가 뒤에 쌓여도 대상이 흔들리지 않게.
+      const billing = attachUsage(run.events, turn.usage);
       // 채널이 이 턴에 바뀌었으면(§5.2) 새 매체는 아직 고지 전이다 — 이미 고지한 채널이면
       // 아무것도 하지 않으므로 턴마다 반복되지 않는다.
       const disclosure = prependDisclosure(rec, run.steps);
@@ -1444,6 +1494,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
         ...(decision.mode === 'degraded_ai' ? { fallback: decision } : {}),
         ...(disclosure !== undefined ? { disclosure } : {}),
         ...(rec.state.handoff ? { handoff: { ...(rec.state.handoff.queue !== undefined ? { queue: rec.state.handoff.queue } : {}), ...(summaryMasked !== undefined ? { summaryMasked } : {}) } } : {}),
+        ...(billing !== undefined ? { billing } : {}),
       };
       rec.lastResult = result;
       sessions.put(rec);
@@ -1456,22 +1507,42 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       return result;
     },
 
-    async end(interactionId: string, reasonKo: string): Promise<ChannelTurnResult> {
+    async end(interactionId: string, reasonKo: string, input?: ChannelEndInput): Promise<ChannelTurnResult> {
       const rec = sessions.get(interactionId);
       if (!rec) throw new Error(`세션을 찾을 수 없습니다: ${interactionId}`);
       const reg = registration(rec.adapter);
-      if (rec.ended) return { ...rec.lastResult, events: [] };   // 중복 종료 요청은 이벤트를 늘리지 않는다
+      // §11.2 통화 과금 구간. **던지지 않는다** — 과금 근거가 틀렸다는 이유로 종료를 막으면 세션이
+      // 열린 채 남고, 그 누수는 장애가 아니라 요금으로 나타난다(브리지가 end 를 막지 않는 것과 같다).
+      const check = input?.billableMs === undefined ? undefined : checkBillableMs(input.billableMs);
+      if (rec.ended) {
+        // 이미 종료된 세션에는 실을 수 없다. `session.ended` 는 추가 전용이므로 뒤늦게 고쳐 넣는
+        // 경로를 만들지 않는다(§8.1) — 대신 그 통화의 과금 근거가 집계에 없다는 사실을 돌려준다.
+        // 장애 폴백이 세션을 먼저 끝낸 통화가 전부 이 경로로 온다.
+        const note: TurnBillingNote | undefined = check === undefined ? undefined : {
+          billableMsRecorded: false,
+          billableMsReasonKo: '세션이 이미 종료돼 session.ended 에 통화 구간을 실을 수 없었습니다 '
+            + '(추가 전용 이벤트는 뒤늦게 고치지 않습니다, §8.1) — 이 통화는 통화 분 집계에서 빠집니다(§11.2).',
+        };
+        return { ...rec.lastResult, events: [], ...(note !== undefined ? { billing: note } : {}) };
+      }
 
       // §4.1 — 목표 미달 상태에서 고객이 끊으면 자동완결이 아니다.
       const outcome = resolveOutcome({
         id: rec.interactionId, tenantId: rec.scope.tenantId, startedAt: rec.startedAt, endedAt: now(),
         channels: [...rec.channels], turns: rec.turns, entities: { ...rec.state.slots },
       });
-      const events: InteractionEvent[] = [sessionEnded(meta(rec), { outcome, turnCount: rec.state.turnCount })];
+      const events: InteractionEvent[] = [sessionEnded(meta(rec), {
+        outcome, turnCount: rec.state.turnCount,
+        ...(check?.ok ? { billableMs: check.billableMs } : {}),
+      })];
       rec.state.status = 'completed';
       rec.state.currentNodeId = null;
       rec.ended = true;
-      const result: ChannelTurnResult = { interactionId, state: rec.state, steps: [], status: 'completed', events };
+      const billing = endBillingNote(rec, check);
+      const result: ChannelTurnResult = {
+        interactionId, state: rec.state, steps: [], status: 'completed', events,
+        ...(billing !== undefined ? { billing } : {}),
+      };
       rec.lastResult = result;
       sessions.put(rec);
       await publish(events);

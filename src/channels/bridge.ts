@@ -109,6 +109,13 @@ export interface BridgeTurnPayload {
    * 뒤져 찾아내게 두면 언어마다 각자 다르게 찾는다(§2).
    */
   disclosure?: { channel: string; placement: string; configVersion: number };
+  /**
+   * §11.2 과금 근거가 어디까지 실렸는가. 어떤 노출 스위치와도 무관하게 나간다 — 여기에는
+   * 개인정보가 없고(수치와 Core 가 쓴 사유 문구뿐), 감추면 호스트는 자기 통화의 엔진 비용·통화
+   * 시간이 집계에 **없다는 사실**을 알 길이 없다. 파이썬·자바 호스트도 이 값을 보고 자기 쪽
+   * 과금 기록을 남길 수 있어야 한다.
+   */
+  billing?: unknown;
 }
 
 /** 처리 기록. 발화 원문·개인정보를 담지 않는다 — op·판정·마스킹된 사유만 남는다(§10.3). */
@@ -460,6 +467,7 @@ function projectTurn(r: ChannelTurnResult, opts: BridgeOptions): BridgeTurnPaylo
   // 고지 사실은 어떤 노출 스위치와도 무관하게 나간다 — 슬롯 값·상담사용 요약과 달리
   // 여기에는 개인정보가 없고, 감추면 "고지했다"를 증명할 길이 호스트에 남지 않는다(§10.1).
   if (r.disclosure !== undefined) payload.disclosure = { ...r.disclosure };
+  if (r.billing !== undefined) payload.billing = { ...r.billing };
   return payload;
 }
 
@@ -544,7 +552,14 @@ export function createBridge(opts: BridgeOptions): Bridge {
       case 'end': {
         if (!nonEmptyString(body.interactionId)) bad('interactionId 가 없습니다.');
         if (!nonEmptyString(body.reasonKo)) bad('reasonKo 가 없습니다. 종료 사유 없는 종료는 기록에서 원인을 잃습니다.');
-        return projectTurn(await opts.core.end(body.interactionId, body.reasonKo), opts);
+        // §11.2 통화 과금 구간은 **형태 검증을 여기서 하지 않고** Core 로 넘긴다. 두 가지 이유다 —
+        // (1) `end` 는 어떤 경우에도 막지 않는다(막히면 세션이 새고 누수는 요금으로 나타난다),
+        // (2) 검사가 두 곳이면 같은 값이 경로에 따라 다르게 판정된다(§2). 무효값은 Core 가
+        // 싣지 않고 응답 `billing` 에 사유를 적는다. 선언이 없으면 종전과 완전히 같다(§13-3).
+        const endInput = body.billableMs === undefined
+          ? undefined
+          : { billableMs: body.billableMs as number };
+        return projectTurn(await opts.core.end(body.interactionId, body.reasonKo, endInput), opts);
       }
       case 'health': {
         const { samples, observedAt } = toHealthSamples(body);

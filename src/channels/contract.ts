@@ -16,6 +16,7 @@ import type { TenantScope } from '../core/tenancy.ts';
 import type { SwitchTicket } from '../core/executeSwitch.ts';
 import type { DisclosurePlacement } from '../portal/aiDisclosure.ts';
 import type { ComponentId, HealthSample, FallbackDecision } from '../ops/fallback.ts';
+import type { TurnBillingNote } from '../billing/turnUsage.ts';
 
 export const CHANNEL_CONTRACT_VERSION = 1;
 
@@ -87,6 +88,31 @@ export interface ChannelTurnResult {
    * 고지가 배선되지 않았거나 이미 고지한 채널이면 실리지 않는다.
    */
   disclosure?: { channel: ChannelKind; placement: DisclosurePlacement; configVersion: number };
+  /**
+   * §11.2 과금 근거가 이번 호출에서 **어디까지 실렸는가**. 아무 선언도 없었으면 실리지 않는다.
+   *
+   * 채널이 반드시 읽어야 하는 값이다 — `usageAttached: false` 인 실측과 `billableMsRecorded: false`
+   * 인 통화 구간은 §8.1 원장에 **없다**. 즉 그 호의 엔진 비용·통화 시간은 공급사 청구서에만 남고
+   * 우리 집계에는 없으며, 그 차이는 몇 주 뒤 대사(reconcile)에서 '미설명'으로 돌아온다.
+   */
+  billing?: TurnBillingNote;
+}
+
+/**
+ * 세션 종료 시 채널이 넘기는 과금 근거(§11.2). 전부 생략 가능하며, 생략하면 종전과 완전히 같다.
+ *
+ * 왜 종료 시점에만 받는가: 통화 과금 구간은 끊긴 뒤에야 확정된다. 그런데 `session.ended` 는
+ * 추가 전용 이벤트라 **나중에 고쳐 넣을 수 없다** — 그래서 종료를 지시하는 그 호출에서 함께 받는다.
+ * 받을 자리가 없던 동안 `billable_ms` 를 채우는 코드는 저장소에 0건이었고, 그 결과 모든 음성 세션이
+ * `sessionsMissingBillableMs`(실측 누락)로 집계돼 **통화 요금의 근거가 아예 없었다**.
+ */
+export interface ChannelEndInput {
+  /**
+   * 과금 대상 구간(ms). 대기·호 설정 구간을 포함할지는 **계약 사항**이므로 채널이 계약대로 채운다 —
+   * Core 는 세션 전체 길이(`duration_ms`)로 대체 추정하지 않는다(§13-3). 측정하지 못했으면 **넣지 않는다**:
+   * 0 은 "0초 통화를 실측했다"는 뜻이고, 누락과 0 을 같게 적는 것이 정산 분쟁의 출발점이다.
+   */
+  billableMs?: number;
 }
 
 /**
@@ -151,8 +177,14 @@ export interface ConversationCorePort {
   readonly contractVersion: number;
   start(req: ChannelSessionRequest): Promise<ChannelTurnResult>;
   send(interactionId: string, turn: ChannelTurnInput): Promise<ChannelTurnResult>;
-  /** 고객이 끊음·이탈. Outcome 확정은 Core가 §4.1 규칙으로 판정한다. */
-  end(interactionId: string, reasonKo: string): Promise<ChannelTurnResult>;
+  /**
+   * 고객이 끊음·이탈. Outcome 확정은 Core가 §4.1 규칙으로 판정한다.
+   *
+   * `input` 은 선택이며 §11.2 과금 근거를 함께 넘기는 자리다. 넘기지 않으면 종전과 완전히 같다 —
+   * 다만 그 세션은 통화 분 집계에서 빠지고 `sessionsMissingBillableMs` 로만 남는다. 값이 실렸는지는
+   * 결과의 `billing` 에 사실대로 적힌다(무효값은 종료를 막지 않는다 — 막으면 세션이 샌다).
+   */
+  end(interactionId: string, reasonKo: string, input?: ChannelEndInput): Promise<ChannelTurnResult>;
   /** 헬스 보고 — 채널이 주기적으로 올린다(§9.3). */
   reportHealth(report: ChannelHealthReport): void;
 }

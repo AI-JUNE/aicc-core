@@ -144,10 +144,22 @@ function hypothesize(
       evidenceKo: `집계 과정에서 중복 이벤트 ${agg.duplicatesDropped}건을 제거했습니다. 외부 명세가 중복을 제거하지 않았다면 그만큼 차이가 납니다(§8.1 멱등).`,
     });
   }
-  if (bucket && (bucket.sessionsMissingBillableMs > 0 || bucket.turnsMissingUsage > 0)) {
+  if (bucket && (bucket.sessionsMissingBillableMs > 0 || bucket.turnsMissingUsage > 0
+    || bucket.sessionsBillableMsOnNonVoice > 0 || bucket.usageValuesRejected > 0)) {
+    // 누락과 거부를 한 문장에 적되 구분한다 — 전자는 "아무도 재지 않았다"이고 후자는 "쟀는데
+    // 쓸 수 없는 값이 왔다"다. 대응이 다르다(배선 추가 vs 어댑터 환산 수정).
+    const extra = [
+      bucket.sessionsBillableMsOnNonVoice > 0
+        ? `음성이 아닌 채널로 끝나 통화 분 집계에서 빠진 통화 ${bucket.sessionsBillableMsOnNonVoice}건(§5.2 전환일 수 있습니다 — 매출 누락인지 채널의 선언 오류인지 확인하세요)`
+        : '',
+      bucket.usageValuesRejected > 0
+        ? `실측으로 볼 수 없어 거부한 사용량 항목 ${bucket.usageValuesRejected}건(음수·NaN·무한 — 어댑터 단위 환산을 확인하세요, §6.2)`
+        : '',
+    ].filter((s) => s !== '');
     out.push({
       cause: 'incomplete_measurement',
-      evidenceKo: `실측 누락 — billable_ms 없는 세션 ${bucket.sessionsMissingBillableMs}건, usage 없는 턴 ${bucket.turnsMissingUsage}건이 집계에서 빠졌습니다. 추정으로 메우지 않았으므로 Core 수량이 작게 나옵니다(§13-3).`,
+      evidenceKo: `실측 누락 — billable_ms 없는 세션 ${bucket.sessionsMissingBillableMs}건, usage 없는 턴 ${bucket.turnsMissingUsage}건이 집계에서 빠졌습니다. 추정으로 메우지 않았으므로 Core 수량이 작게 나옵니다(§13-3).`
+        + (extra.length > 0 ? ` 또한 ${extra.join(' / ')}.` : ''),
     });
   }
 
