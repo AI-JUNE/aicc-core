@@ -458,3 +458,51 @@ h.close()
   assert.equal(out.stats.calls_started, 0);
   assert.equal(out.degraded, false);
 });
+
+test('§11.2 통화 과금 구간은 받은 그대로 보내고, 없으면 추정하지 않고 건수로 센다', b, () => {
+  const out = parse(runDriver(`${PRELUDE}
+h = hooks()
+h.on_call_start("call-A"); h.on_call_start("call-B")
+h.on_call_end("call-A", billable_ms=65000)   # 회선이 준 실측
+h.on_call_end("call-B")                       # 주지 않았다 — 만들어 넣지 않는다
+dump(h)
+h.close()
+`));
+  const ends = out.transcript.requests.filter((l) => l.includes('"op":"end"'));
+  assert.equal(ends.length, 2);
+  assert.equal(ends.filter((l) => l.includes('"billableMs":65000')).length, 1);
+  assert.equal(ends.filter((l) => l.includes('billableMs')).length, 1, '선언하지 않은 통화에 값이 실렸다');
+  assert.equal(out.stats.ends_missing_billable_ms, 1, '청구 근거 없는 통화를 세지 않았다');
+  assert.equal(out.stats.calls_ended, 2);
+});
+
+test('구버전 시그니처의 end 를 감싼 호스트도 종료에서 죽지 않는다', b, () => {
+  // 종료 자리에서 죽으면 세션이 닫히지 않고, 그 누수는 장애가 아니라 요금으로 먼저 나타난다.
+  const out = parse(runDriver(`${PRELUDE}
+from aicc_bridge import BridgeResponse
+
+class LegacyEnd:
+    def __init__(self):
+        self.ends = []
+        self.transcript = None
+    def hello(self): return BridgeResponse(id="1", ok=True, result={})
+    def start(self, **kw): return BridgeResponse(id="2", ok=True, result={"interactionId": "i1"})
+    def end(self, i, reason):            # billable_ms 를 모르는 구버전
+        self.ends.append((i, reason))
+        return BridgeResponse(id="9", ok=True, result={})
+    def close(self): pass
+
+c = LegacyEnd()
+h = CallbotCoreHooks(lambda: c, flow_id="f", on_error=lambda code, m: errors.append(code))
+h.on_call_start("c1")
+h.on_call_end("c1")
+json.dump({"ends": c.ends, "stats": h.stats.as_dict(), "errors": errors,
+           "degraded": h.degraded, "enabled": h.enabled, "reason": h.disabled_reason_ko,
+           "transcript": None}, sys.stdout, ensure_ascii=False)
+h.close()
+`));
+  assert.equal(out.ends.length, 1, '종료가 구버전 구현에서 막혔다');
+  assert.equal(out.stats.calls_ended, 1);
+  assert.deepEqual(out.errors, []);
+  assert.equal(out.degraded, false);
+});

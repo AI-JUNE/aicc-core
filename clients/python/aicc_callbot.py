@@ -16,7 +16,7 @@ agent.py 에 넣을 것은 훅마다 한 줄이다(이 파일은 agent.py 를 im
     hooks = AsyncCallbotCoreHooks.from_env()          # 기본 OFF. 켜는 조건은 아래
     @agent.on("call_start")  ... await hooks.on_call_start(call.call_id)
     @agent.on("transcript")  ... await hooks.on_transcript(call.call_id, role, text)
-    @agent.on("call_end")    ... await hooks.on_call_end(call.call_id)
+    @agent.on("call_end")    ... await hooks.on_call_end(call.call_id, billable_ms=call.billable_ms)
 
 이 어댑터가 지키는 것 (전부 "빠지면 사고가 나는" 지점이다)
 --------------------------------------------------------
@@ -33,6 +33,9 @@ agent.py 에 넣을 것은 훅마다 한 줄이다(이 파일은 agent.py 를 im
    보내면 봇의 말이 고객 입력으로 시나리오를 진행시킨다.
 5. **종료는 멱등이고 빠지지 않는다.** `on_call_end` 는 두 번 불러도 한 번만 닫고, `close()` 는
    열린 통화를 모두 닫은 뒤 브리지를 내린다 — 닫히지 않은 세션은 장애가 아니라 요금으로 나타난다.
+   종료에는 §11.2 통화 과금 구간(`billable_ms`)을 함께 넘길 수 있다. **만들어 넣지 않는다**(§13-3):
+   회선이 주지 않으면 그 통화는 통화 분 집계에서 빠지고, 그 건수를 `ends_missing_billable_ms` 로
+   센다 — 세지 않으면 "청구할 근거가 없는 통화"가 몇 건인지 모르는 채 월말이 온다.
 6. **발화·응답을 print 하지 않는다(§10.3).** 이 파일은 어떤 것도 출력하지 않는다.
    결과가 필요하면 `on_turn` 콜백으로 받는다(상담사용 요약·슬롯 값은 기본적으로 들어 있지 않다).
 7. **한도 초과는 장애가 아니다(§9.3).** `E_RATE_LIMITED` 를 브리지 사망과 같게 다루면 통화 전체가
@@ -86,6 +89,9 @@ class HookStats:
     #: 한도 대기 중이라 **보내지 않은** 건수. 거절과 나눠 세지 않으면 "한도를 얼마나 밀어붙였는지"를 못 본다.
     turns_deferred: int = 0
     starts_deferred: int = 0
+    #: §11.2 통화 과금 구간을 선언하지 않고 닫은 통화 수. 그 통화는 통화 분 집계에서 빠진다 —
+    #: 추정으로 메우지 않으므로(§13-3) 이 건수가 곧 "청구 근거가 없는 통화 수"다.
+    ends_missing_billable_ms: int = 0
 
     def as_dict(self) -> Dict[str, int]:
         return dict(self.__dict__)
@@ -240,8 +246,19 @@ class CallbotCoreHooks:
     def on_timeout(self, call_id: str) -> Optional[BridgeResponse]:
         return self._turn(call_id, lambda c, i: c.send_timeout(i))
 
-    def on_call_end(self, call_id: str, reason_ko: str = "통화 종료") -> Optional[BridgeResponse]:
-        """멱등. 두 번째 호출은 아무것도 보내지 않는다."""
+    def on_call_end(
+        self,
+        call_id: str,
+        reason_ko: str = "통화 종료",
+        billable_ms: Optional[float] = None,
+    ) -> Optional[BridgeResponse]:
+        """멱등. 두 번째 호출은 아무것도 보내지 않는다.
+
+        `billable_ms` 는 §11.2 통화 과금 구간이며 **회선이 알고 이 어댑터는 모른다** — 대기·호 설정
+        구간을 포함할지는 계약 사항이라 추정하지 않는다(§13-3). 주지 않으면 그 통화는 통화 분 집계에서
+        빠지고, 그 사실을 `stats.ends_missing_billable_ms` 로 센다. 세지 않으면 "청구할 근거가 없는
+        통화"가 몇 건인지 아무도 모르는 채 월말이 온다.
+        """
         with self._lock:
             call = self._calls.get(call_id)
             if call is None:
@@ -252,9 +269,17 @@ class CallbotCoreHooks:
                 return None
             call.ended = True  # 브리지가 죽어 있어도 "닫으려 했다"는 상태는 남긴다
             self._prune_ended()
+            if billable_ms is None:
+                self.stats.ends_missing_billable_ms += 1
             if not self._ready():
                 return None
-            res = self._guard(lambda c: c.end(call.interaction_id, reason_ko))
+            # 값이 없으면 인자를 **싣지 않는다** — 종전과 완전히 같은 호출이어야 한다(§13-3).
+            # 이 한 줄이 없으면 end 를 감싼 호스트 구현(구버전 시그니처)이 종료 시점에 TypeError 로
+            # 죽고, 죽는 자리가 하필 세션을 닫는 곳이라 누수가 요금으로 나타난다.
+            res = self._guard(
+                (lambda c: c.end(call.interaction_id, reason_ko)) if billable_ms is None
+                else (lambda c: c.end(call.interaction_id, reason_ko, billable_ms=billable_ms))
+            )
             if res is not None:
                 self.stats.calls_ended += 1
             return res
@@ -440,8 +465,19 @@ class AsyncCallbotCoreHooks:
     async def on_timeout(self, call_id: str) -> Optional[BridgeResponse]:
         return await self._run(call_id, lambda: self.inner.on_timeout(call_id))
 
-    async def on_call_end(self, call_id: str, reason_ko: str = "통화 종료") -> Optional[BridgeResponse]:
-        return await self._run(call_id, lambda: self.inner.on_call_end(call_id, reason_ko))
+    async def on_call_end(
+        self,
+        call_id: str,
+        reason_ko: str = "통화 종료",
+        billable_ms: Optional[float] = None,
+    ) -> Optional[BridgeResponse]:
+        # 값이 없으면 인자를 싣지 않는다 — 구버전 시그니처의 inner(테스트 대역·호스트 래퍼)를
+        # 종료 자리에서 죽이지 않기 위해서다. 종료가 막히면 세션이 새고 누수는 요금이 된다.
+        return await self._run(
+            call_id,
+            (lambda: self.inner.on_call_end(call_id, reason_ko)) if billable_ms is None
+            else (lambda: self.inner.on_call_end(call_id, reason_ko, billable_ms)),
+        )
 
     async def close(self) -> None:
         """예약된 훅을 먼저 비운 뒤 닫는다 — 먼저 닫으면 남은 턴이 "끝난 통화"로 버려진다."""

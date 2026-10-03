@@ -299,8 +299,26 @@ class BridgeClient:
         """무음·응답 없음. 음성 채널에서 가장 자주 쓰는 입력이라 이름을 따로 준다."""
         return self.send(interaction_id, {"input": {"kind": "timeout"}})
 
-    def end(self, interaction_id: str, reason_ko: str) -> BridgeResponse:
-        return self.request("end", interactionId=interaction_id, reasonKo=reason_ko)
+    def end(
+        self,
+        interaction_id: str,
+        reason_ko: str,
+        *,
+        billable_ms: Optional[float] = None,
+    ) -> BridgeResponse:
+        """세션 종료. `billable_ms` 는 §11.2 통화 과금 구간이다.
+
+        **만들어 넣지 않는다**(§13-3). `None` 이면 키를 싣지 않고 종전과 완전히 같다 — 0 을 보내면
+        "0초 통화를 실측했다"는 뜻이 되고, 누락과 0 을 같게 적는 것이 정산 분쟁의 출발점이다.
+        값이 실렸는지는 응답 `result.billing` 에 사실대로 적혀 돌아온다.
+
+        형태가 틀려도 **여기서 막지 않는다** — end 가 막히면 세션이 닫히지 않고, 그 누수는 장애가
+        아니라 요금으로 먼저 나타난다. 판정은 Core 한 곳이 하고 사유를 돌려준다.
+        """
+        payload: Dict[str, Any] = {"interactionId": interaction_id, "reasonKo": reason_ko}
+        if billable_ms is not None:
+            payload["billableMs"] = billable_ms
+        return self.request("end", **payload)
 
     def report_health(self, samples: Sequence[Dict[str, Any]], observed_at: str) -> BridgeResponse:
         """관측 시각은 호출자가 준다 — 클라이언트가 시각을 만들어 넣지 않는다(§13-3)."""

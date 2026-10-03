@@ -1755,6 +1755,114 @@ test('§9.3 이 끄라고 한 기능만 끈다 — LLM 저하는 지식 응대�
   assert.deepEqual(after.steps.map((s) => s.nodeId), ['__answer', 'bye']);
 });
 
+// ── §11.2 과금 근거 배선 ────────────────────────────────────────────────────
+// 여기서 막는 사고는 전부 "청구할 근거가 없다"로 끝난다. 통화는 정상으로 보이고 이벤트도 정상이라
+// 어디서도 터지지 않으며, 드러나는 시점은 대사(reconcile)거나 고객사의 청구 이의다.
+
+test('§11.2 종료 시 넘어온 통화 과금 구간이 session.ended 에 실린다', b, async () => {
+  const { core, collector } = build();
+  await core.start(req());
+  const r = await core.end('i_test1', '고객 종료', { billableMs: 65000 });
+  assert.equal(r.events[0].billable_ms, 65000);
+  assert.deepEqual(r.billing, { billableMsRecorded: true });
+  const ended = collector.events.find((e) => e.type === 'session.ended');
+  assert.equal(ended.billable_ms, 65000);
+});
+
+test('§13-3 통화 구간을 넘기지 않으면 종전과 완전히 같다 — 0 으로 채우지 않는다', b, async () => {
+  const { core } = build();
+  await core.start(req());
+  const r = await core.end('i_test1', '고객 종료');
+  assert.equal('billable_ms' in r.events[0], false);
+  assert.equal(r.billing, undefined);
+});
+
+test('§11.2 무효한 통화 구간은 종료를 막지 않고 싣지 않는다 — 막으면 세션이 샌다', b, async () => {
+  for (const bad of [-1, Number.NaN, '65000', null]) {
+    const { core, port } = build();
+    await core.start(req());
+    const r = await core.end('i_test1', '고객 종료', { billableMs: bad });
+    assert.equal(r.status, 'completed');                      // 종료는 그대로 진행된다
+    assert.equal('billable_ms' in r.events[0], false);
+    assert.equal(r.billing.billableMsRecorded, false);
+    assert.ok(r.billing.billableMsReasonKo);
+    assert.ok(port.log.some((l) => l[0] === 'end'));
+  }
+});
+
+test('§11.2 이미 종료된 세션에는 뒤늦게 싣지 않고 집계에서 빠진다는 사실을 돌려준다(§8.1)', b, async () => {
+  // 장애 폴백이 세션을 먼저 끝낸 통화가 전부 이 경로로 온다 — 그 통화의 통화 분은 근거가 없다.
+  const { core, collector } = build({ samples: [{ component: 'telephony', state: 'down', observedAt: NOW }] });
+  const started = await core.start(req());
+  assert.equal(started.fallback.mode, 'unavailable');
+  const before = collector.events.length;
+  const r = await core.end('i_test1', '회선 종료', { billableMs: 42000 });
+  assert.deepEqual(r.events, []);                             // 추가 전용 이벤트를 고치지 않는다
+  assert.equal(collector.events.length, before);
+  assert.equal(r.billing.billableMsRecorded, false);
+  assert.match(r.billing.billableMsReasonKo, /통화 분 집계에서 빠집니다/);
+  assert.equal(collector.events.find((e) => e.type === 'session.ended').billable_ms, undefined);
+});
+
+test('§5.2 음성이 아닌 채널로 끝나면 이벤트에는 실리되 집계 제외 사실을 드러낸다', b, async () => {
+  const chat = fakePort('chatbot');
+  const { core } = build({ port: chat, components: ['messaging', 'llm', 'rag', 'backend'] });
+  await core.start(req({ adapter: 'chatbot' }));
+  const r = await core.end('i_test1', '대화 종료', { billableMs: 30000 });
+  assert.equal(r.events[0].billable_ms, 30000);
+  assert.equal(r.billing.billableMsRecorded, true);
+  assert.match(r.billing.billableMsReasonKo, /통화 분 집계에서는 제외/);
+});
+
+test('§11.2 쓸 수 없는 사용량은 이벤트에 싣지 않고 거부 사실을 돌려준다', b, async () => {
+  // 브리지(JSONL) 경로만 검사하고 이 경로는 아무 검사도 없었다 — NaN 하나가 월 집계를 무너뜨린다.
+  const { core, collector } = build();
+  await core.start(req());
+  const r = await core.send('i_test1', {
+    input: { kind: 'utterance', text: '홍길동' },
+    usage: { llm_prompt_tokens: Number.NaN, gpu_seconds: 3 },
+  });
+  const turn = collector.events.find((e) => e.type === 'turn.completed' && e.speaker === 'customer');
+  assert.equal(turn.usage, undefined);
+  assert.equal(r.billing.usageAttached, false);
+  assert.deepEqual(r.billing.usageRejected, ['channel.llm_prompt_tokens', 'channel.gpu_seconds']);
+});
+
+test('§11.2 정상 실측은 그대로 실리고 기록에도 사실대로 남는다', b, async () => {
+  const { core } = build();
+  await core.start(req());
+  const r = await core.send('i_test1', {
+    input: { kind: 'utterance', text: '홍길동' },
+    usage: { llm_prompt_tokens: 30, stt_audio_ms: 2000 },
+  });
+  assert.equal(r.billing.usageAttached, true);
+  assert.equal('usageRejected' in r.billing, false);
+  const turn = r.events.find((e) => e.type === 'turn.completed' && e.speaker === 'customer');
+  assert.deepEqual(turn.usage, { llm_prompt_tokens: 30, stt_audio_ms: 2000 });
+});
+
+test('§9.3 장애 폴백으로 조기 종료된 턴의 실측은 조용히 사라지지 않는다', b, async () => {
+  // 그 턴의 STT 는 이미 돌았고 비용은 공급사 청구서에 남는다. 실을 자리가 없다는 사실을 드러낸다.
+  const { core, health } = build();
+  await core.start(req());
+  health.record({ component: 'telephony', state: 'down', observedAt: NOW });
+  const r = await core.send('i_test1', {
+    input: { kind: 'utterance', text: '홍길동' },
+    usage: { stt_audio_ms: 2500 },
+  });
+  assert.equal(r.fallback.mode, 'unavailable');
+  assert.equal(r.events.some((e) => e.type === 'turn.completed'), false);
+  assert.equal(r.billing.usageAttached, false);
+  assert.match(r.billing.usageReasonKo, /과금 집계에 들어가지 않습니다/);
+});
+
+test('§13-3 사용량 선언이 없으면 과금 기록을 만들지 않는다', b, async () => {
+  const { core } = build();
+  await core.start(req());
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '홍길동' } });
+  assert.equal(r.billing, undefined);
+});
+
 test('배선 거부: 검색기·답변기 부재와 성립하지 않는 정책은 통화 전에 막는다', b, () => {
   assert.throws(() => build({ flows: [flowFaq], knowledge: { answerer: answererOf(), policy: KB_POLICY } }), /지식 응대 배선 거부/);
   assert.throws(() => build({ flows: [flowFaq], knowledge: { retriever: retrieverOf(), policy: KB_POLICY } }), /지식 응대 배선 거부/);

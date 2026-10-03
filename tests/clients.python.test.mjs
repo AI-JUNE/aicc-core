@@ -251,3 +251,35 @@ json.dump(cases, sys.stdout, ensure_ascii=False)
   assert.equal(out['정상'], 1500);
   assert.equal(out['0'], 0, '브리지가 0 을 줬다면 0 이다 — 지어낸 값이 아니다');
 });
+
+test('§11.2 end 는 통화 과금 구간을 실어 보내고, 주지 않으면 키 자체가 없다(§13-3)', b, () => {
+  const source = `${PRELUDE}
+c = client()
+c.hello()
+r = c.start(flow_id="f_reference_voice", entry_point="inbound_call")
+iid = r.interaction_id
+ended = c.end(iid, "고객 종료", billable_ms=65000)
+c2 = client()
+c2.hello()
+r2 = c2.start(flow_id="f_reference_voice", entry_point="inbound_call")
+plain = c2.end(r2.interaction_id, "고객 종료")
+json.dump({
+    "with_lines": c.transcript.requests, "without_lines": c2.transcript.requests,
+    "with_ok": ended.ok, "without_ok": plain.ok,
+    "with_result": ended.result, "without_result": plain.result,
+}, sys.stdout, ensure_ascii=False)
+c.close(); c2.close()
+`;
+  const run = withDriver(source, (f) => runPython(f));
+  assert.equal(run.status, 0, run.stderr);
+  const out = JSON.parse(run.stdout);
+  assert.equal(out.with_ok, true);
+  assert.equal(out.without_ok, true);
+  const endLine = out.with_lines.find((l) => l.includes('"op":"end"'));
+  assert.ok(endLine.includes('"billableMs":65000'), `end 줄에 과금 구간이 없다: ${endLine}`);
+  // 선언이 없으면 키를 만들지 않는다 — 0 을 보내면 "0초 통화를 실측했다"가 된다.
+  const plainEnd = out.without_lines.find((l) => l.includes('"op":"end"'));
+  assert.equal(plainEnd.includes('billableMs'), false, `주지 않았는데 키가 실렸다: ${plainEnd}`);
+  // Core 가 사실을 되돌려 준다(참조 Core 픽스처는 billing 을 만들지 않으므로 ok 만 확인한다).
+  assert.ok(out.with_result);
+});

@@ -216,6 +216,47 @@ test('모르는 사용량·지연 키와 음수는 거부한다(§11.2·§13-3)'
   }
 });
 
+test('§11.2 end 는 통화 과금 구간을 Core 로 넘기고 실린 사실을 돌려준다', b, async () => {
+  const { bridge } = build();
+  await bridge.handleLine(line({ id: '0', op: 'start', req: { flowId: 'billing', entryPoint: 'inbound_call' } }));
+  const r = await bridge.handleLine(line({ id: '1', op: 'end', interactionId: 'i_bridge1', reasonKo: '고객 종료', billableMs: 65000 }));
+  assert.equal(r.ok, true);
+  assert.equal(r.result.events[0].billable_ms, 65000);
+  assert.deepEqual(r.result.billing, { billableMsRecorded: true });
+});
+
+test('§11.2 무효한 통화 구간이 와도 end 는 막히지 않는다 — 막히면 세션이 샌다', b, async () => {
+  for (const bad of [-1, '65000', null]) {
+    const { bridge } = build();
+    await bridge.handleLine(line({ id: '0', op: 'start', req: { flowId: 'billing', entryPoint: 'inbound_call' } }));
+    const r = await bridge.handleLine(line({ id: '1', op: 'end', interactionId: 'i_bridge1', reasonKo: '고객 종료', billableMs: bad }));
+    assert.equal(r.ok, true, JSON.stringify(bad));              // 종료는 어떤 경우에도 성공한다
+    assert.equal(r.result.status, 'completed');
+    assert.equal('billable_ms' in r.result.events[0], false);
+    assert.equal(r.result.billing.billableMsRecorded, false);
+  }
+});
+
+test('§13-3 billableMs 를 안 보내면 종전과 완전히 같다', b, async () => {
+  const { bridge } = build();
+  await bridge.handleLine(line({ id: '0', op: 'start', req: { flowId: 'billing', entryPoint: 'inbound_call' } }));
+  const r = await bridge.handleLine(line({ id: '1', op: 'end', interactionId: 'i_bridge1', reasonKo: '고객 종료' }));
+  assert.equal(r.result.billing, undefined);
+  assert.equal('billable_ms' in r.result.events[0], false);
+});
+
+test('§11.2 과금 기록은 노출 스위치와 무관하게 호스트에 나간다', b, async () => {
+  // 감추면 비-Node 호스트는 자기 통화의 실측이 집계에 없다는 사실을 알 길이 없다.
+  const { bridge } = build({ includeSlots: false, includeHandoffSummary: false });
+  await bridge.handleLine(line({ id: '0', op: 'start', req: { flowId: 'billing', entryPoint: 'inbound_call' } }));
+  const r = await bridge.handleLine(line({
+    id: '1', op: 'send', interactionId: 'i_bridge1',
+    turn: { input: { kind: 'utterance', text: '홍길동' }, usage: { stt_audio_ms: 800 } },
+  }));
+  assert.equal(r.ok, true);
+  assert.equal(r.result.billing.usageAttached, true);
+});
+
 test('미지 세션 send 는 오류 응답이지 예외가 아니다', b, async () => {
   const { bridge } = build();
   const r = await bridge.handleLine(line({

@@ -27,6 +27,36 @@ test('§11.2 통화 시간은 billable_ms만 신뢰하고, 없으면 추정하�
   assert.equal(agg.buckets[0].sessionsMissingBillableMs, 1);
 });
 
+test('§5.2 음성이 아닌 채널로 끝난 통화의 실측은 통화 분에 넣지 않되 버리지도 않는다', b, () => {
+  // 통화 중 화면으로 전환되면 session.ended.channel 이 visual 이 된다. 자동으로 통화 시간에
+  // 넣으면 잘못 선언된 채팅 세션까지 통화로 청구되고(과다청구), 조용히 버리면 매출이 사라진다.
+  const switched = ev.sessionEnded(meta('e1', { channel: 'visual' }), { outcome: 'AUTO_RESOLVED', turnCount: 3, billableMs: 90000 });
+  const agg = bl.aggregateUsage([switched], { scope: { tenantId: 't1' }, granularity: 'total', rounding });
+  assert.equal(bl.totalQuantities(agg).voice_seconds, 0);
+  assert.equal(agg.buckets[0].sessionsBillableMsOnNonVoice, 1);
+  assert.equal(agg.buckets[0].sessionsMissingBillableMs, 0);   // 누락이 아니다 — 실측은 있었다
+});
+
+test('§11.2 실측으로 볼 수 없는 통화 구간은 통화 시간으로 세지 않는다', b, () => {
+  const broken = ev.sessionEnded(meta('e1'), { outcome: 'AUTO_RESOLVED', turnCount: 1, billableMs: Number.NaN });
+  const agg = bl.aggregateUsage([broken], { scope: { tenantId: 't1' }, granularity: 'total', rounding });
+  assert.equal(bl.totalQuantities(agg).voice_seconds, 0);
+  assert.equal(agg.buckets[0].sessionsMissingBillableMs, 1);
+});
+
+test('§11.2 쓸 수 없는 사용량 값은 0 으로도 그대로도 집계하지 않고 건수로 남긴다', b, () => {
+  const t = ev.turnCompleted(meta('e1'), {
+    turnId: 't1', speaker: 'customer', utterance: '네',
+    usage: { llm_prompt_tokens: Number.NaN, llm_completion_tokens: 30 },
+  });
+  const agg = bl.aggregateUsage([t], { scope: { tenantId: 't1' }, granularity: 'total', rounding });
+  const q = bl.totalQuantities(agg);
+  assert.equal(q.llm_prompt_tokens, 0);
+  assert.equal(q.llm_completion_tokens, 30);             // 멀쩡한 항목은 그대로 센다
+  assert.equal(agg.buckets[0].usageValuesRejected, 1);
+  assert.equal(agg.buckets[0].turnsMissingUsage, 0);     // 실측이 아예 없는 것과 구분한다
+});
+
 test('§8.1 중복 이벤트는 이중 과금되지 않는다', b, () => {
   const e = ev.sessionEnded(meta('e1'), { outcome: 'AUTO_RESOLVED', turnCount: 1, billableMs: 60000 });
   const agg = bl.aggregateUsage([e, e, e], { scope: { tenantId: 't1' }, granularity: 'total', rounding });

@@ -976,6 +976,69 @@
         않는 것(§10.3)을 그 경로에서 확인한다. 실엔진·실 벡터 DB 연결은 **[승인 필요]**.
         근거: `src/knowledge/executeIngest.ts` · `tests/knowledge.executeIngest.test.mjs`(18건) ·
         `tests/knowledge.pipeline.test.mjs`(7건 — 색인→검색→답변 경계) · `API.md` 반영
+      · Core 측 완료(27): **과금 근거가 통화에서 집계까지 닿지 않았다 — 청구할 수 있는 통화가 0건(2026-10-03)** —
+        (13)~(26)이 메운 것과 같은 모양의 공백이 §11.2 에 하나 더, 그리고 **돈이 걸린 자리**에 있었다.
+        조각은 다 있다: `billing/usage.ts` 가 이벤트→수량, `billing/reconcile.ts` 가 대사·청구 차단,
+        `adapters/engineSet.ts` 의 `collectUsage` 가 엔진 조각의 `lastUsage()` 수집. 그런데 그 사이
+        **실측을 이벤트에 싣는 자리**가 비어 있었고, 비어 있던 방식이 둘 다 조용했다.
+        (1) **`session.ended.billable_ms` 를 채우는 코드가 저장소 전체에 0건이었다.** 스키마 주석은
+        "채널 어댑터가 계약대로 채운다"고 적혀 있는데 `ConversationCorePort.end(id, reasonKo)` 에는
+        **넘길 자리가 없었다** — 즉 모든 음성 세션이 `sessionsMissingBillableMs`(실측 누락)로 집계되고
+        `voice_seconds`/`voice_units` 는 영원히 0 이다. 통화는 정상이고 이벤트도 정상이라 어디서도
+        터지지 않으며, 드러나는 시점은 **첫 청구서**다. 과금 구간은 끊긴 뒤에야 확정되는데
+        `session.ended` 는 추가 전용이라 뒤늦게 고칠 수 없다 — 그래서 종료를 지시하는 그 호출에서
+        함께 받는다(`ChannelEndInput`).
+        (2) **TypeScript 호스트가 넘기는 사용량은 아무 검사도 지나지 않았다.** 브리지(JSONL) 경로는
+        `numberMap` 으로 검증하는데 챗봇·D-ARS 가 쓰는 `ChannelTurnInput.usage` 는 그대로 이벤트에
+        실렸다. 같은 값이 경로에 따라 다르게 집계되는 것이 §2 의 이중 관리이고, 여기서는 그 대가가
+        크다 — `llm_prompt_tokens: NaN` 하나가 그 테넌트 월 집계의 **모든 수량**을 NaN 으로 만들고,
+        NaN 비교는 언제나 거짓이라 `withinTolerance` 는 불일치·`diff > 0` 은 거짓으로 읽혀
+        **과다청구 차단(`blocked`)이 아니라 '검토 필요'로 떨어진다**. 검사가 두 곳이어야 하는 것이
+        아니라 **한 곳이어야 한다**(`billing/turnUsage.ts`).
+        그 외 고정한 것:
+        - **실을 자리가 없으면 조용히 버리지 않는다.** 장애 폴백으로 조기 종료된 턴에는 고객 발화
+          이벤트가 없다 — 그런데 채널은 그 입력을 만들려고 **이미 STT 를 돌렸고** 그 비용은 공급사
+          청구서에 남는다. 지금까지 그 실측은 사라졌고, 대사에서는 `missing_core`(이벤트 유실)로
+          뜨지만 유실이 아니라 애초에 만들지 않은 것이라 원장을 뒤져도 찾을 수 없다. 이제
+          `result.billing` 에 싣지 못한 사실과 사유가 적힌다.
+        - **같은 항목을 두 출처가 내면 합산하지 않고 드러낸다**(`collectPartUsage` 와 같은 규칙) —
+          합산은 곧 이중 계상이고 이중 계상은 대사에서 과다청구가 된다.
+        - **무효한 과금 근거가 종료를 막지 않는다.** `checkBillableMs` 는 던지지 않는다 — 막으면
+          세션이 열린 채 남고 그 누수는 장애가 아니라 **요금**으로 나타난다(브리지가 `end` 를 절대
+          제한하지 않는 것과 같은 이유). 브리지도 형태 검증을 하지 않고 Core 로 넘긴다.
+        - **이미 종료된 세션에 뒤늦게 싣지 않는다**(§8.1 추가 전용) — 대신 그 통화가 통화 분 집계에서
+          빠진다는 사실을 돌려준다. **장애 폴백이 먼저 끝낸 통화가 전부 이 경로**이므로, 폴백이 잦은
+          날은 청구 근거가 통째로 비는데 그 사실만은 호스트가 알게 된다.
+        - **§5.2 전환으로 화면에서 끝난 통화를 자동으로 통화 시간에 넣지 않는다.** `session.ended.channel`
+          이 `visual` 이면 `aggregateUsage` 는 그 `billable_ms` 를 세지 않는다. 집계 규칙을 "채널 무관"
+          으로 바꾸면 잘못 선언된 채팅 세션까지 통화로 청구하는 **과다청구 경로**가 열리고, 채널을
+          음성으로 고쳐 적는 것은 거짓이다. 그래서 둘 다 하지 않고 `sessionsBillableMsOnNonVoice` 로
+          드러낸다(정책은 사람이 정한다, §13-3) — 종료 시점에도 `billing` 에 같은 사실을 적는다.
+        - **집계기도 마지막 방어선에서 거부한다**: 음수·NaN·무한은 0 으로도 그대로도 적지 않고
+          `usageValuesRejected` 로 센다(원장에는 과거 호스트가 넣은 값도 남아 있다). 대사 근거 문구가
+          "아무도 재지 않았다"(누락)와 "쟀는데 쓸 수 없는 값이 왔다"(거부)를 구분한다 — 대응이
+          배선 추가와 어댑터 환산 수정으로 서로 다르다.
+        - **0 과 누락을 같게 적지 않는다**: `billableMs` 0 은 허용한다(즉시 끊긴 호는 실제로 0 이고,
+          거부하면 측정하지 않은 것과 구분되지 않는다). 반대로 **값을 만들어 넣지 않는다** — 주지
+          않으면 키 자체가 없고 종전과 완전히 같다(§13-3). 상한도 두지 않는다("통화가 이렇게 길 수는
+          없다"는 숫자는 계약·회선마다 다르고, Core 가 정하면 그 값이 곧 정책이다).
+        - 파이썬 경로(음성)까지 연다: `aicc_bridge.py` 의 `end(..., billable_ms=None)` 과 훅 어댑터
+          `on_call_end(..., billable_ms=None)`. **값이 없으면 인자를 싣지 않는다** — 구버전 시그니처의
+          호스트 래퍼를 **종료 자리에서** 죽이지 않기 위해서다(하필 세션을 닫는 곳이라 누수가 요금이
+          된다, 검사로 고정). 선언 없이 닫은 통화는 `ends_missing_billable_ms` 로 세어 "청구할 근거가
+          없는 통화 수"를 월말 전에 볼 수 있게 했다.
+        **변이 검증(도구 출력 그대로)**: 비음성 집계 노출을 없애면 1건 실패 · 런타임의 사용량 검증을
+        생략하면 1건 실패 · `sessionEnded` 에서 `billableMs` 를 빼면 2건 실패 — 전부 원본에서는 통과한다.
+        실호출 없음(가짜 포트·드라이런 브리지로만 검증). 실회선 통화 시간 수집은 **[승인 필요]**.
+        근거: `src/billing/turnUsage.ts` · `tests/billing.turnUsage.test.mjs`(17건) ·
+        `src/billing/usage.ts`(`sessionsBillableMsOnNonVoice`·`usageValuesRejected`) ·
+        `src/billing/reconcile.ts`(근거 문구) · `tests/billing.usage.test.mjs`(11건) ·
+        `src/channels/contract.ts`(`ChannelEndInput`·`ChannelTurnResult.billing`) ·
+        `src/channels/runtime.ts`(`attachUsage`·`endBillingNote`) · `tests/channels.runtime.test.mjs`(127건 —
+        과금 배선 9건 포함) · `src/channels/bridge.ts`(`end` 의 `billableMs`·`billing` 투영) ·
+        `tests/channels.bridge.test.mjs`(32건) · `clients/python/aicc_bridge.py` ·
+        `clients/python/aicc_callbot.py` · `tests/clients.python.test.mjs`(10건) ·
+        `tests/clients.callbot.test.mjs`(17건) · `API.md` 반영
       · 남은 것: **Callbot 저장소 쪽 배선** — 코드는 훅마다 한 줄(README 참조)이며 더 쓸 것이 없다.
         남은 것은 저장소 결정 사항이다: 현행 LLM 툴(welfare_apply 등)과 Core 시나리오의 역할 분담
         (어느 쪽이 화면 노드를 밀 것인가)·실운영 Core 모듈·Flow id 를 **사람이 정해야 한다**,
@@ -984,7 +1047,15 @@
         지식 응대도 같다 — 지식베이스 목록·검색 임계값(`topK`·`minScore`·`minHits`·`maxContextChars`)·
         답변 지시문·청킹 설정은 테넌트 값이고, 문서 단위 청크 삭제 수단(`removeChunks`)은 **벡터 DB 선정
         후** 호스트가 붙인다(없으면 개정 전 청크가 남는다는 사실이 색인 결과에 드러난다),
-        챗봇·D-ARS CI 게이트 활성화를 위한 `AICC_CORE_TOKEN` 등록 **[승인 필요]**, 실회선·실메신저 연결 **[승인 필요]**
+        챗봇·D-ARS CI 게이트 활성화를 위한 `AICC_CORE_TOKEN` 등록 **[승인 필요]**, 실회선·실메신저 연결 **[승인 필요]**,
+        **참조 클라이언트 복사본 재동기화(2026-10-03 발생)** — (27)이 `clients/python/aicc_bridge.py`·
+        `aicc_callbot.py` 를 고쳤으므로 Callbot 저장소의 `voice-agent/aicc/` 복사본은 이제 낡았다
+        (지문: `aicc_bridge.py` → `f477d3e3534c`, `aicc_callbot.py` → `1fffc09cf207`). 자동 개발 세션의
+        작업 디렉터리 제한으로 그 저장소를 고칠 수 없어 **사람이 복사한다** — 복사 전까지는
+        `node scripts/client-drift.mjs --source clients/python --target <callbot>/voice-agent/aicc
+        --files aicc_bridge.py,aicc_callbot.py` 가 '다름'으로 실패하는 것이 정상이다(게이트가 바로 이
+        상태를 잡기 위해 있다). 어긋남의 증상은 컴파일 오류가 아니라 **통화 중 다른 동작**이다 —
+        지금 경우에는 음성 채널에서 `billable_ms` 를 선언할 방법이 없는 상태가 유지된다
 - [x] **이벤트 버스 영속화 어댑터** — 추가 전용 이벤트 원장(`EventLog`)·원장 기반 멱등 저장소·
       JSONL 직렬화/부분손상 복구·커서 기반 재전송·무결성 점검.
       근거: `src/events/store.ts` · `tests/events.store.test.mjs`(16건).
