@@ -923,8 +923,28 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
   async function runKnowledgeTurn(
     binding: NonNullable<ConversationCoreOptions['knowledge']>,
     rec: SessionRecord, ctx: RunnerContext, input: FlowInput, text: string,
-    latency: { latency?: LatencyMs },
+    latency: { latency?: LatencyMs }, decision: FallbackDecision,
   ): Promise<RunResult> {
+    if (decision.disable.includes('knowledge_grounding')) {
+      // §9.3 이 **끄라고 판정한 기능**은 부르지 않는다. 그동안 이 목록은 아무도 읽지 않았고
+      // (저장소 전체에서 `disable` 을 보는 코드가 없었다), 그 상태에서 지식 응대를 배선하면
+      // 판정은 "지식검색을 끈다"인데 호출은 계속된다 — 저하된 엔진을 더 밀어붙이고(§11.2 비용),
+      // 고객은 기다리고, **신뢰할 수 없다고 판정된 지식베이스로 답한다**.
+      // 여기서 판정을 다시 하지 않는다(무엇을 끌지는 `decideFallbackMode` 하나다, §2) ·
+      // **엔진 상태로 집계하지 않는다**(이미 그 상태 때문에 끈 것이다 — 또 적으면 한 번의 장애가
+      // 두 번 집계되고 복구 판정이 그만큼 늦어진다, §9.3).
+      binding.onResult?.({
+        interactionId: rec.interactionId,
+        answered: false,
+        cause: 'disabled_by_fallback',
+        infraFailed: false,
+        partial: false,
+        citations: 0,
+        reasonKo: `§9.3 판정으로 지식 응대를 끈 상태라 호출하지 않았습니다: ${decision.reasonKo}`,
+        usage: { embedChars: 0, storeQueries: 0, hits: 0, promptChars: 0, responseChars: 0 },
+      });
+      return runnerSend(rec.flow, rec.state, { kind: 'unrecognized', text, ...latency }, ctx);
+    }
     const outcome = await resolveKnowledgeTurn(
       { retriever: binding.retriever, answerer: binding.answerer, policy: binding.policy },
       { scope: rec.scope, channel: rec.state.channel, text },
@@ -946,7 +966,14 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     return runnerSend(rec.flow, rec.state, { kind: 'unrecognized', text, ...latency }, ctx);
   }
 
-  async function runTurn(rec: SessionRecord, ctx: RunnerContext, input: FlowInput): Promise<RunResult> {
+  /**
+   * `decision` 은 이 턴의 §9.3 판정이다. **다시 계산하지 않고 받는다** — `send` 가 이미
+   * 같은 값으로 장애 경로(이관·IVR·종료)를 지났으므로, 여기서 또 조회하면 그 사이에 바뀐
+   * 상태로 **한 턴 안에서 두 가지 판정**이 돌 수 있다(§2).
+   */
+  async function runTurn(
+    rec: SessionRecord, ctx: RunnerContext, input: FlowInput, decision: FallbackDecision,
+  ): Promise<RunResult> {
     const binding = opts.intent;
     const node = rec.state.currentNodeId === null ? undefined : rec.flow.nodes[rec.state.currentNodeId];
     const knowledge = opts.knowledge;
@@ -956,7 +983,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       // 근거를 못 찾는다(번호 메뉴가 필요하면 `Choice` 노드를 쓴다).
       if (input.kind === 'utterance') {
         const latency = input.latency !== undefined ? { latency: input.latency } : {};
-        return runKnowledgeTurn(knowledge, rec, ctx, input, input.text, latency);
+        return runKnowledgeTurn(knowledge, rec, ctx, input, input.text, latency, decision);
       }
       if (input.kind === 'dtmf') {
         const latency = input.latency !== undefined ? { latency: input.latency } : {};
@@ -1389,7 +1416,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
 
       const prevChannel = rec.state.channel;
       const ctx = runnerCtx(rec, reg.port.capabilities);
-      const run = await runTurn(rec, ctx, turn.input);
+      const run = await runTurn(rec, ctx, turn.input, decision);
       rec.state = run.state;
 
       if (turn.usage !== undefined) {

@@ -1718,6 +1718,43 @@ test('과금 근거는 지식 턴의 고객 발화에 붙는다(§11.2)', b, asy
   assert.equal(withUsage[0].speaker, 'customer');
 });
 
+test('§9.3 이 지식검색을 끈 상태에서는 엔진을 부르지 않는다 — 판정 목록을 실제로 읽는다', b, async () => {
+  // `FallbackDecision.disable` 은 지금까지 **저장소 어디에서도 읽지 않는 값**이었다.
+  // 그 상태로 지식 응대를 배선하면 판정은 "지식검색을 끈다"인데 호출은 계속되고,
+  // 저하된 엔진을 더 밀어붙이면서 **신뢰할 수 없다고 판정된 지식베이스로 답한다**.
+  const reports = [];
+  const rt = retrieverOf();
+  const an = answererOf();
+  const { core } = build({
+    flows: [flowFaq],
+    samples: [{ component: 'rag', state: 'degraded', observedAt: NOW }],
+    knowledge: kbBinding(rt, an, { onResult: (x) => reports.push(x) }),
+  });
+  const r = await core.start(faqReq());
+  const after = await core.send(r.interactionId, { input: { kind: 'utterance', text: RAW_Q } });
+  assert.equal(rt.calls.length, 0);
+  assert.equal(an.calls.length, 0);
+  assert.deepEqual(after.fallback.disable, ['knowledge_grounding']);
+  assert.equal(after.state.failCount, 1);                  // 통화는 §5.1 사다리로 살린다
+  // 조용히 끄지 않는다. 다만 **엔진 상태로 다시 집계하지 않는다**(그 상태 때문에 끈 것이다).
+  assert.deepEqual(reports.map((x) => [x.cause, x.infraFailed]), [['disabled_by_fallback', false]]);
+  assert.deepEqual(reports[0].usage, { embedChars: 0, storeQueries: 0, hits: 0, promptChars: 0, responseChars: 0 });
+});
+
+test('§9.3 이 끄라고 한 기능만 끈다 — LLM 저하는 지식 응대를 끄지 않는다', b, async () => {
+  const rt = retrieverOf();
+  const { core } = build({
+    flows: [flowFaq],
+    samples: [{ component: 'llm', state: 'degraded', observedAt: NOW }],
+    knowledge: kbBinding(rt, answererOf()),
+  });
+  const r = await core.start(faqReq());
+  const after = await core.send(r.interactionId, { input: { kind: 'utterance', text: RAW_Q } });
+  assert.deepEqual(after.fallback.disable, []);
+  assert.equal(rt.calls.length, 1);
+  assert.deepEqual(after.steps.map((s) => s.nodeId), ['__answer', 'bye']);
+});
+
 test('배선 거부: 검색기·답변기 부재와 성립하지 않는 정책은 통화 전에 막는다', b, () => {
   assert.throws(() => build({ flows: [flowFaq], knowledge: { answerer: answererOf(), policy: KB_POLICY } }), /지식 응대 배선 거부/);
   assert.throws(() => build({ flows: [flowFaq], knowledge: { retriever: retrieverOf(), policy: KB_POLICY } }), /지식 응대 배선 거부/);

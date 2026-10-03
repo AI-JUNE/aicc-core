@@ -82,6 +82,12 @@ export interface KnowledgeInput {
  */
 export type KnowledgeFailureCause =
   | 'empty_question'       // 빈 질문 — 엔진을 부르지 않았다
+  /**
+   * §9.3 판정이 지식 응대를 끈 상태라 **호출하지 않았다**. 이 실행기는 이 값을 만들지 않는다 —
+   * 장애 판정은 `decideFallbackMode` 하나이고, 끄는 결정은 그 판정을 받는 런타임이 한다(§2).
+   * 어휘를 여기 두는 이유는 호스트가 받는 원인 목록이 두 벌로 갈라지지 않게 하기 위해서다.
+   */
+  | 'disabled_by_fallback'
   | 'config_error'         // 정책이 성립하지 않는다 — **장애가 아니다**(우리 쪽 오타다)
   | 'embed_failed'         // 질의 임베딩 실패
   | 'store_failed'         // 지식베이스 조회 장애 — 근거 없음과 **섞지 않는다**
