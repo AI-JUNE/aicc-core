@@ -18,6 +18,7 @@ import type { DisclosurePlacement } from '../portal/aiDisclosure.ts';
 import type { ComponentId, HealthSample, FallbackDecision } from '../ops/fallback.ts';
 import type { TurnBillingNote } from '../billing/turnUsage.ts';
 import type { ConsentPurpose } from '../consent/consent.ts';
+import type { ComplianceTurnNote } from '../qa/executeCompliance.ts';
 
 export const CHANNEL_CONTRACT_VERSION = 1;
 
@@ -114,6 +115,18 @@ export interface ChannelTurnResult {
     notRecordedKo?: string;
     pendingRequired?: ConsentPurpose[];
   };
+  /**
+   * §7 5.2 준수 점검 결과. **세션이 끝난 호출에만** 실린다(점검은 세션 전체를 한꺼번에 본다) —
+   * 점검이 배선되지 않았으면 실리지 않는다(종전과 완전히 같다).
+   *
+   * 여기 있는 것은 **위반 요약**이다: 근거 이벤트 id·검출 표현·금칙어 문구는 싣지 않는다 —
+   * 이 값은 고객 접점 프로세스까지 나가고, 금칙어 목록은 운영·리뷰 화면의 자료다(§2·§10.3).
+   * 전문(`QaReport`)이 필요한 쪽은 Core 배선의 `onReport` 로 받는다.
+   *
+   * `reviewed: false` 는 **위반 0건이 아니다** — 점검을 수행하지 못했다는 뜻이고 사유가 함께 실린다.
+   * 같은 이유로 `skipped` 가 비어 있지 않은 규칙은 합격이 아니다.
+   */
+  compliance?: ComplianceTurnNote;
 }
 
 /**

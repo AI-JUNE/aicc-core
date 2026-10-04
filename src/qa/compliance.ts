@@ -7,6 +7,14 @@
 //
 // 이 모듈은 판정만 한다(순수 함수). 조치·재학습·경고 발송은 승인 후 별도 워커가 맡는다 — [승인 필요].
 // 합격률·목표 점수 같은 수치는 두지 않는다(§13-3). 점검 결과는 위반 목록이지 점수가 아니다.
+//
+// `checked` 와 `skipped` 는 **점검하지 않은 것을 합격으로 읽지 않기 위해** 있다(2026-10-04 수정).
+// 그 약속이 세 군데에서 깨져 있었다: 금칙어를 한 건도 등록하지 않은 테넌트, 이 채널에 적용되는
+// 금칙어 규칙이 없는 경우, 그리고 고지가 이 채널에서 필수로 선언되지 않은 경우 — 셋 다 검사
+// 자체를 돌리지 않는데 리포트에는 `checked` 로 남았다. 그 리포트는 "금칙어 점검 완료 · 위반 0건"
+// 으로 읽히지만 그 0 은 점검 결과가 아니라 **설정 누락**이다. 고지 표식 미등록도 절반만 적혀 있었다
+// (`disclosure_missing` 만 skipped, `disclosure_late` 는 점검 완료). 위반이 0건인 것과 보지 않은 것을
+// 같은 칸에 적는 것이 이 모듈이 막으려던 바로 그 실패다.
 import type { ChannelKind } from '../domain/types.ts';
 import type { InteractionEvent, TurnCompletedEvent, SessionStartedEvent } from '../events/schema.ts';
 import { maskPii } from '../core/policyGuard.ts';
@@ -90,6 +98,13 @@ export function isDisclosureUtterance(text: string, markers: string[]): boolean 
   });
 }
 
+/** 고지 규칙 둘은 같은 입력으로 함께 판정된다 — 한쪽만 건너뛴 것으로 적으면 다른 쪽이 합격으로 남는다. */
+const DISCLOSURE_RULES: QaRuleId[] = ['disclosure_missing', 'disclosure_late'];
+
+function skipDisclosure(reasonKo: string): QaReport['skipped'] {
+  return DISCLOSURE_RULES.map((ruleId) => ({ ruleId, reasonKo }));
+}
+
 /**
  * §10.1 — 필수 고지가 "AI가 처음 말을 걸기 전"에 나왔는지 본다.
  * 고지가 세션 후반에 붙는 건 고지가 아니라 변명이다. 그래서 누락과 지각을 나눠 판정한다.
@@ -99,17 +114,21 @@ function checkDisclosure(events: InteractionEvent[], rules: QaRuleSet, channel: 
   skipped: QaReport['skipped'];
 } {
   const findings: QaFinding[] = [];
-  const skipped: QaReport['skipped'] = [];
-  if (rules.disclosureRequired[channel] !== true) return { findings, skipped };
+  if (rules.disclosureRequired[channel] !== true) {
+    // 위반이 아니다 — 다만 **점검한 것도 아니다**. 고지 필수 선언이 빠진 테넌트의 리포트가
+    // "고지 점검 완료"로 남으면, 설정 누락이 합격과 같은 모양으로 보인다.
+    return {
+      findings,
+      skipped: skipDisclosure(`'${channel}' 채널이 고지 필수로 선언되지 않아 고지 점검을 수행하지 않았습니다(§10.1).`),
+    };
+  }
   if (rules.disclosureMarkers.length === 0) {
-    skipped.push({ ruleId: 'disclosure_missing', reasonKo: '테넌트에 고지 표식이 등록되지 않아 판정할 수 없습니다.' });
-    return { findings, skipped };
+    return { findings, skipped: skipDisclosure('테넌트에 고지 표식이 등록되지 않아 판정할 수 없습니다.') };
   }
 
   const botTurns = events.filter(isTurn).filter((e) => e.speaker === 'bot');
   if (botTurns.length === 0) {
-    skipped.push({ ruleId: 'disclosure_missing', reasonKo: '봇 발화 이벤트가 없어 고지 여부를 판정할 수 없습니다.' });
-    return { findings, skipped };
+    return { findings, skipped: skipDisclosure('봇 발화 이벤트가 없어 고지 여부를 판정할 수 없습니다.') };
   }
 
   const idx = botTurns.findIndex((e) => isDisclosureUtterance(e.utterance_masked, rules.disclosureMarkers));
@@ -130,14 +149,32 @@ function checkDisclosure(events: InteractionEvent[], rules: QaRuleSet, channel: 
       ...(at ? { eventId: at.event_id, turnId: at.turn_id, occurredAt: at.occurred_at } : {}),
     });
   }
-  return { findings, skipped };
+  return { findings, skipped: [] };
 }
 
-/** 금칙어는 봇 발화만 본다. 고객 발화를 금칙어로 잡는 건 QA가 아니라 검열이다. */
-function checkForbidden(events: InteractionEvent[], rules: QaRuleSet, channel: ChannelKind): QaFinding[] {
+/**
+ * 금칙어는 봇 발화만 본다. 고객 발화를 금칙어로 잡는 건 QA가 아니라 검열이다.
+ *
+ * 적용할 규칙이 없으면 **건너뛴 것으로 적는다**(위반 0건이 아니다). 금칙어를 등록하지 않은
+ * 테넌트와 "금칙 표현이 없었던 통화"는 리뷰 화면에서 반드시 구분되어야 한다.
+ */
+function checkForbidden(events: InteractionEvent[], rules: QaRuleSet, channel: ChannelKind): {
+  findings: QaFinding[];
+  skipped: QaReport['skipped'];
+} {
   const out: QaFinding[] = [];
   const applicable = rules.forbiddenPhrases.filter((r) => !r.channels || r.channels.includes(channel));
-  if (applicable.length === 0) return out;
+  if (applicable.length === 0) {
+    return {
+      findings: out,
+      skipped: [{
+        ruleId: 'forbidden_phrase',
+        reasonKo: rules.forbiddenPhrases.length === 0
+          ? '등록된 금칙어 규칙이 없어 금칙 표현 점검을 수행하지 않았습니다.'
+          : `'${channel}' 채널에 적용되는 금칙어 규칙이 없어 점검을 수행하지 않았습니다.`,
+      }],
+    };
+  }
   for (const e of events.filter(isTurn)) {
     if (e.speaker === 'customer') continue;
     const n = normalizeForMatch(e.utterance_masked);
@@ -156,7 +193,7 @@ function checkForbidden(events: InteractionEvent[], rules: QaRuleSet, channel: C
       }
     }
   }
-  return out;
+  return { findings: out, skipped: [] };
 }
 
 /**
@@ -234,18 +271,22 @@ export function runComplianceCheck(
   const channel: ChannelKind = (start ?? first).channel;
 
   const disclosure = checkDisclosure(sorted, rules, channel);
+  const forbidden = checkForbidden(sorted, rules, channel);
   const findings = [
     ...disclosure.findings,
-    ...checkForbidden(sorted, rules, channel),
+    ...forbidden.findings,
     ...checkPiiLeak(sorted),
   ];
-  const skippedIds = new Set(disclosure.skipped.map((s) => s.ruleId));
+  // 건너뛴 규칙은 `checked` 에서 빠진다 — 두 칸에 동시에 적히면 "점검했고 건너뛰었다"가 되어
+  // 리뷰 화면이 둘 중 하나를 고르게 되고, 그 선택은 화면마다 달라진다.
+  const skipped = [...disclosure.skipped, ...forbidden.skipped];
+  const skippedIds = new Set(skipped.map((s) => s.ruleId));
   return {
     tenantId: scope.tenantId,
     interactionId: first.interaction_id,
     findings,
     checked: ALL_RULES.filter((r) => !skippedIds.has(r)),
-    skipped: disclosure.skipped,
+    skipped,
   };
 }
 
