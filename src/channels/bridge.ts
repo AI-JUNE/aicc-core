@@ -116,6 +116,14 @@ export interface BridgeTurnPayload {
    * 과금 기록을 남길 수 있어야 한다.
    */
   billing?: unknown;
+  /**
+   * §10.1 동의. 과금 근거와 **같은 이유로** 어떤 노출 스위치와도 무관하게 나간다 — 여기에는
+   * 개인정보가 없고(목적 코드·상태·정책 버전·Core 가 쓴 사유뿐 — 동의 주체 참조는 **싣지 않는다**),
+   * 감추면 비-Node 호스트는 "이 통화에서 동의를 받았다"를 증명할 길도, **필수 동의가 아직
+   * 미획득이어서 개인정보 조회가 막힌다**는 사실을 알 길도 없다. 음성 채널(녹취·개인정보 수집)이
+   * 바로 그 사실을 가장 먼저 알아야 하는 곳이다.
+   */
+  consent?: unknown;
 }
 
 /** 처리 기록. 발화 원문·개인정보를 담지 않는다 — op·판정·마스킹된 사유만 남는다(§10.3). */
@@ -468,6 +476,15 @@ function projectTurn(r: ChannelTurnResult, opts: BridgeOptions): BridgeTurnPaylo
   // 여기에는 개인정보가 없고, 감추면 "고지했다"를 증명할 길이 호스트에 남지 않는다(§10.1).
   if (r.disclosure !== undefined) payload.disclosure = { ...r.disclosure };
   if (r.billing !== undefined) payload.billing = { ...r.billing };
+  // 동의 사실도 그대로 내보낸다. `pendingRequired` 는 **복사한 배열**이다 — 결과 객체를 그대로
+  // 넘기면 호스트가 정렬·push 로 Core 가 돌려준 판정을 고칠 수 있다(JSON 직렬화 전까지).
+  if (r.consent !== undefined) {
+    payload.consent = {
+      ...r.consent,
+      ...(r.consent.pendingRequired !== undefined ? { pendingRequired: [...r.consent.pendingRequired] } : {}),
+      ...(r.consent.recorded !== undefined ? { recorded: { ...r.consent.recorded } } : {}),
+    };
+  }
   return payload;
 }
 

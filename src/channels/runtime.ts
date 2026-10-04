@@ -1533,12 +1533,16 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     // 합류한 매체에서는 아직 고지하지 않았다 — 고객은 이 화면을 처음 본다(§5.2·§10.3).
     // 렌더할 단계가 없어도 고지는 나간다: 화면이 열린 것 자체가 AI 응대의 시작이다.
     const disclosure = prependDisclosure(rec, steps);
+    // 합류는 새 발화가 아니므로 확정된 동의가 없다. 다만 화면이 열리는 이 지점이 §10.1 동의를
+    // 받기 가장 좋은 자리이므로, 지금 미획득인 필수 목적은 그대로 드러낸다.
+    const consent = applyConsentTurn(rec, null);
     sessions.put(rec);
     const shown = visibleSteps(steps);
     if (shown.length > 0) await reg.port.present(rec.interactionId, shown);
     const result: ChannelTurnResult = {
       interactionId: rec.interactionId, state: rec.state, steps, status: rec.state.status, events: [],
       ...(disclosure !== undefined ? { disclosure } : {}),
+      ...(consent !== undefined ? { consent } : {}),
     };
     rec.lastResult = result;
     return result;
@@ -1694,10 +1698,14 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       recordTurns(rec, events);
       const summaryMasked = rec.state.handoff ? attachSummary(rec, events) : undefined;
       rec.ended = rec.state.status !== 'running';
+      // 세션 시작에는 확정된 동의가 없다 — 아직 아무것도 묻지 않았다. 다만 **필수인데 지금
+      // 미획득인 목적**은 첫 응답부터 드러낸다(그 동안 개인정보 조회가 막힌다는 뜻이다).
+      const consent = applyConsentTurn(rec, null);
       const result: ChannelTurnResult = {
         interactionId, state: rec.state, steps: drained.steps, status: rec.state.status, events,
         ...(decision.mode === 'degraded_ai' ? { fallback: decision } : {}),
         ...(disclosure !== undefined ? { disclosure } : {}),
+        ...(consent !== undefined ? { consent } : {}),
         ...(rec.state.handoff ? { handoff: { ...(rec.state.handoff.queue !== undefined ? { queue: rec.state.handoff.queue } : {}), ...(summaryMasked !== undefined ? { summaryMasked } : {}) } } : {}),
       };
       rec.lastResult = result;
@@ -1736,6 +1744,9 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       }
 
       const prevChannel = rec.state.channel;
+      // 이 턴이 **기다리던** 노드. 동의 확정 판정의 기준이다(§10.1) — 턴 뒤의 슬롯만 보면
+      // 확정된 Confirm 값이 세션에 영구히 남아 이후 모든 턴에서 같은 동의가 다시 쌓인다.
+      const pendingNodeId = rec.state.currentNodeId;
       const ctx = runnerCtx(rec, reg.port.capabilities);
       const run = await runTurn(rec, ctx, turn.input, decision);
       rec.state = run.state;
@@ -1746,6 +1757,10 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       // 채널이 이 턴에 바뀌었으면(§5.2) 새 매체는 아직 고지 전이다 — 이미 고지한 채널이면
       // 아무것도 하지 않으므로 턴마다 반복되지 않는다.
       const disclosure = prependDisclosure(rec, run.steps);
+      // 동의는 **커넥터 이행보다 먼저** 반영한다(§10.1·§6.1). 같은 턴에서 동의를 받고 곧바로
+      // 개인정보 조회로 넘어가는 시나리오(동의 → Api)가 가장 흔한 모양이고, 순서가 뒤면 방금 받은
+      // 동의가 이력에 없는 상태로 게이트를 지나 그 조회만 조용히 막힌다.
+      const consent = applyConsentTurn(rec, pendingNodeId);
       const drained = await drainConnectors(rec, reg, run);
       const events = drained.events;
       const summaryMasked = rec.state.handoff ? attachSummary(rec, events) : undefined;
@@ -1756,6 +1771,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
         interactionId, state: rec.state, steps: drained.steps, status: rec.state.status, events,
         ...(decision.mode === 'degraded_ai' ? { fallback: decision } : {}),
         ...(disclosure !== undefined ? { disclosure } : {}),
+        ...(consent !== undefined ? { consent } : {}),
         ...(rec.state.handoff ? { handoff: { ...(rec.state.handoff.queue !== undefined ? { queue: rec.state.handoff.queue } : {}), ...(summaryMasked !== undefined ? { summaryMasked } : {}) } } : {}),
         ...(billing !== undefined ? { billing } : {}),
       };

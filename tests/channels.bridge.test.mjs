@@ -257,6 +257,62 @@ test('§11.2 과금 기록은 노출 스위치와 무관하게 호스트에 나�
   assert.equal(r.result.billing.usageAttached, true);
 });
 
+test('§10.1 동의 기록도 노출 스위치와 무관하게 호스트에 나간다 — 주체 참조는 싣지 않는다', b, async () => {
+  // 음성 호스트는 "이 통화에서 동의를 받았다"를 증명해야 하고, 필수 동의가 미획득이면
+  // 개인정보 조회가 막힌다는 사실을 알아야 한다. 감추면 둘 다 알 길이 없다.
+  const CO = await import('../src/consent/executeConsent.ts');
+  const store = CO.createMemoryConsentStore();
+  const consentFlow = {
+    id: 'consent', version: 1, startNodeId: '__consent:recording',
+    nodes: {
+      '__consent:recording': {
+        id: '__consent:recording', kind: 'Confirm', prompt: '통화 녹취에 동의하십니까?', next: 'bye',
+      },
+      bye: { id: 'bye', kind: 'Say', text: '감사합니다.' },
+    },
+  };
+  const { bridge } = build({ includeSlots: false, includeHandoffSummary: false }, {
+    flows: R.createMemoryFlowRegistry([consentFlow]),
+    consent: {
+      policy: {
+        tenantId: 'goone', requirements: [{ purpose: 'recording', required: true }],
+        version: 2, updatedAt: NOW, updatedBy: 'legal@goone', approved: true,
+      },
+      records: store,
+      subjectRef: () => 'sha256:voice1',
+    },
+  });
+  const s = await bridge.handleLine(line({ id: '0', op: 'start', req: { flowId: 'consent', entryPoint: 'inbound_call' } }));
+  assert.deepEqual(s.result.consent.pendingRequired, ['recording']);
+  const r = await bridge.handleLine(line({
+    id: '1', op: 'send', interactionId: 'i_bridge1', turn: { input: { kind: 'utterance', text: '네' } },
+  }));
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.result.consent.recorded, { purpose: 'recording', state: 'granted', policyVersion: 2 });
+  assert.equal(r.result.consent.pendingRequired, undefined);
+  // 동의 주체 참조(해시여도)는 어떤 경로로도 나가지 않는다(§10.3).
+  assert.equal(JSON.stringify(r).includes('sha256:voice1'), false);
+  assert.equal(store.list('sha256:voice1').length, 1);
+});
+
+test('동의 판정은 호스트가 고칠 수 없다 — 돌려준 배열을 복사해 내보낸다', b, async () => {
+  const CO = await import('../src/consent/executeConsent.ts');
+  const { bridge, core } = build({}, {
+    consent: {
+      policy: {
+        tenantId: 'goone', requirements: [{ purpose: 'recording', required: true }],
+        version: 1, updatedAt: NOW, updatedBy: 'legal@goone', approved: true,
+      },
+      records: CO.createMemoryConsentStore(),
+      subjectRef: () => 'sha256:voice2',
+    },
+  });
+  const s = await bridge.handleLine(line({ id: '0', op: 'start', req: { flowId: 'billing', entryPoint: 'inbound_call' } }));
+  s.result.consent.pendingRequired.push('marketing');
+  const again = core.sessions.get('i_bridge1').lastResult;
+  assert.deepEqual(again.consent.pendingRequired, ['recording']);
+});
+
 test('미지 세션 send 는 오류 응답이지 예외가 아니다', b, async () => {
   const { bridge } = build();
   const r = await bridge.handleLine(line({

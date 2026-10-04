@@ -1,8 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-let R = null, F = null, B = null, P = null, EV = null, DF = null, LC = null;
+let R = null, F = null, B = null, P = null, EV = null, DF = null, LC = null, CO = null, CN = null;
 try {
+  CO = await import('../src/consent/executeConsent.ts');
+  CN = await import('../src/consent/consent.ts');
   R = await import('../src/channels/runtime.ts');
   F = await import('../src/ops/fallback.ts');
   B = await import('../src/events/bus.ts');
@@ -51,7 +53,7 @@ function fakePort(id = 'callbot', capsOver = {}, over = {}) {
   };
 }
 
-function build({ flows = [flowBilling], registry, port = fakePort(), ports, samples = [], policy = {}, components, reprompt, timing, routing, connectors, channelSwitch, disclosure, intent, knowledge } = {}) {
+function build({ flows = [flowBilling], registry, port = fakePort(), ports, samples = [], policy = {}, components, reprompt, timing, routing, connectors, channelSwitch, disclosure, intent, knowledge, consent } = {}) {
   const collector = B.createCollectorSink('t');
   const bus = B.createEventBus({
     scope: SCOPE, sinks: [collector],
@@ -78,6 +80,7 @@ function build({ flows = [flowBilling], registry, port = fakePort(), ports, samp
     ...(disclosure !== undefined ? { disclosure } : {}),
     ...(intent !== undefined ? { intent } : {}),
     ...(knowledge !== undefined ? { knowledge } : {}),
+    ...(consent !== undefined ? { consent } : {}),
   });
   return { core, port, collector, health };
 }
@@ -1872,5 +1875,286 @@ test('배선 거부: 검색기·답변기 부재와 성립하지 않는 정책�
       knowledge: kbBinding(retrieverOf(), answererOf(), { policy: { topK: 2, minScore: 0.5, minHits: 5, maxContextChars: 100 } }),
     }),
     /지식 응대 배선 거부/,
+  );
+});
+
+// ── 동의 배선 (§10.1·§6.1) ───────────────────────────────────────────────────
+//
+// 여기서 고정하는 것은 **동의 이력의 진실성**이다. 배선이 없던 동안 시나리오가 동의를 묻고
+// 고객이 "네"라고 답해도 그 답은 Confirm 슬롯 값으로만 남았고 동의 기록은 0건이었다 —
+// 통화·이벤트·적합성 검사가 모두 정상이라 드러나는 시점은 점검이거나 분쟁이다.
+// 반대편에서는 개인정보 파라미터를 선언한 커넥터가 동의 컨텍스트가 없어 **언제나** 막혀 있었다.
+
+const CPOLICY = (over = {}) => ({
+  tenantId: 'goone',
+  requirements: [
+    { purpose: 'personal_data_collection', required: true, noticeRef: 'n1' },
+    { purpose: 'marketing', required: false, noticeRef: 'n2' },
+  ],
+  version: 3, updatedAt: '2026-09-01T00:00:00.000Z', updatedBy: 'legal@goone', approved: true,
+  ...over,
+});
+
+const PDC = '__consent:personal_data_collection';
+
+/** 동의 → 개인정보 조회 시나리오. 실제 운영에서 가장 흔한 모양이다. */
+const flowConsent = ({ onNo = 'bye' } = {}) => ({
+  id: 'consent', version: 1, startNodeId: 'greet',
+  nodes: {
+    greet: { id: 'greet', kind: 'Say', text: '안녕하세요, AI 상담입니다.', next: PDC },
+    [PDC]: { id: PDC, kind: 'Confirm', prompt: '개인정보 수집·이용에 동의하십니까?', onYes: 'ask', onNo },
+    ask: { id: 'ask', kind: 'Collect', slot: 'account_no', prompt: '주민등록번호를 말씀해 주세요.', next: 'lookup' },
+    lookup: { id: 'lookup', kind: 'Api', connectorId: 'c_balance', waitText: '조회 중입니다.', next: 'tell', onError: 'sorry' },
+    tell: { id: 'tell', kind: 'Say', text: '조회가 끝났습니다.' },
+    sorry: { id: 'sorry', kind: 'Say', text: '지금은 조회가 어렵습니다.' },
+    bye: { id: 'bye', kind: 'Say', text: '동의 없이는 진행할 수 없습니다.' },
+  },
+});
+
+function consentWiring(over = {}) {
+  const store = CO.createMemoryConsentStore();
+  const recorded = [];
+  return {
+    store, recorded,
+    binding: {
+      policy: CPOLICY(),
+      records: store,
+      subjectRef: () => 'sha256:abc',
+      onRecord: (i) => recorded.push(i),
+      ...over,
+    },
+  };
+}
+
+/** pii 파라미터를 선언한 커넥터 — `requiresConsent` 가 참이므로 게이트를 지나야 한다. */
+const piiWiring = (over) => wiring({
+  defs: [CDEF({ params: [{ name: 'rrn', fromSlot: 'account_no', required: true, pii: true }] })],
+  ...over,
+});
+
+test('§13-3 배선이 없으면 종전과 완전히 같다 — 동의는 슬롯 값으로만 남고 기록은 0건이다', b, async () => {
+  const { core } = build({ flows: [flowConsent()] });
+  await core.start(req({ flowId: 'consent' }));
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '네' } });
+  assert.equal(r.consent, undefined);                         // 결과에 아무것도 실리지 않는다
+  assert.equal(r.state.slots[`${PDC}__confirmed`], 'yes');    // 답은 슬롯에만 남는다
+  // 그 사실을 조용히 두지는 않는다.
+  assert.equal(core.warnings().some((w) => w.code === 'W_CONSENT_UNBOUND'), true);
+});
+
+test('배선하면 확정된 "네"가 추가 전용 이력에 기록된다(§10.1)', b, async () => {
+  const c = consentWiring();
+  const { core } = build({ flows: [flowConsent()], consent: c.binding });
+  const s = await core.start(req({ flowId: 'consent' }));
+  // 아직 아무것도 묻지 않았으므로 기록은 없고, 필수 미획득 사실만 드러난다.
+  assert.equal(s.consent.recorded, undefined);
+  assert.deepEqual(s.consent.pendingRequired, ['personal_data_collection']);
+
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '네' } });
+  assert.deepEqual(r.consent.recorded, {
+    purpose: 'personal_data_collection', state: 'granted', policyVersion: 3,
+  });
+  assert.equal(r.consent.pendingRequired, undefined);
+  assert.equal(c.store.list('sha256:abc').length, 1);
+  const rec = c.store.list('sha256:abc')[0];
+  assert.equal(rec.state, 'granted');
+  assert.equal(rec.via, 'voice');
+  assert.equal(rec.interactionId, 'i_test1');
+  assert.deepEqual(c.recorded, [{
+    interactionId: 'i_test1', purpose: 'personal_data_collection', recorded: true, state: 'granted',
+  }]);
+});
+
+test('같은 동의를 턴마다 다시 쌓지 않는다 — 확정된 슬롯은 세션에 영구히 남는다', b, async () => {
+  const c = consentWiring();
+  const w = piiWiring();
+  const { core } = build({ flows: [flowConsent()], consent: c.binding, connectors: w.binding });
+  await core.start(req({ flowId: 'consent' }));
+  await core.send('i_test1', { input: { kind: 'utterance', text: '네' } });
+  assert.equal(c.store.list('sha256:abc').length, 1);
+  // 이후 턴들. 슬롯만 보고 기록하면 여기서 건수가 계속 늘어난다(한 통화에 수십 건).
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '900101-1234567' } });
+  assert.equal(c.store.list('sha256:abc').length, 1);
+  assert.equal(r.consent, undefined);          // 기록도 미획득도 없으면 아무것도 싣지 않는다
+  assert.equal(c.recorded.length, 1);
+});
+
+test('실패 경로: 되묻는 중에는 기록하지 않는다 — 침묵은 동의가 아니다(§5.1)', b, async () => {
+  const c = consentWiring();
+  const { core } = build({ flows: [flowConsent()], consent: c.binding });
+  await core.start(req({ flowId: 'consent' }));
+  const r = await core.send('i_test1', { input: { kind: 'timeout' } });
+  assert.equal(c.store.list('sha256:abc').length, 0);
+  assert.equal(r.consent.recorded, undefined);
+  assert.equal(r.consent.notRecordedKo, undefined);          // 되묻는 중은 정상이라 사유를 올리지 않는다
+  assert.deepEqual(r.consent.pendingRequired, ['personal_data_collection']);
+  assert.deepEqual(c.recorded, []);
+});
+
+test('경계: 기록된 동의가 개인정보 조회를 **실제로** 통과시킨다(§6.1)', b, async () => {
+  const c = consentWiring();
+  const w = piiWiring();
+  const { core } = build({ flows: [flowConsent()], consent: c.binding, connectors: w.binding });
+  await core.start(req({ flowId: 'consent' }));
+  await core.send('i_test1', { input: { kind: 'utterance', text: '네' } });
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '900101-1234567' } });
+  assert.equal(w.calls.length, 1);                            // 게이트를 지났다
+  assert.deepEqual(r.steps.map((s) => s.nodeId), ['lookup', 'tell']);
+  assert.equal(r.state.slots.__last_connector_error__, undefined);
+});
+
+test('경계: 거부한 고객의 개인정보 조회는 막히고 onError 로 간다 — 성공으로 넘어가지 않는다', b, async () => {
+  const c = consentWiring();
+  const w = piiWiring();
+  // 거부해도 흐름이 조회로 가는 시나리오(설정은 테넌트 몫이다) — 게이트가 마지막 방어선이다.
+  const { core } = build({ flows: [flowConsent({ onNo: 'ask' })], consent: c.binding, connectors: w.binding });
+  await core.start(req({ flowId: 'consent' }));
+  const no = await core.send('i_test1', { input: { kind: 'utterance', text: '아니요' } });
+  assert.equal(no.consent.recorded.state, 'denied');
+  assert.deepEqual(no.consent.pendingRequired, ['personal_data_collection']);
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '900101-1234567' } });
+  assert.equal(w.calls.length, 0);
+  assert.equal(r.state.slots.__last_connector_error__, 'consent_denied');
+  assert.deepEqual(r.steps.map((s) => s.nodeId), ['lookup', 'sorry']);
+});
+
+test('실패 경로: 주체 참조가 없으면 기록하지 않고 사유를 올린다(§10.3)', b, async () => {
+  const c = consentWiring({ subjectRef: () => undefined });
+  const { core } = build({ flows: [flowConsent()], consent: c.binding });
+  await core.start(req({ flowId: 'consent' }));
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '네' } });
+  assert.equal(r.consent.recorded, undefined);
+  assert.match(r.consent.notRecordedKo, /주체 참조가 없어/);
+  // 주체를 모르는 상태를 "다 받았다"로 적지 않는다.
+  assert.deepEqual(r.consent.pendingRequired, ['personal_data_collection']);
+  assert.equal(c.recorded[0].recorded, false);
+});
+
+test('실패 경로: 주체 조회가 던져도 통화는 끊기지 않는다', b, async () => {
+  const c = consentWiring({ subjectRef: () => { throw new Error('auth down'); } });
+  const { core } = build({ flows: [flowConsent()], consent: c.binding });
+  await core.start(req({ flowId: 'consent' }));
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '네' } });
+  assert.equal(r.status, 'running');
+  assert.match(r.consent.notRecordedKo, /주체 참조가 없어/);
+});
+
+test('실패 경로: 이력 저장이 실패해도 통화는 계속되고 사실이 드러난다', b, async () => {
+  const c = consentWiring({
+    records: { list: () => [], append() { throw new Error('DB down'); } },
+  });
+  const { core } = build({ flows: [flowConsent()], consent: c.binding });
+  await core.start(req({ flowId: 'consent' }));
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '네' } });
+  assert.equal(r.status, 'running');
+  assert.equal(r.consent.recorded, undefined);
+  assert.match(r.consent.notRecordedKo, /이력 저장이 실패해/);
+  assert.equal(c.recorded[0].recorded, false);
+});
+
+test('실패 경로: 이력 조회가 던져도 "다 받았다"로 읽지 않는다', b, async () => {
+  const c = consentWiring({
+    records: { list() { throw new Error('DB down'); }, append() {} },
+  });
+  const { core } = build({ flows: [flowConsent()], consent: c.binding });
+  const s = await core.start(req({ flowId: 'consent' }));
+  assert.deepEqual(s.consent.pendingRequired, ['personal_data_collection']);
+});
+
+test('증빙 참조는 호스트가 주며 조회가 던져도 기록을 막지 않는다', b, async () => {
+  const c = consentWiring({ evidenceRef: ({ purpose }) => `rec:${purpose}` });
+  const { core } = build({ flows: [flowConsent()], consent: c.binding });
+  await core.start(req({ flowId: 'consent' }));
+  await core.send('i_test1', { input: { kind: 'utterance', text: '네' } });
+  assert.equal(c.store.list('sha256:abc')[0].evidenceRef, 'rec:personal_data_collection');
+
+  const boom = consentWiring({ evidenceRef: () => { throw new Error('vault down'); } });
+  const { core: core2 } = build({ flows: [flowConsent()], consent: boom.binding });
+  await core2.start(req({ flowId: 'consent' }));
+  await core2.send('i_test1', { input: { kind: 'utterance', text: '네' } });
+  assert.equal(boom.store.list('sha256:abc').length, 1);
+  assert.equal(boom.store.list('sha256:abc')[0].evidenceRef, undefined);
+});
+
+test('배선 거부: 미승인·다른 테넌트 정책과 주체·저장소 부재는 통화 전에 막는다', b, () => {
+  const base = consentWiring().binding;
+  assert.throws(
+    () => build({ flows: [flowConsent()], consent: { ...base, policy: CPOLICY({ approved: false }) } }),
+    /동의 배선 거부/,
+  );
+  assert.throws(
+    () => build({ flows: [flowConsent()], consent: { ...base, policy: CPOLICY({ tenantId: 'rival' }) } }),
+    /동의 배선 거부/,
+  );
+  assert.throws(
+    () => build({ flows: [flowConsent()], consent: { ...base, subjectRef: undefined } }),
+    /주체 참조 조회/,
+  );
+  assert.throws(
+    () => build({ flows: [flowConsent()], consent: { ...base, records: {} } }),
+    /동의 이력 저장소/,
+  );
+});
+
+test('배선 거부: 동의 컨텍스트 출처가 둘이면 설정 오류다(§2)', b, () => {
+  const w = piiWiring({ consent: () => undefined });
+  assert.throws(
+    () => build({ flows: [flowConsent()], consent: consentWiring().binding, connectors: w.binding }),
+    /같은 판정의 출처가 둘이면/,
+  );
+});
+
+test('시작 전 거부: 성립하지 않는 동의 노드는 통화를 시작하지 않는다', b, async () => {
+  const bad = flowConsent();
+  bad.nodes['__consent:모름'] = { id: '__consent:모름', kind: 'Confirm', prompt: '동의?', next: 'bye' };
+  const { core } = build({ flows: [bad], consent: consentWiring().binding });
+  await assert.rejects(() => core.start(req({ flowId: 'consent' })), /동의 질문 노드가 성립하지 않습니다/);
+
+  const loop = flowConsent();
+  loop.nodes[PDC] = { ...loop.nodes[PDC], onNo: PDC };
+  const { core: core2 } = build({ flows: [loop], consent: consentWiring().binding });
+  await assert.rejects(() => core2.start(req({ flowId: 'consent' })), /self_branch/);
+});
+
+test('경고: 필수 목적을 묻는 노드가 시나리오에 없으면 드러낸다(§10.1)', b, async () => {
+  const { core } = build({ consent: consentWiring().binding });     // flowBilling — 동의 노드 없음
+  await core.start(req());
+  const w = core.warnings().find((x) => x.code === 'W_CONSENT');
+  assert.ok(w);
+  assert.match(w.messageKo, /personal_data_collection/);
+});
+
+test('경고: 개인정보 커넥터가 있는데 동의 컨텍스트 출처가 없으면 드러낸다(§6.1)', b, async () => {
+  const w = piiWiring();
+  const { core } = build({ flows: [flowApiOnError()], connectors: w.binding });
+  await core.start(req({ flowId: 'api' }));
+  const issue = core.warnings().find((x) => x.code === 'W_CONSENT_UNBOUND');
+  assert.ok(issue);
+  assert.match(issue.messageKo, /언제나 동의 게이트에서 막힙니다/);
+});
+
+test('개인정보를 싣지 않는 커넥터는 경고를 만들지 않는다 — 가짜 경고가 쌓이면 진짜 누락이 묻힌다', b, async () => {
+  const w = wiring();                                               // pii 선언 없음·국내
+  const { core } = build({ flows: [flowApiOnError()], connectors: w.binding });
+  await core.start(req({ flowId: 'api' }));
+  assert.equal(core.warnings().some((x) => x.code === 'W_CONSENT_UNBOUND'), false);
+});
+
+test('호스트가 넘긴 동의 컨텍스트는 덮어쓰지 않는다 — 그 경로는 종전과 같다', b, async () => {
+  const seeded = [{
+    tenantId: 'goone', subjectRef: 'sha256:host', purpose: 'personal_data_collection',
+    state: 'granted', at: '2026-08-01T00:00:00.000Z', via: 'web', policyVersion: 3,
+  }];
+  const w = piiWiring({
+    consent: () => ({ policy: CPOLICY(), records: seeded, subjectRef: 'sha256:host', now: NOW }),
+  });
+  const { core } = build({ flows: [flowApiOnError()], connectors: w.binding });
+  await core.start(req({ flowId: 'api' }));
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '900101-1234567' } });
+  assert.equal(w.calls.length, 1);
+  assert.equal(r.consent, undefined);
+  assert.equal(
+    CN.gateAction(CPOLICY(), seeded, 'call_backend_with_pii', 'sha256:host', NOW, SCOPE).allow,
+    true,
   );
 });
