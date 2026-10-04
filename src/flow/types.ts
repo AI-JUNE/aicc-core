@@ -59,6 +59,15 @@ export function isKnowledgeEntryNode(node: FlowNode | undefined): node is Collec
 }
 
 /**
+ * `Confirm` 노드가 확정된 답(`yes`·`no`)을 담는 슬롯 키. **판정은 한 곳에만 둔다** —
+ * Runner 가 이 규칙으로 값을 쓰고, 그 값을 읽는 쪽(§10.1 동의 기록)이 접미사를 복사해 적으면
+ * 한쪽을 고치는 날 다른 쪽이 조용히 아무것도 못 읽게 된다(예외가 아니라 **기록 0건**으로 나타난다).
+ */
+export function confirmSlotKey(nodeId: string): string {
+  return `${nodeId}__confirmed`;
+}
+
+/**
  * 답변 각주(§5.2). 화면·말풍선에 "[1] 수수료 안내"로 붙는 값이며 **최소한만 싣는다** —
  * 청크 id·문서 id·점수는 채널이 쓸 일이 없고, 각주에 내부 식별자가 섞이면 되돌릴 수 없다.
  */

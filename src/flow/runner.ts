@@ -3,7 +3,7 @@
 // 실엔진·실회선은 호출하지 않는다(입력은 상위 계층이 어댑터로부터 받아 전달).
 import type { ChannelKind, Handoff, Outcome } from '../domain/types.ts';
 import type { Flow, FlowNode, RenderedStep } from './types.ts';
-import { INTENT_SLOT, KNOWLEDGE_SLOT, renderNode } from './types.ts';
+import { INTENT_SLOT, KNOWLEDGE_SLOT, confirmSlotKey, renderNode } from './types.ts';
 import { decideFallback, type FallbackAction } from '../core/session.ts';
 import { buildReprompt, classifyFailure, type FailureSignal, type RepromptPolicy, type RepromptReason } from './reprompt.ts';
 import { resolveTurnTiming, type TurnTimingPolicy } from './timing.ts';
@@ -399,8 +399,8 @@ function resolve(node: FlowNode, input: FlowInput, ctx: RunnerContext): Resoluti
     }
     case 'Confirm': {
       const low = v.toLowerCase();
-      if (YES.includes(low)) return { ok: true, next: node.onYes ?? node.next ?? null, slot: { key: `${node.id}__confirmed`, value: 'yes' } };
-      if (NO.includes(low)) return { ok: true, next: node.onNo ?? node.next ?? null, slot: { key: `${node.id}__confirmed`, value: 'no' } };
+      if (YES.includes(low)) return { ok: true, next: node.onYes ?? node.next ?? null, slot: { key: confirmSlotKey(node.id), value: 'yes' } };
+      if (NO.includes(low)) return { ok: true, next: node.onNo ?? node.next ?? null, slot: { key: confirmSlotKey(node.id), value: 'no' } };
       return { ok: false };
     }
     default:

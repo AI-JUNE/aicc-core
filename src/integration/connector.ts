@@ -231,6 +231,16 @@ export function piiParams(def: ConnectorDef): string[] {
   return def.params.filter((p) => p.pii === true).map((p) => p.name);
 }
 
+/**
+ * 이 커넥터를 부르려면 동의 컨텍스트가 **필수**인가(§10.1). 판정은 한 곳에만 둔다 —
+ * 실행기는 이 조건으로 호출을 막고, 런타임은 같은 조건으로 "동의 컨텍스트 출처가 없으면
+ * 이 조회는 통화 중 언제나 막힌다"를 **시작 전에** 경고한다. 두 곳이 조건을 따로 적으면
+ * 한쪽을 고치는 날 경고가 사라진 채 통화만 조용히 막힌다.
+ */
+export function requiresConsent(def: ConnectorDef): boolean {
+  return piiParams(def).length > 0 || def.residency === 'overseas';
+}
+
 // ── 요청 조립 ─────────────────────────────────────────────────────────────────
 
 export interface BuildContext {

@@ -24,7 +24,7 @@ import type { FlowInput } from '../flow/runner.ts';
 import type { HealthSample } from '../ops/fallback.ts';
 import {
   CONNECTOR_HEALTH_COMPONENT, applyResponse, assertConnectorResidency, assertConnectorScope,
-  buildRequest, connectorOk, decideOnFailure, piiParams, redactRequest, validateConnector,
+  buildRequest, connectorOk, decideOnFailure, piiParams, redactRequest, requiresConsent, validateConnector,
   type ConnectorDef, type ConnectorErrorCode, type ConnectorFailureAction, type ConnectorPort,
   type ConnectorRequest, type ConnectorResponse,
 } from './connector.ts';
@@ -176,7 +176,7 @@ export async function executeConnector(input: ExecuteConnectorInput): Promise<Ex
   }
 
   const pii = piiParams(def);
-  if (pii.length > 0 || def.residency === 'overseas') {
+  if (requiresConsent(def)) {
     if (!input.consent) {
       return {
         kind: 'blocked', reason: 'consent_context_missing',

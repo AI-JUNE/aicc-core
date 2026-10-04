@@ -42,6 +42,7 @@ import type { AiDisclosureConfig } from '../portal/aiDisclosure.ts';
 import { planDisclosure, validateDisclosureBinding } from '../core/executeDisclosure.ts';
 import type { ConnectorPumpBinding } from '../integration/connectorPump.ts';
 import { connectorHopLimit, hopLimitInput, missingConnectors, pumpConnectorHop } from '../integration/connectorPump.ts';
+import { requiresConsent } from '../integration/connector.ts';
 import type { IntentCatalog, IntentPolicy } from '../nlu/intent.ts';
 import { validateIntentCatalog, validateIntentPolicy } from '../nlu/intent.ts';
 import type { FlowLookup, IntentRoutingTable } from '../nlu/intentRouting.ts';
@@ -55,6 +56,12 @@ import type { Answerer } from '../knowledge/answer.ts';
 import type { Retriever } from '../knowledge/retrieval.ts';
 import type { KnowledgeFailureCause, KnowledgeUsage } from '../knowledge/executeKnowledge.ts';
 import { resolveKnowledgeTurn } from '../knowledge/executeKnowledge.ts';
+import type { ConsentPolicy, ConsentPurpose, ConsentRecord } from '../consent/consent.ts';
+import type { ConsentStore } from '../consent/executeConsent.ts';
+import {
+  buildConsentLookup, consentNodeDefects, consentNodes, consentPurposeOf, isConsentNode,
+  pendingRequiredConsents, planConsentTurn, validateConsentBinding,
+} from '../consent/executeConsent.ts';
 import type { TurnBillingNote } from '../billing/turnUsage.ts';
 import { attachTurnUsage, billingNoteOrUndefined, checkBillableMs, mergeTurnUsage, usageNote } from '../billing/turnUsage.ts';
 import type {
@@ -289,6 +296,54 @@ export interface KnowledgeBinding {
   }) => void;
 }
 
+/**
+ * 동의 배선(§10.1·§10.3·§6.1). **주지 않으면 종전과 완전히 같다**(§13-3) — 동의는 기록되지
+ * 않고, 그 사실이 `W_CONSENT_UNBOUND` 경고로 남는다.
+ *
+ * 주면 Core 가 두 가지를 한다: (1) 시나리오의 동의 질문 노드(`__consent:<목적>` id 를 가진
+ * `Confirm`)에서 확정된 답을 **추가 전용 기록 한 건**으로 바꿔 저장소에 넘기고,
+ * (2) 그 이력으로 업무시스템 조회의 동의 컨텍스트를 만든다 — §6.1 게이트는 이미 있었으나
+ * 그 입력을 만드는 코드가 저장소에 0건이어서 pii 파라미터를 선언한 커넥터는 **언제나 막혔다**.
+ *
+ * 이 배선이 없으면 `consent/consent.ts`(정책 검증·상태 판정·기록 생성)는 저장소에 있으나
+ * **아무도 부르지 않는** 상태로 남고, 채널 3곳이 각자 동의 기록을 짜며 각자 다르게 틀린다(§2).
+ *
+ * 문구·법적 근거·보유기간은 Core 가 만들지 않는다 — 법무 검토를 거친 테넌트 정책만 싣는다 **[승인 필요]**.
+ */
+export interface ConsentBinding {
+  /**
+   * 테넌트 동의 정책. **고정 객체로 받는다** — 운영 중 정책을 고치면 버전이 달라지고, 살아 있는
+   * 런타임에 그 객체가 물려 있으면 진행 중인 통화의 동의가 **다른 버전으로 기록된다**(어떤 문구로
+   * 받은 동의인지 추적할 수 없게 된다, §10.1). 새 정책은 재배선으로 싣는다.
+   */
+  policy: ConsentPolicy;
+  /** 추가 전용 동의 이력 저장소. 영속 구현으로 교체한다(§6.2) — 인메모리는 단일 프로세스용이다. */
+  records: ConsentStore;
+  /**
+   * 동의 주체 참조. **호스트가 만든다** — 해시·고객키만이며 Core 는 만들지 않는다(§10.3·§13-3).
+   *
+   * 특히 `interactionId` 를 주체로 쓰지 않는다: 통화마다 주체가 달라져 재동의가 영영 쌓이지 않고,
+   * 다음 통화에서는 **직전에 받은 동의를 찾을 수 없다**. 인증 전이면 `undefined` 를 주면 된다 —
+   * 그 상태의 동의는 기록되지 않고, 그 사실이 턴 결과에 적힌다(없음을 통과로 읽지 않는다).
+   * 던져도 통화는 끊지 않는다("없음"으로 본다).
+   */
+  subjectRef: (interactionId: string) => string | undefined;
+  /** 증빙 참조(녹취 구간 키·서명 id). 증빙 원문을 넣지 않는다(§10.3). */
+  evidenceRef?: (args: { interactionId: string; purpose: ConsentPurpose }) => string | undefined;
+  /**
+   * 이번 턴의 동의 처리 결과를 호스트에 그대로 올린다(삼키지 않는다).
+   * **기록하지 못한 경우도 올린다** — 주체 미설정·미승인 정책·정책 미선언은 설정 문제이고,
+   * 올리지 않으면 "동의를 받았다고 생각하는데 이력이 없다"가 몇 주 뒤에 발견된다.
+   */
+  onRecord?: (info: {
+    interactionId: string;
+    purpose?: ConsentPurpose;
+    recorded: boolean;
+    state?: 'granted' | 'denied';
+    reasonKo?: string;
+  }) => void;
+}
+
 export interface ConversationCoreOptions {
   scope: TenantScope;
   flows: FlowRegistry;
@@ -344,6 +399,12 @@ export interface ConversationCoreOptions {
    * 문구는 Core 가 만들지 않는다 — 법무 검토를 거친 테넌트 문구만 싣는다 **[승인 필요]**.
    */
   disclosure?: AiDisclosureConfig;
+  /**
+   * 동의(§10.1·§6.1). **주지 않으면 종전과 완전히 같다**(§13-3) — 동의 기록은 0건이고,
+   * 개인정보 파라미터를 선언한 커넥터 조회는 동의 컨텍스트가 없어 항상 막힌다.
+   * 그 사실이 `W_CONSENT_UNBOUND` 경고로 남는다.
+   */
+  consent?: ConsentBinding;
   now?: () => string;
   newInteractionId?: (req: ChannelSessionRequest) => string;
   onPublish?: (results: PublishResult[]) => void;
@@ -502,6 +563,66 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       throw new Error('채널 전환 배선 거부: 승계 슬롯 allowlist 가 배열이 아니다 (설계서 §10.3)');
     }
   }
+
+  // 동의 배선도 **배포 시점에** 거른다. 미승인 정책·다른 테넌트 정책을 통과시키면 그 정책으로
+  // 받은 동의가 이력에 쌓이는데, 그건 동의가 아니다(§10.1) — 그리고 통화·이벤트 어디에서도
+  // 터지지 않으므로 점검에서 처음 드러난다(고지·라우팅·전환과 같은 규칙).
+  if (opts.consent !== undefined) {
+    const cb = opts.consent;
+    if (typeof cb.subjectRef !== 'function') {
+      throw new Error('동의 배선 거부: 주체 참조 조회(subjectRef)가 없다 — Core 는 동의 주체를 만들지 않는다 (설계서 §10.3·§13-3)');
+    }
+    if (!cb.records || typeof cb.records.list !== 'function' || typeof cb.records.append !== 'function') {
+      throw new Error('동의 배선 거부: 동의 이력 저장소(records)가 없다 — Core 는 동의를 영속화하지 않는다 (설계서 §6.2)');
+    }
+    const cIssues = validateConsentBinding(cb.policy, opts.scope);
+    if (cIssues.errorsKo.length > 0) {
+      throw new Error(`동의 배선 거부: ${cIssues.errorsKo.join(' / ')}`);
+    }
+    for (const messageKo of cIssues.warningsKo) warnings.push({ code: 'W_CONSENT', severity: 'warning', messageKo });
+    // 출처가 둘이면 **어느 쪽이 이겼는지가 화면마다 달라진다**(§2 의 이중 관리). 호스트가 자기
+    // 컨텍스트를 만들고 있다면 Core 가 조용히 덮어쓰지 않고 설정 오류로 본다.
+    if (opts.connectors?.consent !== undefined) {
+      throw new Error(
+        '동의 배선 거부: 커넥터 배선에 이미 동의 컨텍스트(connectors.consent)가 있다 — '
+        + '같은 판정의 출처가 둘이면 어느 쪽이 적용됐는지 알 수 없다 (설계서 §10.1·§2)',
+      );
+    }
+  }
+
+  /**
+   * 호스트의 주체 참조 조회. **던져도 통화를 끊지 않는다** — "없음"으로 보고, 그 상태에서
+   * 개인정보 조회만 막힌다(안전한 방향). 빈 문자열은 값이 아니라 누락으로 읽는다.
+   */
+  function consentSubjectRef(interactionId: string): string | undefined {
+    const cb = opts.consent;
+    if (!cb) return undefined;
+    try {
+      const ref = cb.subjectRef(interactionId);
+      return typeof ref === 'string' && ref.trim() !== '' ? ref : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * 커넥터 펌프에 넘기는 배선. 동의가 배선돼 있으면 **Core 가 동의 컨텍스트를 만들어 끼운다** —
+   * §6.1 게이트(`executeConnector`)는 이미 있었지만 그 입력을 만드는 코드가 저장소에 0건이어서
+   * 개인정보 파라미터를 선언한 커넥터는 통화 중 **언제나** `consent_context_missing` 으로 막혔다.
+   * 호스트가 자기 컨텍스트를 넘기고 있으면 덮어쓰지 않는다(위에서 설정 오류로 거부된다).
+   */
+  const connectorBinding: ConnectorPumpBinding | undefined = (() => {
+    const b = opts.connectors;
+    if (b === undefined) return undefined;
+    const cb = opts.consent;
+    if (cb === undefined || b.consent !== undefined) return b;
+    return {
+      ...b,
+      consent: ({ interactionId }) => buildConsentLookup(
+        cb.policy, cb.records, consentSubjectRef(interactionId), now(),
+      ),
+    };
+  })();
 
   for (const reg of opts.channels) {
     const issues = validateRegistration(reg);
@@ -870,7 +991,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
   async function drainConnectors(
     rec: SessionRecord, reg: ChannelRegistration, run: RunResult,
   ): Promise<{ steps: RenderedStep[]; events: InteractionEvent[]; presented: number; endReasonKo?: string }> {
-    const binding = opts.connectors;
+    const binding = connectorBinding;
     const steps: RenderedStep[] = [...run.steps];
     const events: InteractionEvent[] = [...run.events];
     let presented = 0;
@@ -1277,6 +1398,93 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     return { channel, placement: plan.placement, configVersion: plan.configVersion };
   }
 
+  function consentEvidenceRef(interactionId: string, purpose: ConsentPurpose): string | undefined {
+    const cb = opts.consent;
+    if (!cb?.evidenceRef) return undefined;
+    try {
+      const ref = cb.evidenceRef({ interactionId, purpose });
+      return typeof ref === 'string' && ref.trim() !== '' ? ref : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * 이번 턴의 §10.1 동의 처리. 배선이 없으면 **아무것도 하지 않는다** — 종전과 완전히 같다(§13-3).
+   *
+   * `pendingNodeId` 는 **이 턴이 시작될 때 입력을 기다리던 노드**다. 턴 처리 후의 슬롯만 보고
+   * 기록하면 확정된 `Confirm` 슬롯이 세션에 영구히 남으므로 이후 모든 턴에서 같은 동의가 다시
+   * 쌓이고(한 통화에 수십 건), 감사에서는 어느 것이 진짜 동의 시점인지 알 수 없게 된다.
+   *
+   * 기록 실패는 **통화를 끊지 않는다**. 저장소 장애는 "동의 없음"으로 남아 개인정보 조회만
+   * 막히는데(§6.1 게이트) 그것이 안전한 방향이다 — 반대로 하면 기록 없는 동의로 조회가 나간다.
+   * 테넌트 격리 위반만 그대로 올라간다(§11.1 — 남의 테넌트 이력에 쌓이는 동의는 동의가 아니다).
+   */
+  function applyConsentTurn(rec: SessionRecord, pendingNodeId: string | null): ChannelTurnResult['consent'] {
+    const cb = opts.consent;
+    if (!cb) return undefined;
+    const out: NonNullable<ChannelTurnResult['consent']> = {};
+    const pendingNode = pendingNodeId === null ? undefined : rec.flow.nodes[pendingNodeId];
+    if (isConsentNode(pendingNode)) {
+      const purpose = consentPurposeOf(pendingNode.id);
+      const evidenceRef = purpose === undefined ? undefined : consentEvidenceRef(rec.interactionId, purpose);
+      const plan = planConsentTurn({
+        policy: cb.policy,
+        scope: rec.scope,
+        pendingNode,
+        slotsAfter: rec.state.slots,
+        nodeAfter: rec.state.currentNodeId,
+        failCountAfter: rec.state.failCount,
+        subjectRef: consentSubjectRef(rec.interactionId),
+        at: now(),
+        via: rec.state.channel,
+        interactionId: rec.interactionId,
+        ...(evidenceRef !== undefined ? { evidenceRef } : {}),
+      });
+      if (plan.action === 'record') {
+        let appended = true;
+        try {
+          cb.records.append(plan.record);
+        } catch {
+          appended = false;
+        }
+        if (appended) {
+          out.recorded = { purpose: plan.purpose, state: plan.state, policyVersion: plan.record.policyVersion };
+        } else {
+          out.notRecordedKo = `${plan.purpose} 동의가 확정됐으나 이력 저장이 실패해 기록되지 않았습니다 — `
+            + '그 동의는 근거가 없고, 개인정보 조회는 게이트에서 막힙니다(§10.1·§6.1).';
+        }
+        cb.onRecord?.({
+          interactionId: rec.interactionId, purpose: plan.purpose, recorded: appended, state: plan.state,
+          ...(out.notRecordedKo !== undefined ? { reasonKo: out.notRecordedKo } : {}),
+        });
+      } else if (plan.code !== 'not_consent_turn' && plan.code !== 'unanswered') {
+        // 설정 문제다(주체 미설정·미승인 정책·정책 미선언). 삼키면 "동의를 받았다고 생각하는데
+        // 이력이 없다"가 몇 주 뒤에 발견된다. 되묻는 중(`unanswered`)은 정상이므로 올리지 않는다.
+        out.notRecordedKo = plan.reasonKo;
+        cb.onRecord?.({
+          interactionId: rec.interactionId, recorded: false, reasonKo: plan.reasonKo,
+          ...(plan.purpose !== undefined ? { purpose: plan.purpose } : {}),
+        });
+      }
+    }
+
+    // 필수인데 아직 granted 가 아닌 목적. **막는 데 쓰지 않는다** — 거부 분기는 시나리오가 정한다.
+    let records: readonly ConsentRecord[] = [];
+    const subjectRef = consentSubjectRef(rec.interactionId);
+    if (subjectRef !== undefined) {
+      try {
+        const listed = cb.records.list(subjectRef);
+        if (Array.isArray(listed)) records = listed;
+      } catch {
+        records = [];   // 조회 실패를 "다 받았다"로 읽지 않는다 — 아래에서 미획득으로 적힌다
+      }
+    }
+    const pending = pendingRequiredConsents(cb.policy, records, subjectRef, now());
+    if (pending.length > 0) out.pendingRequired = pending;
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
+
   async function join(req: ChannelSessionRequest, interactionId: string): Promise<ChannelTurnResult> {
     const rec = sessions.get(interactionId);
     if (!rec) throw new Error(`합류할 Interaction이 없습니다: ${interactionId} (§5.2)`);
@@ -1367,6 +1575,61 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       if (unsupported.length > 0) {
         // 렌더 불가 노드를 가진 시나리오는 시작하지 않는다 — 통화 중간에 막히는 것이 더 나쁘다(§5.3).
         throw new Error(`${req.adapter} 채널에서 실행할 수 없는 시나리오입니다: ${unsupported.map((i) => i.messageKo).join(' / ')}`);
+      }
+      // 동의 노드 결함은 **시작 전에** 거른다(렌더 불가 노드와 같은 이유, §5.3). 통화 중에
+      // 드러나면 이미 늦고, 통과시키면 침묵을 동의로 적거나 받은 동의를 놓치는 두 사고 중
+      // 하나가 반드시 일어난다 — 둘 다 예외가 아니라 **동의 이력의 거짓**으로 남는다(§10.1).
+      const consentDefects = consentNodeDefects(flow);
+      if (consentDefects.length > 0) {
+        throw new Error(
+          '동의 질문 노드가 성립하지 않습니다: '
+          + consentDefects.map((d) => `${d.nodeId}(${d.defect})`).join(', ')
+          + ' — 예약 id 는 Confirm 노드여야 하고, 뒤에 적힌 목적이 ConsentPurpose 여야 하며, '
+          + '분기가 자기 자신을 가리키면 확정과 되묻는 중을 가를 수 없습니다 (설계서 §10.1)',
+        );
+      }
+      const flowConsentNodes = consentNodes(flow);
+      if (opts.consent === undefined && flowConsentNodes.length > 0) {
+        // 묻고는 있는데 기록이 없다. 종전 동작이므로 막지 않되 조용히 두지도 않는다 —
+        // 이 상태에서 고객의 "네"는 Confirm 슬롯 값으로만 남고 **동의 기록은 0건**이다.
+        // 점검·분쟁에서 필요한 것은 슬롯이 아니라 목적·정책 버전·시각이 적힌 기록이다.
+        warnOnce('W_CONSENT_UNBOUND',
+          `시나리오 ${flow.id} v${flow.version} 에 동의 질문 노드가 ${flowConsentNodes.length}건 있으나 동의 배선(consent)이 없습니다 — `
+          + '고객의 답이 동의 기록이 아니라 슬롯 값으로만 남습니다(§10.1).');
+      }
+      if (opts.consent !== undefined) {
+        // 필수 목적을 묻는 노드가 이 시나리오에 없으면 그 동의는 **이 통화에서 영원히 미획득**이고,
+        // 개인정보를 싣는 조회는 계속 막힌다. 막지는 않는다 — 다른 경로(포털·IVR 메뉴)에서 받은
+        // 동의가 이력에 있을 수 있기 때문이다. 다만 아무도 모르는 채로 두지 않는다.
+        const asked = new Set(flowConsentNodes.map((n) => n.purpose));
+        const unasked = opts.consent.policy.requirements
+          .filter((r) => r.required && !asked.has(r.purpose)).map((r) => r.purpose);
+        if (unasked.length > 0) {
+          warnOnce('W_CONSENT',
+            `필수 동의 목적을 묻는 노드가 시나리오 ${flow.id} v${flow.version} 에 없습니다: ${unasked.join(', ')} — `
+            + '다른 경로에서 받은 동의가 없으면 그 동의는 이 통화에서 획득되지 않습니다(§10.1).');
+        }
+      }
+      if (opts.consent === undefined && opts.connectors !== undefined && opts.connectors.consent === undefined) {
+        // 동의 컨텍스트 출처가 아무것도 없는데 개인정보를 싣는 커넥터가 있다. 그 조회는 통화 중
+        // **언제나** `consent_context_missing` 으로 막히는데 업무시스템은 멀쩡하므로 장애로
+        // 보이지 않고 "그 메뉴만 안 된다"로만 나타난다. 판정 조건은 `requiresConsent` 하나다(§2).
+        const gated: string[] = [];
+        for (const node of Object.values(flow.nodes)) {
+          if (node.kind !== 'Api') continue;
+          let def;
+          try {
+            def = opts.connectors.connectors.get(node.connectorId);
+          } catch {
+            def = undefined;      // 조회 실패는 위 missingConnectors 가 막는다
+          }
+          if (def !== undefined && requiresConsent(def)) gated.push(`${node.id}→${def.id}`);
+        }
+        if (gated.length > 0) {
+          warnOnce('W_CONSENT_UNBOUND',
+            `개인정보·국외이전이 선언된 커넥터를 부르는 Api 노드가 있으나 동의 컨텍스트 출처가 없습니다: ${gated.join(', ')} — `
+            + '그 조회는 통화 중 언제나 동의 게이트에서 막힙니다(§10.1·§6.1).');
+        }
       }
       if (opts.intent === undefined && Object.values(flow.nodes).some((n) => isIntentEntryNode(n))) {
         // 인텐트 진입 노드가 있는데 배선이 없다. 종전 동작이므로 막지 않되 조용히 두지도 않는다 —

@@ -17,6 +17,7 @@ import type { SwitchTicket } from '../core/executeSwitch.ts';
 import type { DisclosurePlacement } from '../portal/aiDisclosure.ts';
 import type { ComponentId, HealthSample, FallbackDecision } from '../ops/fallback.ts';
 import type { TurnBillingNote } from '../billing/turnUsage.ts';
+import type { ConsentPurpose } from '../consent/consent.ts';
 
 export const CHANNEL_CONTRACT_VERSION = 1;
 
@@ -96,6 +97,23 @@ export interface ChannelTurnResult {
    * 우리 집계에는 없으며, 그 차이는 몇 주 뒤 대사(reconcile)에서 '미설명'으로 돌아온다.
    */
   billing?: TurnBillingNote;
+  /**
+   * §10.1 동의. 동의가 배선되지 않았으면 실리지 않는다(종전과 완전히 같다).
+   *
+   * `recorded` 는 **이번 턴에 확정돼 추가 전용 이력에 쌓인 동의**다. 동의 질문 자체는 시나리오의
+   * `Confirm` 단계로 이미 나갔으므로 여기 있는 것은 감사 근거(어느 목적을 어떤 정책 버전으로
+   * 받았는가)다. 호스트가 슬롯을 뒤져 찾아내게 두면 세 저장소가 각자 다르게 찾는다(§2).
+   *
+   * `pendingRequired` 는 필수로 선언됐는데 지금 `granted` 가 아닌 목적이다. **Core 는 이 값으로
+   * 막지 않는다** — 거부 분기는 시나리오(`onNo`)와 테넌트가 정한다. 다만 이 목록이 비어 있지
+   * 않은 동안 pii 파라미터를 선언한 업무시스템 조회(§6.1)는 동의 게이트에서 막힌다.
+   */
+  consent?: {
+    recorded?: { purpose: ConsentPurpose; state: 'granted' | 'denied'; policyVersion: number };
+    /** 확정된 답이 있었는데 기록하지 못한 사유. 정상 생략(동의 턴이 아님·확정 전)에는 실리지 않는다. */
+    notRecordedKo?: string;
+    pendingRequired?: ConsentPurpose[];
+  };
 }
 
 /**
@@ -250,7 +268,21 @@ export type ContractIssueCode =
    * 채널이 배포본이 아닌 지정 버전으로 실행했거나, 배포 기록과 리비전 단계가 어긋났다(§5.3).
    * 전부 막지 않는 상태이지만 **아무도 모르는 채로 돌아가서는 안 되는** 상태다.
    */
-  | 'W_FLOW_NOT_DEPLOYED';
+  | 'W_FLOW_NOT_DEPLOYED'
+  /**
+   * §10.1 동의가 배선되지 않았다. 이 상태에서 일어나는 일은 두 방향 모두 조용하다:
+   * 시나리오가 동의를 **묻고 있어도** 고객의 "네"는 `Confirm` 슬롯 값으로만 남아 **동의 기록은
+   * 0건**이고(점검·분쟁에서 필요한 것은 목적·버전·시각이 적힌 기록이다), 개인정보 파라미터를
+   * 선언한 업무시스템 조회(§6.1)는 동의 컨텍스트가 없어 **통화 중 언제나 막힌다**(업무시스템은
+   * 멀쩡하므로 장애로 보이지 않고 "그 메뉴만 안 된다"로 나타난다).
+   * 종전 동작이므로 막지는 않되 조용히 두지도 않는다.
+   */
+  | 'W_CONSENT_UNBOUND'
+  /**
+   * 동의는 배선됐으나 어긋난 것이 있다(필수 목적을 묻는 노드가 시나리오에 없는 등, §10.1).
+   * 막지는 않되 운영이 반드시 보아야 한다 — 그 상태에서는 필수 동의가 영원히 미획득이다.
+   */
+  | 'W_CONSENT';
 
 export interface ContractIssue {
   code: ContractIssueCode;
