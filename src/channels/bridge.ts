@@ -124,6 +124,17 @@ export interface BridgeTurnPayload {
    * 바로 그 사실을 가장 먼저 알아야 하는 곳이다.
    */
   consent?: unknown;
+  /**
+   * §7 5.2 준수 점검 요약. 세션이 끝난 응답에만 실린다.
+   *
+   * 고지·동의와 **같은 이유로** 어떤 노출 스위치와도 무관하게 나간다 — 여기에는 개인정보가 없고
+   * (규칙 id·심각도별 건수·Core 가 쓴 사유뿐. 근거 이벤트 id·검출 표현·금칙어 문구는 애초에
+   * 요약에 담기지 않는다), 감추면 비-Node 호스트는 자기 통화가 **점검됐는지조차** 알 길이 없다.
+   * 음성 채널이 바로 고지 누락·녹취 중 마스킹 누락이 가장 먼저 나타나는 곳이다.
+   *
+   * `reviewed: false` 를 "위반 없음"으로 읽지 않도록 사유(`reasonKo`)를 함께 내보낸다.
+   */
+  compliance?: unknown;
 }
 
 /** 처리 기록. 발화 원문·개인정보를 담지 않는다 — op·판정·마스킹된 사유만 남는다(§10.3). */
@@ -483,6 +494,19 @@ function projectTurn(r: ChannelTurnResult, opts: BridgeOptions): BridgeTurnPaylo
       ...r.consent,
       ...(r.consent.pendingRequired !== undefined ? { pendingRequired: [...r.consent.pendingRequired] } : {}),
       ...(r.consent.recorded !== undefined ? { recorded: { ...r.consent.recorded } } : {}),
+    };
+  }
+  // 점검 요약도 같은 규칙이다 — 배열·객체는 **복사해서** 내보낸다. 결과를 그대로 넘기면 호스트가
+  // push·정렬·대입으로 Core 가 돌려준 판정을 고칠 수 있고(JSON 직렬화 전까지), 고쳐진 판정은
+  // "점검을 통과했다"로 남는다.
+  if (r.compliance !== undefined) {
+    const c = r.compliance;
+    payload.compliance = {
+      ...c,
+      ...(c.counts !== undefined ? { counts: { ...c.counts } } : {}),
+      ...(c.violated !== undefined ? { violated: [...c.violated] } : {}),
+      ...(c.checked !== undefined ? { checked: [...c.checked] } : {}),
+      ...(c.skipped !== undefined ? { skipped: c.skipped.map((s) => ({ ...s })) } : {}),
     };
   }
   return payload;

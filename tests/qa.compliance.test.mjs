@@ -112,3 +112,57 @@ test('고지 불필요 채널은 위반으로 잡지 않는다', b, () => {
   assert.equal(r.findings.length, 0);
   assert.deepEqual(qa.countBySeverity(r), { critical: 0, major: 0, minor: 0 });
 });
+
+// ── 점검하지 않은 규칙을 점검 완료로 적지 않는다(2026-10-04 수정) ────────────
+//
+// 아래 네 건은 전부 "위반 0건"으로 보이던 상태다. 그 0 은 점검 결과가 아니라 설정 누락이고,
+// 리뷰 화면에서 둘이 같은 모양이면 설정 누락은 영영 발견되지 않는다.
+
+test('금칙어를 등록하지 않았으면 합격이 아니라 skipped 다', b, () => {
+  const events = [ev.turnCompleted(meta(1), { turnId: 't1', speaker: 'bot', utterance: 'AI 상담입니다' })];
+  const r = qa.runComplianceCheck(events, rules(), scope);          // forbiddenPhrases: []
+  assert.equal(r.checked.includes('forbidden_phrase'), false);
+  const s = r.skipped.find((x) => x.ruleId === 'forbidden_phrase');
+  assert.ok(s);
+  assert.match(s.reasonKo, /등록된 금칙어 규칙이 없어/);
+});
+
+test('이 채널에 적용되는 금칙어가 없으면 그 사실이 사유로 남는다', b, () => {
+  const fp = [{ id: 'f1', phrase: '무조건 승인', severity: 'major', reasonKo: 'x', channels: ['chat'] }];
+  const events = [ev.turnCompleted(meta(1), { turnId: 't1', speaker: 'bot', utterance: 'AI 상담입니다' })];
+  const r = qa.runComplianceCheck(events, rules({ forbiddenPhrases: fp }), scope);
+  assert.equal(r.checked.includes('forbidden_phrase'), false);
+  assert.match(r.skipped.find((x) => x.ruleId === 'forbidden_phrase').reasonKo, /'voice' 채널에 적용되는/);
+});
+
+test('고지 필수로 선언되지 않은 채널은 고지 두 규칙 모두 skipped 다', b, () => {
+  const chatMeta = { ...meta(1), channel: 'chat' };
+  const events = [ev.turnCompleted(chatMeta, { turnId: 't1', speaker: 'bot', utterance: '안녕하세요' })];
+  const r = qa.runComplianceCheck(events, rules(), scope);          // disclosureRequired: { voice: true }
+  assert.deepEqual(r.checked.filter((x) => x.startsWith('disclosure')), []);
+  assert.deepEqual(
+    r.skipped.filter((x) => x.ruleId.startsWith('disclosure')).map((x) => x.ruleId),
+    ['disclosure_missing', 'disclosure_late'],
+  );
+});
+
+test('표식 미등록·봇 발화 없음도 고지 두 규칙을 함께 건너뛴다 — 한쪽만 적으면 다른 쪽이 합격으로 남는다', b, () => {
+  const events = [ev.turnCompleted(meta(1), { turnId: 't1', speaker: 'bot', utterance: '안내드립니다' })];
+  const noMarker = qa.runComplianceCheck(events, rules({ disclosureMarkers: [] }), scope);
+  assert.equal(noMarker.checked.includes('disclosure_late'), false);
+
+  const customerOnly = [ev.turnCompleted(meta(1), { turnId: 't1', speaker: 'customer', utterance: '여보세요' })];
+  const noBot = qa.runComplianceCheck(customerOnly, rules(), scope);
+  assert.equal(noBot.checked.includes('disclosure_late'), false);
+  assert.match(noBot.skipped[0].reasonKo, /봇 발화 이벤트가 없어/);
+});
+
+test('실제로 점검한 규칙만 checked 에 남고 두 칸에 동시에 적히지 않는다', b, () => {
+  const fp = [{ id: 'f1', phrase: '무조건 승인', severity: 'major', reasonKo: 'x' }];
+  const events = [ev.turnCompleted(meta(1), { turnId: 't1', speaker: 'bot', utterance: 'AI 상담입니다' })];
+  const r = qa.runComplianceCheck(events, rules({ forbiddenPhrases: fp }), scope);
+  assert.deepEqual(r.checked, ['disclosure_missing', 'disclosure_late', 'forbidden_phrase', 'pii_exposed', 'pii_unmasked_flag']);
+  assert.deepEqual(r.skipped, []);
+  const both = r.checked.filter((c) => r.skipped.some((s) => s.ruleId === c));
+  assert.deepEqual(both, []);
+});

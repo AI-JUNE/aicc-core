@@ -313,6 +313,43 @@ test('동의 판정은 호스트가 고칠 수 없다 — 돌려준 배열을 �
   assert.deepEqual(again.consent.pendingRequired, ['recording']);
 });
 
+test('§7 5.2 준수 점검 요약도 노출 스위치와 무관하게 호스트에 나간다 — 금칙어 문구는 싣지 않는다', b, async () => {
+  // 비-Node 호스트(음성 에이전트)가 자기 통화가 **점검됐는지조차** 알 수 없으면,
+  // 고지 누락·녹취 중 마스킹 누락이 가장 먼저 나타나는 채널에서 그 사실이 묻힌다.
+  const { bridge } = build({ includeSlots: false, includeHandoffSummary: false }, {
+    qa: {
+      disclosureMarkers: ['AI 상담'],
+      forbiddenPhrases: [{ id: 'f1', phrase: '무조건 승인', severity: 'major', reasonKo: '확정적 표현 금지' }],
+    },
+  });
+  const s = await bridge.handleLine(line({ id: '0', op: 'start', req: { flowId: 'billing', entryPoint: 'inbound_call' } }));
+  assert.equal(s.result.compliance, undefined);           // 아직 끝나지 않았다
+  const e = await bridge.handleLine(line({ id: '1', op: 'end', interactionId: 'i_bridge1', reasonKo: '고객 종료' }));
+  assert.equal(e.ok, true);
+  assert.equal(e.result.compliance.reviewed, true);
+  assert.ok(Array.isArray(e.result.compliance.checked));
+  // 고지 설정이 배선되지 않았으므로 고지 항목은 합격이 아니라 skipped 다.
+  assert.ok(e.result.compliance.skipped.some((x) => x.ruleId === 'disclosure_missing'));
+  // 등록된 금칙어 문구·근거 이벤트 id 는 요약에 담기지 않는다(§10.3).
+  assert.equal(JSON.stringify(e.result.compliance).includes('무조건 승인'), false);
+  assert.equal(JSON.stringify(e.result.compliance).includes('i_bridge1_e'), false);
+});
+
+test('점검 판정은 호스트가 고칠 수 없다 — 돌려준 배열·객체를 복사해 내보낸다', b, async () => {
+  const { bridge, core } = build({}, {
+    qa: { disclosureMarkers: ['AI 상담'], forbiddenPhrases: [] },
+  });
+  await bridge.handleLine(line({ id: '0', op: 'start', req: { flowId: 'billing', entryPoint: 'inbound_call' } }));
+  const e = await bridge.handleLine(line({ id: '1', op: 'end', interactionId: 'i_bridge1', reasonKo: '종료' }));
+  e.result.compliance.skipped.push({ ruleId: 'pii_exposed', reasonKo: '호스트가 끼워 넣음' });
+  e.result.compliance.checked.length = 0;
+  e.result.compliance.counts.critical = 99;
+  const kept = core.sessions.get('i_bridge1').lastResult.compliance;
+  assert.equal(kept.skipped.some((x) => x.reasonKo === '호스트가 끼워 넣음'), false);
+  assert.ok(kept.checked.length > 0);
+  assert.equal(kept.counts.critical, 0);
+});
+
 test('미지 세션 send 는 오류 응답이지 예외가 아니다', b, async () => {
   const { bridge } = build();
   const r = await bridge.handleLine(line({

@@ -53,7 +53,7 @@ function fakePort(id = 'callbot', capsOver = {}, over = {}) {
   };
 }
 
-function build({ flows = [flowBilling], registry, port = fakePort(), ports, samples = [], policy = {}, components, reprompt, timing, routing, connectors, channelSwitch, disclosure, intent, knowledge, consent } = {}) {
+function build({ flows = [flowBilling], registry, port = fakePort(), ports, samples = [], policy = {}, components, reprompt, timing, routing, connectors, channelSwitch, disclosure, intent, knowledge, consent, qa } = {}) {
   const collector = B.createCollectorSink('t');
   const bus = B.createEventBus({
     scope: SCOPE, sinks: [collector],
@@ -81,6 +81,7 @@ function build({ flows = [flowBilling], registry, port = fakePort(), ports, samp
     ...(intent !== undefined ? { intent } : {}),
     ...(knowledge !== undefined ? { knowledge } : {}),
     ...(consent !== undefined ? { consent } : {}),
+    ...(qa !== undefined ? { qa } : {}),
   });
   return { core, port, collector, health };
 }
@@ -2138,6 +2139,193 @@ test('개인정보를 싣지 않는 커넥터는 경고를 만들지 않는다 �
   const { core } = build({ flows: [flowApiOnError()], connectors: w.binding });
   await core.start(req({ flowId: 'api' }));
   assert.equal(core.warnings().some((x) => x.code === 'W_CONSENT_UNBOUND'), false);
+});
+
+// ── QA·준수 점검 배선(§7 5.2·§10.1·§10.3·§13-3) ──────────────────────────────
+//
+// 여기서 고정하는 결함의 증상은 **리포트가 깨끗한 것**이다. 배선이 없던 동안 어떤 세션도
+// 점검되지 않았고, 고지 누락·금칙 표현·마스킹 누락이 한 건도 집계되지 않았다 — 그런데
+// "점검이 돌고 있다"와 "한 번도 돈 적이 없다"가 운영 화면에서 똑같이 보인다.
+
+const FP = [{ id: 'f1', phrase: '무조건 승인', severity: 'major', reasonKo: '확정적 표현 금지' }];
+
+function qaWiring(over = {}) {
+  const reports = [];
+  return {
+    reports,
+    binding: {
+      disclosureMarkers: ['AI 상담'],
+      forbiddenPhrases: FP,
+      onReport: (info) => reports.push(info),
+      ...over,
+    },
+  };
+}
+
+/** 봇 발화에 금칙 표현이 섞인 시나리오. 고객 발화가 아니라 **우리가** 말한 것이 문제다. */
+const flowForbidden = {
+  id: 'fp', version: 1, startNodeId: 'say',
+  nodes: { say: { id: 'say', kind: 'Say', text: '고객님은 AI 상담 대상이며 무조건 승인됩니다.' } },
+};
+
+test('미배선: 어떤 세션도 점검되지 않는다는 사실을 경고로 드러낸다(§7 5.2)', b, async () => {
+  const { core } = build();
+  const w = core.warnings().filter((i) => i.code === 'W_QA_UNBOUND');
+  assert.equal(w.length, 1);
+  assert.match(w[0].messageKo, /리포트 자체가 없어/);
+  // 종전과 완전히 같다(§13-3) — 결과에 아무것도 실리지 않는다.
+  await core.start(req());
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '홍길동' } });
+  assert.equal(r.status, 'completed');
+  assert.equal(r.compliance, undefined);
+  assert.equal(core.sessions.get('i_test1').qa, undefined);
+});
+
+test('배선 있음: 세션이 끝나면 점검이 한 번 돌고 요약이 결과에 실린다', b, async () => {
+  const qa = qaWiring();
+  const { core } = build({ disclosure: DISC(), qa: qa.binding });
+  assert.equal(core.warnings().some((i) => i.code === 'W_QA_UNBOUND'), false);
+  const started = await core.start(req());
+  assert.equal(started.compliance, undefined);          // 아직 끝나지 않았다
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '홍길동' } });
+  assert.equal(r.status, 'completed');
+  assert.equal(r.compliance.reviewed, true);
+  assert.equal(r.compliance.requiresHumanReview, false);
+  assert.deepEqual(r.compliance.counts, { critical: 0, major: 0, minor: 0 });
+  assert.deepEqual(r.compliance.violated, []);
+  assert.equal(qa.reports.length, 1);
+  assert.equal(qa.reports[0].interactionId, 'i_test1');
+  assert.equal(qa.reports[0].report.findings.length, 0);
+});
+
+test('Core 가 낸 고지가 점검에 보인다 — 시나리오 문구에 표식이 없어도 위반이 아니다(§10.1)', b, async () => {
+  // 이 검사가 고정하는 것: 고지 발화의 §8.1 턴 이벤트. 그 이벤트가 없으면 고지를 제대로 낸
+  // 세션이 전부 disclosure_missing(critical)으로 잡혀 리뷰 큐가 통째로 잠긴다.
+  const qa = qaWiring();
+  const { core, collector } = build({ flows: [flowRetry], disclosure: DISC(), qa: qa.binding });
+  await core.start(req({ flowId: 'retry' }));
+  const r = await core.end('i_test1', '고객 종료');
+  assert.equal(r.compliance.reviewed, true);
+  assert.deepEqual(r.compliance.violated, []);
+  assert.equal(r.compliance.checked.includes('disclosure_missing'), true);
+  // 원장에도 남는다 — "고지했다"의 근거는 휘발성 반환값이 아니라 §8.1 기록이다.
+  const botTurns = collector.events.filter((e) => e.type === 'turn.completed' && e.speaker === 'bot');
+  assert.equal(botTurns[0].node_id, '__disclosure');
+  assert.equal(botTurns[0].utterance_masked, '본 상담은 AI 상담원이 진행합니다.');
+  assert.equal(botTurns[0].occurred_at <= botTurns[1].occurred_at, true);
+});
+
+test('봇 발화의 금칙 표현을 잡는다 — 등급 분기는 복사하지 않는다(major 는 사람 리뷰가 아니다)', b, async () => {
+  const qa = qaWiring();
+  const { core } = build({ flows: [flowForbidden], disclosure: DISC(), qa: qa.binding });
+  await core.start(req({ flowId: 'fp' }));
+  const r = await core.end('i_test1', '종료');
+  assert.deepEqual(r.compliance.violated, ['forbidden_phrase']);
+  assert.equal(r.compliance.counts.major, 1);
+  assert.equal(r.compliance.requiresHumanReview, false);
+  assert.match(qa.reports[0].report.findings[0].messageKo, /확정적 표현 금지/);
+});
+
+test('장애 폴백으로 중단된 통화도 점검한다 — end() 에만 걸면 이 통화가 빠진다(§9.3)', b, async () => {
+  const qa = qaWiring();
+  const { core } = build({ samples: [{ component: 'telephony', state: 'down', observedAt: NOW }], qa: qa.binding });
+  const r = await core.start(req());
+  assert.equal(r.status, 'failed');
+  assert.equal(r.compliance.reviewed, true);
+  assert.equal(qa.reports.length, 1);
+  // 봇 발화가 없으므로 고지 판정은 합격이 아니라 skipped 다.
+  assert.ok(r.compliance.skipped.some((s) => s.ruleId === 'disclosure_missing'));
+});
+
+test('폴백 이관으로 끝난 통화도 점검한다(§9.3)', b, async () => {
+  const qa = qaWiring();
+  const { core } = build({
+    samples: [{ component: 'llm', state: 'down', observedAt: NOW }],
+    policy: { legacyIvrAvailable: true }, qa: qa.binding,
+  });
+  const r = await core.start(req());
+  assert.equal(r.status, 'transferred');
+  assert.equal(r.compliance.reviewed, true);
+  assert.equal(qa.reports.length, 1);
+});
+
+test('한 세션에 한 번만 점검한다 — 두 번 올리면 리뷰 큐에 같은 통화가 두 건 쌓인다', b, async () => {
+  const qa = qaWiring();
+  const { core } = build({ disclosure: DISC(), qa: qa.binding });
+  await core.start(req());
+  await core.send('i_test1', { input: { kind: 'utterance', text: '홍길동' } });
+  await core.send('i_test1', { input: { kind: 'utterance', text: '늦게 온 입력' } });
+  const again = await core.end('i_test1', '고객 종료');
+  assert.equal(qa.reports.length, 1);
+  // 이미 끝난 세션의 응답은 직전 판정을 그대로 되돌려준다(새 판정을 만들지 않는다).
+  assert.equal(again.compliance.reviewed, true);
+});
+
+test('요약에는 근거 이벤트 id·금칙어 문구가 실리지 않는다 — 전문에는 남는다(§10.3)', b, async () => {
+  const qa = qaWiring();
+  const { core } = build({ flows: [flowForbidden], disclosure: DISC(), qa: qa.binding });
+  await core.start(req({ flowId: 'fp' }));
+  const r = await core.end('i_test1', '종료');
+  const note = JSON.stringify(r.compliance);
+  assert.equal(note.includes('무조건 승인'), false);
+  assert.equal(note.includes('i_test1_e'), false);
+  const full = JSON.stringify(qa.reports[0].report);
+  assert.equal(full.includes('무조건 승인'), true);
+  assert.equal(full.includes('i_test1_e'), true);
+});
+
+test('수집 상한을 넘으면 전수 규칙을 점검 완료로 적지 않는다(§13-3)', b, async () => {
+  const qa = qaWiring({ maxEvents: 1 });
+  const { core } = build({ disclosure: DISC(), qa: qa.binding });
+  await core.start(req());
+  const r = await core.send('i_test1', { input: { kind: 'utterance', text: '홍길동' } });
+  assert.equal(core.sessions.get('i_test1').qa.truncated, true);
+  assert.equal(r.compliance.checked.includes('forbidden_phrase'), false);
+  assert.ok(r.compliance.skipped.some((s) => s.ruleId === 'pii_exposed' && /상한/.test(s.reasonKo)));
+});
+
+test('점검 결과를 받는 훅이 던져도 종료는 그대로 간다 — 그 예외는 세션 누수가 된다', b, async () => {
+  const { core, port } = build({
+    disclosure: DISC(),
+    qa: qaWiring({ onReport: () => { throw new Error('리뷰 큐 장애'); } }).binding,
+  });
+  await core.start(req());
+  const r = await core.end('i_test1', '고객 종료');
+  assert.equal(r.status, 'completed');
+  assert.equal(r.compliance, undefined);               // 올리지 못한 판정을 결과에 싣지 않는다
+  assert.ok(port.log.some((l) => l[0] === 'end'));     // 채널에는 종료 지시가 나갔다
+});
+
+test('배선 거부: 비교할 수 없는 금칙어는 생성 시점에 막는다 — 통화 중에는 드러나지 않는다', b, () => {
+  assert.throws(
+    () => build({ qa: qaWiring({ forbiddenPhrases: [{ id: 'f1', phrase: '  ', severity: 'major', reasonKo: 'x' }] }).binding }),
+    /QA 점검 배선 거부/,
+  );
+  assert.throws(
+    () => build({ qa: qaWiring({ maxEvents: 0 }).binding }),
+    /QA 점검 배선 거부/,
+  );
+});
+
+test('경고: 고지 설정이 없으면 고지 점검을 하지 않는다는 사실이 드러난다(§2)', b, async () => {
+  const qa = qaWiring();
+  const { core } = build({ qa: qa.binding });           // disclosure 미배선
+  const w = core.warnings().filter((i) => i.code === 'W_QA');
+  assert.ok(w.some((x) => /출처는 AiDisclosureConfig 하나/.test(x.messageKo)));
+  await core.start(req());
+  const r = await core.end('i_test1', '종료');
+  assert.equal(r.compliance.checked.includes('disclosure_missing'), false);
+  assert.ok(r.compliance.skipped.some((s) => s.ruleId === 'disclosure_missing'));
+});
+
+test('경고: 표식·금칙어 미등록은 막지 않되 그 항목이 합격이 아님을 드러낸다', b, () => {
+  const { core } = build({
+    disclosure: DISC(),
+    qa: qaWiring({ disclosureMarkers: [], forbiddenPhrases: [] }).binding,
+  });
+  const w = core.warnings().filter((i) => i.code === 'W_QA').map((x) => x.messageKo);
+  assert.ok(w.some((m) => /표식이 없어/.test(m)));
+  assert.ok(w.some((m) => /skipped/.test(m)));
 });
 
 test('호스트가 넘긴 동의 컨텍스트는 덮어쓰지 않는다 — 그 경로는 종전과 같다', b, async () => {

@@ -26,7 +26,7 @@ import { turnTimingPolicyOk, validateTurnTimingPolicy } from '../flow/timing.ts'
 import type { TenantScope } from '../core/tenancy.ts';
 import { assertTenantScope } from '../core/tenancy.ts';
 import type { EventMeta, InteractionEvent, LatencyMs, TurnCompletedEvent, HandoffRequestedEvent, UsageMetrics } from '../events/schema.ts';
-import { sessionStarted, sessionEnded, handoffRequested } from '../events/schema.ts';
+import { sessionStarted, sessionEnded, handoffRequested, turnCompleted } from '../events/schema.ts';
 import type { EventBus, PublishResult } from '../events/bus.ts';
 import type { ComponentId, FallbackDecision, FallbackPolicy, HealthRegistry, HealthSample } from '../ops/fallback.ts';
 import { decideFallbackMode } from '../ops/fallback.ts';
@@ -39,7 +39,7 @@ import { executeHandoff } from '../routing/executeHandoff.ts';
 import type { InviteDeliveryKind, InviteRegistry, SlotCarryPolicy, SwitchReason, SwitchTargetChannel } from '../core/channelSwitch.ts';
 import { issueSwitch, redeemSwitch } from '../core/executeSwitch.ts';
 import type { AiDisclosureConfig } from '../portal/aiDisclosure.ts';
-import { planDisclosure, validateDisclosureBinding } from '../core/executeDisclosure.ts';
+import { DISCLOSURE_NODE_ID, planDisclosure, validateDisclosureBinding } from '../core/executeDisclosure.ts';
 import type { ConnectorPumpBinding } from '../integration/connectorPump.ts';
 import { connectorHopLimit, hopLimitInput, missingConnectors, pumpConnectorHop } from '../integration/connectorPump.ts';
 import { requiresConsent } from '../integration/connector.ts';
@@ -64,6 +64,11 @@ import {
 } from '../consent/executeConsent.ts';
 import type { TurnBillingNote } from '../billing/turnUsage.ts';
 import { attachTurnUsage, billingNoteOrUndefined, checkBillableMs, mergeTurnUsage, usageNote } from '../billing/turnUsage.ts';
+import type { ForbiddenPhraseRule, QaReport, QaRuleSet } from '../qa/compliance.ts';
+import type { ComplianceBuffer, ComplianceTurnNote } from '../qa/executeCompliance.ts';
+import {
+  appendForReview, buildQaRuleSet, newComplianceBuffer, reviewCompliance, validateComplianceBinding,
+} from '../qa/executeCompliance.ts';
 import type {
   ChannelAdapterId, ChannelEndInput, ChannelHealthReport, ChannelRegistration, ChannelSessionRequest,
   ChannelTurnInput, ChannelTurnResult, ConversationCorePort, ContractIssue, ChannelCapabilities,
@@ -150,6 +155,12 @@ export interface SessionRecord {
    * 되돌아가면, 테넌트가 정한 `maxClarifyAttempts` 를 넘겨 같은 질문을 계속 되묻게 된다.
    */
   intentClarify?: PendingClarify;
+  /**
+   * §7 5.2 준수 점검용 이벤트 수집함. **점검이 배선된 경우에만 만들어진다** — 미배선이면
+   * 종전과 완전히 같다(수집 비용도 0이다, §13-3). 담기는 것은 §8.1 이벤트 그대로이며
+   * 전부 마스킹을 통과한 값이다(§10.3).
+   */
+  qa?: ComplianceBuffer;
 }
 
 /** 세션 저장소. 인메모리는 단일 프로세스용 — 영속 구현은 이 인터페이스 뒤로 교체한다(§6.2). */
@@ -344,6 +355,45 @@ export interface ConsentBinding {
   }) => void;
 }
 
+/**
+ * QA·준수 점검 배선(§7 5.2·§10.1·§10.3). **주지 않으면 종전과 완전히 같다**(§13-3) —
+ * 어떤 세션도 점검되지 않고, 그 사실이 `W_QA_UNBOUND` 경고로 남는다.
+ *
+ * 주면 Core 가 세션이 끝나는 **네 갈래 전부에서**(정상 종료·§9.3 폴백 중단·폴백 이관·커넥터
+ * 순회 상한) 그 세션의 이벤트를 모아 한 번 점검하고, 요약을 턴 결과에 싣는다.
+ * 이 배선이 없으면 `qa/compliance.ts` 는 저장소에 있으나 **아무도 부르지 않는** 상태로 남는다 —
+ * 그리고 그 상태는 운영 화면에서 "위반이 없다"와 똑같이 보인다.
+ *
+ * 고지 필수 여부는 여기서 받지 않는다 — 출처는 `disclosure`(AiDisclosureConfig) 하나다(§2).
+ * 표식·금칙어 문구는 Core 가 만들지 않는다 — 테넌트 법무·컴플라이언스가 등록한다 **[승인 필요]**.
+ */
+export interface ComplianceBinding {
+  /** 고지 발화 판별용 핵심 어구(§10.1). 비어 있으면 고지 점검을 수행하지 않는다(경고로 남는다). */
+  disclosureMarkers: readonly string[];
+  /** 금칙어 규칙. 비어 있으면 금칙 표현 점검을 수행하지 않는다(합격이 아니라 skipped 다). */
+  forbiddenPhrases: readonly ForbiddenPhraseRule[];
+  /**
+   * 세션당 점검용 이벤트 수집 상한. **기본값 없음**(§13-3) — 주지 않으면 세션 길이만큼 모은다.
+   * 주면 상한을 넘은 뒤부터 담지 않고, 전수를 봐야 하는 규칙은 점검 결과에서 `skipped` 로 내려간다
+   * (잘라낸 범위를 "위반 0건"으로 적지 않는다).
+   */
+  maxEvents?: number;
+  /**
+   * 점검 전문(`QaReport`)을 호스트에 그대로 올린다(삼키지 않는다). 리뷰 큐 적재·보존은
+   * 호스트 몫이다(§6.2) — Core 는 저장하지 않는다.
+   *
+   * **수행하지 못한 점검도 올린다**: 수집 0건·격리 위반·판정 예외는 전부 "위반 0건"과 구분되어야
+   * 하고, 올리지 않으면 "점검이 돌고 있다고 생각하는데 기록이 없다"가 몇 주 뒤에 발견된다.
+   * 이 훅이 던져도 통화·종료는 영향받지 않는다(종료 경로의 예외는 세션 누수로 나타난다).
+   */
+  onReport?: (info: {
+    interactionId: string;
+    /** 점검을 수행하지 못했으면 실리지 않는다 — 빈 리포트를 "위반 없음"으로 읽지 않게. */
+    report?: QaReport;
+    note: ComplianceTurnNote;
+  }) => void;
+}
+
 export interface ConversationCoreOptions {
   scope: TenantScope;
   flows: FlowRegistry;
@@ -405,6 +455,11 @@ export interface ConversationCoreOptions {
    * 그 사실이 `W_CONSENT_UNBOUND` 경고로 남는다.
    */
   consent?: ConsentBinding;
+  /**
+   * QA·준수 점검(§7 5.2). **주지 않으면 종전과 완전히 같다**(§13-3) — 어떤 세션도 점검되지
+   * 않고, 그 사실이 `W_QA_UNBOUND` 경고로 남는다.
+   */
+  qa?: ComplianceBinding;
   now?: () => string;
   newInteractionId?: (req: ChannelSessionRequest) => string;
   onPublish?: (results: PublishResult[]) => void;
@@ -767,6 +822,42 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     });
   }
 
+  // QA·준수 점검도 **배포 시점에** 거른다(§7 5.2). 점검 설정 오류의 증상은 예외가 아니라
+  // **리포트가 깨끗한 것**이고, 깨끗한 리포트는 아무도 다시 보지 않는다 — 비교할 수 없는 금칙어
+  // 하나가 "등록했는데 한 번도 안 걸린다"로 끝나도 어디에서도 터지지 않는다.
+  // 규칙은 **생성 시점에 한 번만** 조립한다: 운영 중 고지 설정·금칙어를 고치면 진행 중인 세션이
+  // 다른 기준으로 점검되고, 같은 통화의 전반·후반이 서로 다른 규칙으로 판정된다. 새 규칙은 재배선이다.
+  let qaRules: QaRuleSet | undefined;
+  if (opts.qa !== undefined) {
+    if (!Array.isArray(opts.qa.disclosureMarkers) || !Array.isArray(opts.qa.forbiddenPhrases)) {
+      throw new Error('QA 점검 배선 거부: 고지 표식·금칙어 규칙이 배열이 아닙니다 (설계서 §7 5.2)');
+    }
+    const activeChannels = [...new Set(opts.channels.map((r) => r.port.capabilities.channel))];
+    const ruleInput = {
+      scope: opts.scope,
+      disclosureMarkers: opts.qa.disclosureMarkers,
+      forbiddenPhrases: opts.qa.forbiddenPhrases,
+      channels: activeChannels,
+      ...(opts.disclosure !== undefined ? { disclosure: opts.disclosure } : {}),
+      ...(opts.qa.maxEvents !== undefined ? { maxEvents: opts.qa.maxEvents } : {}),
+    };
+    const issues = validateComplianceBinding(ruleInput);
+    if (issues.errorsKo.length > 0) {
+      throw new Error(`QA 점검 배선 거부: ${issues.errorsKo.join(' / ')}`);
+    }
+    for (const messageKo of issues.warningsKo) warnings.push({ code: 'W_QA', severity: 'warning', messageKo });
+    qaRules = buildQaRuleSet(ruleInput);
+  } else {
+    // 미배선의 증상은 "위반이 없는 것"과 똑같이 보인다 — 종전 동작이므로 막지 않되 반드시 드러낸다.
+    warnings.push({
+      code: 'W_QA_UNBOUND',
+      severity: 'warning',
+      messageKo: 'QA·준수 점검 배선(qa)이 없습니다 — 어떤 세션도 점검되지 않습니다(§7 5.2). '
+        + 'AI 고지 누락(§10.1)·금칙 표현·마스킹 누락(§10.3)이 한 건도 집계되지 않으며, '
+        + '리포트가 비는 것이 아니라 리포트 자체가 없어 "점검이 돌고 있다"와 구분되지 않습니다.',
+    });
+  }
+
   // 전환이 가능한 채널이 붙어 있는데 배선이 없으면, 그 전환 링크는 **id 가 곧 열쇠**다.
   // 종전 동작이므로 막지는 않되 조용히 두지도 않는다 — 조용한 보안 결함이 가장 오래 산다.
   if (opts.channelSwitch === undefined && opts.channels.some((r) => r.port.capabilities.crossChannelInvite)) {
@@ -859,6 +950,45 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     return note;
   }
 
+  /**
+   * §7 5.2 준수 점검 — 이번 턴 이벤트를 수집함에 담고, **이 턴에 세션이 끝났으면** 한 번 점검한다.
+   *
+   * 결과에 실을 값을 돌려주므로 호출 지점은 **이벤트가 확정된 직후·결과 조립 직전**이다.
+   * 세션이 끝나는 길은 네 갈래이고(정상 종료·폴백 중단·폴백 이관·커넥터 순회 상한) 네 갈래 전부에서
+   * 불린다 — `end()` 에만 걸면 폴백으로 끝난 통화가 영영 점검되지 않는데, 하필 그 통화들이
+   * 감독기관·민원에서 가장 먼저 열리는 통화다(경로별 검사로 고정한다).
+   *
+   * 지키는 것:
+   * - **한 세션에 한 번.** `reviewed` 로 잠근다 — 두 번 올리면 리뷰 큐에 같은 통화가 두 건 쌓이고,
+   *   위반 건수가 통화 수보다 많아진다(§13-3 의 "실측" 이 깨진다).
+   * - **판정하지 않는다.** 위반·리뷰 분기·건수는 `qa/compliance.ts` 하나다(§2).
+   * - **던지지 않는다.** 점검도, 점검 결과를 받는 훅도 종료를 막을 수 없다 — 이 경로에서 예외는
+   *   채널의 `end` 지시가 호출되지 않는 것으로 나타나고, 그 세션 누수는 장애가 아니라 요금이다.
+   */
+  function complianceSlot(
+    rec: SessionRecord, events: readonly InteractionEvent[],
+  ): { compliance?: ComplianceTurnNote } {
+    const binding = opts.qa;
+    const rules = qaRules;
+    if (binding === undefined || rules === undefined) return {};
+    const buf = rec.qa ?? (rec.qa = newComplianceBuffer());
+    appendForReview(buf, events, binding.maxEvents);
+    if (!rec.ended || buf.reviewed) return {};
+    buf.reviewed = true;
+    try {
+      const review = reviewCompliance({ buffer: buf, rules, scope: rec.scope });
+      binding.onReport?.({
+        interactionId: rec.interactionId,
+        ...(review.report !== undefined ? { report: review.report } : {}),
+        note: review.note,
+      });
+      return { compliance: review.note };
+    } catch {
+      // 점검 결과를 받는 쪽이 던진 경우다. 점검을 돌렸다는 사실은 남기되(reviewed) 종료는 그대로 간다.
+      return {};
+    }
+  }
+
   function interactionOf(rec: SessionRecord, reason: Handoff['reason']): Interaction {
     const i: Interaction = {
       id: rec.interactionId,
@@ -932,7 +1062,11 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       events.push(sessionEnded(meta(rec), { outcome: 'FAILED', turnCount: rec.state.turnCount }));
       rec.ended = true;
       await publish(events);
-      const result: ChannelTurnResult = { interactionId: id, state: rec.state, steps: [], status: 'failed', events, fallback: decision };
+      // 폴백으로 끝난 통화도 점검한다 — `end()` 에만 걸면 이 통화는 영영 점검되지 않는다(§7 5.2).
+      const result: ChannelTurnResult = {
+        interactionId: id, state: rec.state, steps: [], status: 'failed', events, fallback: decision,
+        ...complianceSlot(rec, events),
+      };
       rec.lastResult = result;
       sessions.put(rec);
       await reg.port.end(id, decision.reasonKo);
@@ -951,6 +1085,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     const result: ChannelTurnResult = {
       interactionId: id, state: rec.state, steps: [], status: 'transferred', events, fallback: decision,
       handoff: { ...(queue !== undefined ? { queue } : {}), ...(summaryMasked !== undefined ? { summaryMasked } : {}) },
+      ...complianceSlot(rec, events),
     };
     rec.lastResult = result;
     sessions.put(rec);
@@ -1377,7 +1512,24 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
    * 장애 폴백(§9.3)으로 이관·종료되는 경로에서는 부르지 않는다 — **AI 가 응대하지 않았으므로
    * 고지 대상이 없다**. 상담사로 넘기기 직전에 "AI 가 응대합니다"를 내보내면 고지가 아니라 오안내다.
    */
-  function prependDisclosure(rec: SessionRecord, steps: RenderedStep[]): ChannelTurnResult['disclosure'] {
+  /**
+   * 고지를 이번 턴의 **맨 앞**에 끼운다 — 단계에도, §8.1 원장에도.
+   *
+   * 이벤트를 함께 남기는 이유(2026-10-04 추가): 고지 발화는 실제로 고객에게 나가는 봇 발화인데
+   * **다른 모든 봇 발화와 달리 `turn.completed` 가 만들어지지 않았다.** 그래서 "고지했다"의 근거가
+   * 휘발성 반환값(`result.disclosure`)과 채널 쪽 전송 로그밖에 없었고, 원장에는 아무 흔적이 없었다 —
+   * 감독기관 점검에서 내놓을 수 있는 것은 턴 결과가 아니라 §8.1 기록이다. 같은 공백 때문에
+   * 이벤트 위에서 도는 §7 5.2 준수 점검은 Core 가 **실제로 낸** 고지를 볼 수 없었고, 그대로 두면
+   * 고지를 제대로 한 세션이 전부 `disclosure_missing`(critical)으로 잡혀 리뷰 큐가 통째로 잠긴다.
+   *
+   * **시각은 이 턴의 첫 이벤트에서 가져온다.** 여기서 `now()` 를 새로 부르면 시나리오 첫 발화보다
+   * 1ms 늦게 찍히는 경우가 생기고, 그러면 "고지가 첫 응답보다 앞이었나"(§10.1)라는 판정이
+   * **밀리초 경계에 따라 간헐적으로 뒤집힌다** — 간헐적으로 생기는 '지각' 위반은 신호가 아니라 잡음이다.
+   * 없는 시각을 만드는 것이 아니라 같은 턴의 관측된 시각을 쓴다(§13-3).
+   */
+  function prependDisclosure(
+    rec: SessionRecord, steps: RenderedStep[], events: InteractionEvent[],
+  ): ChannelTurnResult['disclosure'] {
     const config = opts.disclosure;
     if (config === undefined) return undefined;
     const channel = rec.state.channel;
@@ -1394,6 +1546,12 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       return undefined;
     }
     steps.unshift(plan.step);
+    const m = meta(rec);
+    const first = events[0];
+    events.unshift(turnCompleted(
+      { ...m, ...(first !== undefined ? { occurredAt: first.occurred_at } : {}) },
+      { turnId: `t_${++rec.state.turnCount}`, speaker: 'bot', utterance: plan.step.text, nodeId: DISCLOSURE_NODE_ID },
+    ));
     rec.disclosedChannels = [...(rec.disclosedChannels ?? []), channel];
     return { channel, placement: plan.placement, configVersion: plan.configVersion };
   }
@@ -1532,17 +1690,22 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     const steps = node ? [renderNode(node, channel)] : [];
     // 합류한 매체에서는 아직 고지하지 않았다 — 고객은 이 화면을 처음 본다(§5.2·§10.3).
     // 렌더할 단계가 없어도 고지는 나간다: 화면이 열린 것 자체가 AI 응대의 시작이다.
-    const disclosure = prependDisclosure(rec, steps);
+    // 고지는 **새 매체에서 처음 나가는 발화**이므로 §8.1 턴 이벤트가 생긴다(재렌더와 다르다).
+    const events: InteractionEvent[] = [];
+    const disclosure = prependDisclosure(rec, steps, events);
     // 합류는 새 발화가 아니므로 확정된 동의가 없다. 다만 화면이 열리는 이 지점이 §10.1 동의를
     // 받기 가장 좋은 자리이므로, 지금 미획득인 필수 목적은 그대로 드러낸다.
     const consent = applyConsentTurn(rec, null);
+    recordTurns(rec, events);
     sessions.put(rec);
+    await publish(events);
     const shown = visibleSteps(steps);
     if (shown.length > 0) await reg.port.present(rec.interactionId, shown);
     const result: ChannelTurnResult = {
-      interactionId: rec.interactionId, state: rec.state, steps, status: rec.state.status, events: [],
+      interactionId: rec.interactionId, state: rec.state, steps, status: rec.state.status, events,
       ...(disclosure !== undefined ? { disclosure } : {}),
       ...(consent !== undefined ? { consent } : {}),
+      ...complianceSlot(rec, events),
     };
     rec.lastResult = result;
     return result;
@@ -1690,7 +1853,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       }
       // 고지는 **첫 단계보다 앞에** 들어가야 하므로 커넥터 이행보다 먼저 끼운다(§10.1) —
       // Api 대기 안내가 먼저 present 되는 시나리오에서는 그 안내가 곧 첫 발화다.
-      const disclosure = prependDisclosure(rec, run.steps);
+      const disclosure = prependDisclosure(rec, run.steps, run.events);
       // Api 노드는 여기서 이행한다. presetSlots 를 병합한 **뒤에** 부른다 — 커넥터 파라미터가
       // 채널이 넘긴 슬롯에서 오는 경우(발신번호·회원번호) 앞서 부르면 필수 슬롯 누락으로 막힌다.
       const drained = await drainConnectors(rec, reg, run);
@@ -1706,6 +1869,8 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
         ...(decision.mode === 'degraded_ai' ? { fallback: decision } : {}),
         ...(disclosure !== undefined ? { disclosure } : {}),
         ...(consent !== undefined ? { consent } : {}),
+        // 첫 턴에 끝난 세션(커넥터 순회 상한·즉시 종료 시나리오)도 점검 대상이다.
+        ...complianceSlot(rec, events),
         ...(rec.state.handoff ? { handoff: { ...(rec.state.handoff.queue !== undefined ? { queue: rec.state.handoff.queue } : {}), ...(summaryMasked !== undefined ? { summaryMasked } : {}) } } : {}),
       };
       rec.lastResult = result;
@@ -1756,7 +1921,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       const billing = attachUsage(run.events, turn.usage);
       // 채널이 이 턴에 바뀌었으면(§5.2) 새 매체는 아직 고지 전이다 — 이미 고지한 채널이면
       // 아무것도 하지 않으므로 턴마다 반복되지 않는다.
-      const disclosure = prependDisclosure(rec, run.steps);
+      const disclosure = prependDisclosure(rec, run.steps, run.events);
       // 동의는 **커넥터 이행보다 먼저** 반영한다(§10.1·§6.1). 같은 턴에서 동의를 받고 곧바로
       // 개인정보 조회로 넘어가는 시나리오(동의 → Api)가 가장 흔한 모양이고, 순서가 뒤면 방금 받은
       // 동의가 이력에 없는 상태로 게이트를 지나 그 조회만 조용히 막힌다.
@@ -1774,6 +1939,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
         ...(consent !== undefined ? { consent } : {}),
         ...(rec.state.handoff ? { handoff: { ...(rec.state.handoff.queue !== undefined ? { queue: rec.state.handoff.queue } : {}), ...(summaryMasked !== undefined ? { summaryMasked } : {}) } } : {}),
         ...(billing !== undefined ? { billing } : {}),
+        ...complianceSlot(rec, events),
       };
       rec.lastResult = result;
       sessions.put(rec);
@@ -1821,6 +1987,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       const result: ChannelTurnResult = {
         interactionId, state: rec.state, steps: [], status: 'completed', events,
         ...(billing !== undefined ? { billing } : {}),
+        ...complianceSlot(rec, events),
       };
       rec.lastResult = result;
       sessions.put(rec);
