@@ -107,3 +107,43 @@ test('§10.3 이미 가려진 값 옆의 진짜 번호는 그대로 가린다 �
   assert.ok(!r.text.includes('010-1234-5678'), '뒤의 진짜 번호가 보호 구간에 묻혔다');
   assert.ok(r.text.includes('900101-*******'), '앞의 가려진 값은 건드리지 않는다');
 });
+
+// ── 날짜를 계좌로 오인하지 않는다 ─────────────────────────────────────────────
+// 감사 detail·정산 사유는 maskPii 를 지나간다. 날짜가 계좌 패턴으로 삼켜지면 개인정보가
+// 새는 것이 아니라 **조사에서 가장 먼저 보는 값**(어느 기간을 조회·반출했는가)이 사라진다.
+test('§10.3 ISO8601 날짜·기간은 마스킹하지 않는다', behavioral, () => {
+  for (const s of [
+    '기간 2026-01-01T00:00:00.000Z~2026-02-01T00:00:00.000Z',
+    '대상 기간 2026-08',
+    '시행일 2026-12-31',
+    '2026-03-01 09:30 접수',
+  ]) {
+    const r = g.maskPii(s);
+    assert.equal(r.text, s, `날짜가 바뀌었다: ${r.text}`);
+    assert.deepEqual(r.hits, []);
+  }
+});
+
+test('§10.3 날짜 보호가 개인정보를 통과시키지 않는다 — 네 규칙 모두', behavioral, () => {
+  const cases = [
+    ['rrn', '2026-01-01 접수 900101-1234567', '900101-1234567'],
+    ['card', '2026-01-01 결제 1234-5678-9012-3456', '1234-5678-9012-3456'],
+    ['phone', '2026-01-01 연락처 010-1234-5678', '010-1234-5678'],
+    ['account', '2026-01-01 계좌 110-123-456789', '110-123-456789'],
+  ];
+  for (const [name, input, secret] of cases) {
+    const r = g.maskPii(input);
+    assert.ok(r.hits.includes(name), `${name} 이 날짜 옆에서 안 잡혔다: ${r.text}`);
+    assert.equal(r.text.includes(secret), false, `${name} 원문이 그대로 남았다: ${r.text}`);
+    assert.ok(r.text.includes('2026-01-01'), '날짜는 보존돼야 한다');
+  }
+});
+
+test('§10.3 날짜처럼 생긴 앞자리로 카드·계좌가 보호 구간에 숨지 않는다', behavioral, () => {
+  // `1234-56` 은 날짜(YYYY-MM)처럼 보이지만 월 범위를 벗어나고 뒤에 숫자가 이어진다.
+  const card = g.maskPii('1234-5678-9012-3456');
+  assert.deepEqual(card.hits, ['card']);
+  const acct = g.maskPii('1002-123-456789');
+  assert.deepEqual(acct.hits, ['account']);
+  assert.equal(acct.text.includes('456789'), false);
+});

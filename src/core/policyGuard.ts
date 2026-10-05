@@ -24,6 +24,21 @@ const RULES: { name: string; re: RegExp; mask: (m: string) => string }[] = [
  */
 const MASKED_SHAPES = /\d{6}-\*{7}|\d{4}-\*{4}-\*{4}-\d{4}|\d{3}-\*{4}-\d{4}|\*{3}-\*{4}-\d{4}/;
 
+/**
+ * ISO8601 날짜·기간 — 계좌 규칙(`\d{2,3}-?\d{2,6}-?\d{2,6}`)이 날짜를 삼키는 것을 막는다.
+ * `2026-01-01T00:00:00.000Z` 는 지금까지 `***-****-6-01-01T...` 로 바뀌었고, 그래서
+ * 감사 detail·정산 사유에 적힌 **대상 기간이 깨진 채** 쌓였다 — 개인정보가 새는 쪽이 아니라
+ * 조사에서 가장 먼저 보는 값(어느 기간을 조회·반출했는가)이 사라지는 쪽의 사고다.
+ *
+ * 경계는 `(?<![\d-])`·`(?![\d-])` 가 잡는다. 이 두 조건이 없으면 카드·계좌의 앞 네 자리가
+ * 날짜로 보여 **마스킹을 피해 나간다** — 과도 보호는 곧 유출이므로 아래 네 규칙이 날짜와
+ * 맞붙어 있을 때도 여전히 가려지는지 검사로 고정한다.
+ */
+const ISO_TEMPORAL = /(?<![\d-])\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:?\d{2})?)?(?![\d-])|(?<![\d-])\d{4}-(?:0[1-9]|1[0-2])(?![\d-])/;
+
+/** 규칙에 넘기기 전에 치워 둘 구간. hits 에는 올리지 않는다 — 이번 호출이 가린 것이 아니다. */
+const PRESERVE = new RegExp(`${ISO_TEMPORAL.source}|${MASKED_SHAPES.source}`, 'g');
+
 export interface MaskResult { text: string; masked: boolean; hits: string[] }
 
 /** 이미 마스킹된 구간을 뒤 규칙이 다시 잡지 않도록 자리표시자로 보호한다(숫자 미포함). */
@@ -34,10 +49,10 @@ export function maskPii(input: string): MaskResult {
   const hits: string[] = [];
   const vault: string[] = [];
 
-  // 이미 마스킹된 구간을 먼저 치워 둔다. hits 에는 넣지 않는다 — 이번 호출이 가린 것이 아니다.
+  // 이미 마스킹된 값과 날짜를 먼저 치워 둔다.
   // 구분자로 공백을 허용하지 않는 것이 중요하다: 허용하면 `900101-******* 010-1234-5678` 이
   // 한 덩어리로 보호되어 **뒤의 진짜 번호가 마스킹되지 않는다**.
-  out = out.replace(new RegExp(MASKED_SHAPES.source, 'g'), (m) => {
+  out = out.replace(new RegExp(PRESERVE.source, 'g'), (m) => {
     vault.push(m);
     return PH(vault.length - 1);
   });

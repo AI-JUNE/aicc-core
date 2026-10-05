@@ -55,9 +55,26 @@ export interface InteractionSummary {
   durationMs?: number;
 }
 
+/**
+ * 안정 식별자. 호출부가 사유를 **문구로 판별**하면 안내 문장을 다듬는 순간 그 분기가 조용히 꺼진다.
+ * 특히 `keyword_pii` 는 단순한 입력 오류가 아니라 감사에 남겨야 하는 사고 신호라서
+ * (저장소에 그 값이 없어야 정상이다) 판별 수단이 문구여서는 안 된다.
+ */
+export type QueryIssueCode =
+  | 'scope'
+  | 'period_format'
+  | 'period_order'
+  | 'period_too_wide'
+  | 'limit'
+  | 'channel'
+  | 'outcome'
+  | 'keyword_empty'
+  | 'keyword_pii';
+
 export interface QueryIssue {
   field: string;
   messageKo: string;
+  code?: QueryIssueCode;
 }
 
 export interface QueryLimits {
@@ -77,45 +94,47 @@ export function validateQuery(q: InteractionQuery, limits: QueryLimits): QueryIs
   try {
     assertTenantScope(q.scope);
   } catch (err) {
-    issues.push({ field: 'scope', messageKo: err instanceof Error ? err.message : String(err) });
+    issues.push({ field: 'scope', code: 'scope', messageKo: err instanceof Error ? err.message : String(err) });
   }
 
   const from = Date.parse(q.period?.fromIso ?? '');
   const to = Date.parse(q.period?.toIso ?? '');
   if (Number.isNaN(from) || Number.isNaN(to)) {
-    issues.push({ field: 'period', messageKo: '조회 기간(from·to)은 ISO8601 형식이어야 한다 (설계서 §7 2.2)' });
+    issues.push({ field: 'period', code: 'period_format', messageKo: '조회 기간(from·to)은 ISO8601 형식이어야 한다 (설계서 §7 2.2)' });
   } else {
-    if (to <= from) issues.push({ field: 'period', messageKo: '조회 종료 시각은 시작 시각보다 뒤여야 한다' });
+    if (to <= from) issues.push({ field: 'period', code: 'period_order', messageKo: '조회 종료 시각은 시작 시각보다 뒤여야 한다' });
     const days = (to - from) / 86_400_000;
     if (days > limits.maxPeriodDays) {
       issues.push({
         field: 'period',
+        code: 'period_too_wide',
         messageKo: `조회 기간이 허용 범위(${limits.maxPeriodDays}일)를 넘는다 — 기간을 나눠 조회한다 (설계서 §10)`,
       });
     }
   }
 
   if (!Number.isInteger(q.limit) || q.limit <= 0) {
-    issues.push({ field: 'limit', messageKo: 'limit은 1 이상의 정수여야 한다' });
+    issues.push({ field: 'limit', code: 'limit', messageKo: 'limit은 1 이상의 정수여야 한다' });
   } else if (q.limit > limits.maxLimit) {
-    issues.push({ field: 'limit', messageKo: `limit은 ${limits.maxLimit} 이하여야 한다` });
+    issues.push({ field: 'limit', code: 'limit', messageKo: `limit은 ${limits.maxLimit} 이하여야 한다` });
   }
 
   for (const c of q.channels ?? []) {
-    if (!CHANNEL_VALUES.includes(c)) issues.push({ field: 'channels', messageKo: `알 수 없는 채널: ${c}` });
+    if (!CHANNEL_VALUES.includes(c)) issues.push({ field: 'channels', code: 'channel', messageKo: `알 수 없는 채널: ${c}` });
   }
   for (const o of q.outcomes ?? []) {
-    if (!OUTCOME_VALUES.includes(o)) issues.push({ field: 'outcomes', messageKo: `알 수 없는 결과: ${o}` });
+    if (!OUTCOME_VALUES.includes(o)) issues.push({ field: 'outcomes', code: 'outcome', messageKo: `알 수 없는 결과: ${o}` });
   }
 
   if (q.keyword !== undefined) {
     const k = q.keyword.trim();
     if (k.length === 0) {
-      issues.push({ field: 'keyword', messageKo: '키워드가 비어 있다' });
+      issues.push({ field: 'keyword', code: 'keyword_empty', messageKo: '키워드가 비어 있다' });
     } else if (maskPii(k).masked) {
       // 개인정보 값 자체로 검색하는 행위를 규약 단계에서 차단한다.
       issues.push({
         field: 'keyword',
+        code: 'keyword_pii',
         messageKo: '개인정보(주민등록번호·카드·계좌·연락처) 패턴은 검색어로 사용할 수 없다 (설계서 §10.3)',
       });
     }
