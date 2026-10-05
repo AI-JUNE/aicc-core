@@ -265,12 +265,15 @@ test('미래 관측은 드러내되 임계값을 만들어 버리지는 않는�
 });
 
 // ── 4번 사고: 요약 ───────────────────────────────────────────────────────────
-test('받은 요약을 다시 마스킹하지 않는다 — maskPii 는 멱등이 아니다', async (t) => {
+test('받은 요약을 다시 마스킹하지 않는다 — 통과시킬 뿐이다', async (t) => {
   if (!rt) return t.skip('타입 스트리핑 미지원 런타임');
   const { maskPii } = await import('../src/core/policyGuard.ts');
   const once = maskPii('주민번호 900101-1234567').text;
-  const twice = maskPii(once).text;
-  assert.notEqual(twice, once, '재적용이 값을 바꾼다는 전제 자체를 고정한다');
+  const again = maskPii(once);
+  // 2026-10-05: maskPii 가 자기 출력에 멱등이 되었다(policyGuard 의 MASKED_SHAPES).
+  // 이 검사는 그 전제를 여기서도 고정한다 — 깨지면 이관 요약이 경로마다 다른 문자열이 된다.
+  assert.equal(again.text, once, '재적용이 값을 바꾸지 않는다');
+  assert.equal(again.masked, false, '이미 가려진 값을 "이번에 가렸다"로 적지 않는다');
 
   const p = rt.executeHandoff(cfg(), req({ summaryMasked: once }));
   assert.equal(p.summaryMasked, once, '요약은 그대로 통과해야 한다');

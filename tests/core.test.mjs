@@ -71,3 +71,39 @@ test('§10.3 규칙 우선순위 — 휴대폰은 phone, 계좌는 account로 �
   const both = g.maskPii('010-1234-5678 / 110-123-456789');
   assert.deepEqual(both.hits.sort(), ['account', 'phone']);
 });
+
+// ── maskPii 멱등성 ─────────────────────────────────────────────────────────────
+// 저장 경로는 한 번만 마스킹하도록 설계돼 있지만, 실제로는 두 번 지나가는 자리가 있다
+// (감사 detail·정산 사유는 호출부와 audit/log.ts 에서 각각, 이벤트 원장의 발화는 조회 투영에서
+// 마지막 방어선으로 한 번 더). 멱등이 아니면 두 번 가린 값이 **다른 값으로 바뀌어**
+// 원장과 화면의 문자열이 갈리고, `masked: true` 가 "원문이 들어왔다"는 사고 신호와 구분되지 않는다.
+const MASK_SAMPLES = {
+  rrn: '주민번호 900101-1234567',
+  card: '카드 1234-5678-9012-3456',
+  phone: '연락처 010-1234-5678',
+  account: '입금계좌 110-123-456789',
+};
+
+test('§10.3 모든 마스킹 규칙에 멱등 표본이 있다 — 규칙을 늘리면 여기서 걸린다', () => {
+  const names = [...read('src/core/policyGuard.ts').matchAll(/name: '([a-z_]+)'/g)].map((m) => m[1]);
+  assert.ok(names.length >= 4, `규칙 이름을 읽지 못했다: ${names.join(',')}`);
+  assert.deepEqual(names.filter((n) => !(n in MASK_SAMPLES)), [], '표본 없는 규칙이 있다 — MASKED_SHAPES 도 같이 늘렸는지 확인하라');
+});
+
+test('§10.3 maskPii 는 자기 출력에 멱등이다 — 재적용이 값을 바꾸지 않는다', behavioral, () => {
+  for (const [name, input] of Object.entries(MASK_SAMPLES)) {
+    const once = g.maskPii(input);
+    assert.deepEqual(once.hits, [name], `${name} 규칙이 잡아야 한다`);
+    const twice = g.maskPii(once.text);
+    assert.equal(twice.text, once.text, `${name}: 재적용이 값을 바꿨다`);
+    assert.equal(twice.masked, false, `${name}: 이미 가려진 값을 "이번에 가렸다"로 적는다`);
+    assert.deepEqual(twice.hits, []);
+  }
+});
+
+test('§10.3 이미 가려진 값 옆의 진짜 번호는 그대로 가린다 — 보호가 과하게 먹지 않는다', behavioral, () => {
+  const r = g.maskPii('900101-******* 010-1234-5678');
+  assert.deepEqual(r.hits, ['phone']);
+  assert.ok(!r.text.includes('010-1234-5678'), '뒤의 진짜 번호가 보호 구간에 묻혔다');
+  assert.ok(r.text.includes('900101-*******'), '앞의 가려진 값은 건드리지 않는다');
+});

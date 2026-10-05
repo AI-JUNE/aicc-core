@@ -11,6 +11,19 @@ const RULES: { name: string; re: RegExp; mask: (m: string) => string }[] = [
   { name: 'account', re: /\b\d{2,3}-?\d{2,6}-?\d{2,6}\b/g,        mask: (m) => '***-****-' + m.slice(-4) },
 ];
 
+/**
+ * 이미 마스킹된 값의 모양 — 위 RULES 의 mask() 출력과 **짝**이다.
+ * 한쪽만 고치면 `tests/core.policyGuard.test.mjs` 의 멱등 검사가 깨진다(§2 이중 관리 방지).
+ *
+ * 왜 필요한가: maskPii 가 자기 출력에 멱등이 아니면 **두 번 가린 값이 더 가려지는 것이 아니라
+ * 다른 값으로 바뀐다**. `900101-*******` 은 계좌 규칙에 다시 걸려 `***-****-0101-*******` 이 된다.
+ * 결과는 조용한 오답이다 — 원장(§8.1)의 전문과 화면·감사에 적힌 전문이 달라지고, 이미 마스킹된
+ * 값을 한 번 더 통과시키는 방어 경로(저장 전 재확인)가 `masked: true` 를 돌려주므로
+ * "원문이 들어왔다"는 사고 신호와 구분되지 않는다. 실제로 감사 detail·정산 사유는 호출부와
+ * `audit/log.ts` 에서 두 번 지나간다.
+ */
+const MASKED_SHAPES = /\d{6}-\*{7}|\d{4}-\*{4}-\*{4}-\d{4}|\d{3}-\*{4}-\d{4}|\*{3}-\*{4}-\d{4}/;
+
 export interface MaskResult { text: string; masked: boolean; hits: string[] }
 
 /** 이미 마스킹된 구간을 뒤 규칙이 다시 잡지 않도록 자리표시자로 보호한다(숫자 미포함). */
@@ -20,6 +33,15 @@ export function maskPii(input: string): MaskResult {
   let out = input;
   const hits: string[] = [];
   const vault: string[] = [];
+
+  // 이미 마스킹된 구간을 먼저 치워 둔다. hits 에는 넣지 않는다 — 이번 호출이 가린 것이 아니다.
+  // 구분자로 공백을 허용하지 않는 것이 중요하다: 허용하면 `900101-******* 010-1234-5678` 이
+  // 한 덩어리로 보호되어 **뒤의 진짜 번호가 마스킹되지 않는다**.
+  out = out.replace(new RegExp(MASKED_SHAPES.source, 'g'), (m) => {
+    vault.push(m);
+    return PH(vault.length - 1);
+  });
+
   for (const r of RULES) {
     const re = new RegExp(r.re.source, 'g');
     let hit = false;
