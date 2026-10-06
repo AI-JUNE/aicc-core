@@ -4,6 +4,7 @@
 //
 // 보존기간(일수)은 테넌트별 법적 검토 결과로만 채운다. 임의 기본값을 코드에 박지 않는다(§13-3).
 import { assertTenantScope, type TenantScope } from './tenancy.ts';
+import { maskPii } from './policyGuard.ts';
 
 export const DAY_MS = 86_400_000;
 
@@ -81,15 +82,20 @@ export interface RetainedRecord {
 /** 정책 오류 목록을 돌려준다(빈 배열이면 통과). 예외 대신 목록 — 설정 화면에서 한 번에 보여주기 위함. */
 export function validateRetentionPolicy(policy: RetentionPolicy): string[] {
   const errors: string[] = [];
-  if (!policy.tenantId) errors.push('tenant_id 누락 (§11.1)');
+  if (!policy || !policy.tenantId) errors.push('tenant_id 누락 (§11.1)');
+
+  // 설정 화면이 한 번에 다 보기 위해 목록을 돌려주는 함수다 — **채우는 중인 폼에서 던지면**
+  // 그 화면은 오류를 하나도 못 보여주고 빈 화면이 된다(품질기준 §1). 빠진 값도 오류 한 줄로 적는다.
+  const rules = Array.isArray(policy?.rules) ? policy.rules : [];
+  if (!Array.isArray(policy?.rules)) errors.push('보존 규칙 목록(rules)이 없다 (§8.2)');
 
   const seen = new Set<DataClass>();
-  for (const r of policy.rules) {
+  for (const r of rules) {
     let spec: DataClassSpec;
     try {
-      spec = dataClassSpec(r.dataClass);
+      spec = dataClassSpec(r?.dataClass);
     } catch {
-      errors.push(`알 수 없는 데이터 분류: ${r.dataClass}`);
+      errors.push(`알 수 없는 데이터 분류: ${String(r?.dataClass)}`);
       continue;
     }
     if (seen.has(r.dataClass)) errors.push(`분류 중복: ${r.dataClass}`);
@@ -98,7 +104,7 @@ export function validateRetentionPolicy(policy: RetentionPolicy): string[] {
     if (!Number.isInteger(r.retentionDays) || r.retentionDays <= 0) {
       errors.push(`${r.dataClass}: 보존기간은 1일 이상의 정수여야 한다`);
     }
-    if (!r.basisKo.trim()) errors.push(`${r.dataClass}: 보존 근거가 비어 있다 (§8.2)`);
+    if (typeof r.basisKo !== 'string' || !r.basisKo.trim()) errors.push(`${r.dataClass}: 보존 근거가 비어 있다 (§8.2)`);
     if (spec.mayContainPii && !r.approved) {
       errors.push(`${r.dataClass}: 개인정보 포함 분류는 승인 전 자동 파기를 실행할 수 없다 [승인 필요]`);
     }
@@ -204,9 +210,22 @@ export interface RetentionDecision {
   reasonKo: string;
 }
 
-/** 레코드 1건의 처리 판정. now를 주입받아 시간 의존성을 제거한다. */
+/**
+ * 레코드 1건의 처리 판정. now를 주입받아 시간 의존성을 제거한다.
+ *
+ * **현재 시각은 던지고 기산 시각은 던지지 않는다.** 둘을 같이 취급하면 안 되는 이유가 있다 —
+ * 현재 시각이 틀리면 모든 레코드의 판정이 똑같이 무의미하므로(설정 오류) 그 자리에서 멈추는 것이
+ * 맞지만, 기산 시각이 **한 건만** 손상된 경우에 던지면 `planDisposition` 이 통째로 예외로 끝나
+ * **그날 만 건의 파기가 전부 밀린다**(그리고 다음 날도, 그 한 건을 고칠 때까지 영구히).
+ * 되돌릴 수 없는 쪽은 지우는 것이 아니라 **지우지 못하는 것**이다(§8.2 — 기한이 지난 개인정보가
+ * 남는다). 그래서 해석할 수 없는 기산 시각은 `blocked` 로 **드러내고** 나머지는 계속 간다
+ * (§9.3 — 한 건의 실패를 통째 실패로 만들지 않는다. `executeDisposition` 의 5번과 같은 규칙이다).
+ * 조용히 넘기는 것이 아니다: `blocked` 는 운영이 반드시 해소해야 하는 건으로 집계된다.
+ */
 export function decide(record: RetainedRecord, policy: RetentionPolicy, nowIso: string): RetentionDecision {
   const base = { recordId: record.id, dataClass: record.dataClass };
+  const now = Date.parse(nowIso);
+  if (Number.isNaN(now)) throw new Error(`현재 시각을 해석할 수 없다: ${JSON.stringify(nowIso)}`);
   if (record.disposedAt) {
     return { ...base, status: 'disposed', reasonKo: `이미 처리됨(${record.disposedAt})` };
   }
@@ -218,9 +237,18 @@ export function decide(record: RetainedRecord, policy: RetentionPolicy, nowIso: 
     return { ...base, status: 'blocked', reasonKo: `보존 규칙 미승인 — 자동 파기 보류 [승인 필요]` };
   }
 
-  const exp = expiresAt(record.createdAt, rule.retentionDays);
-  const now = Date.parse(nowIso);
-  if (Number.isNaN(now)) throw new Error(`현재 시각을 해석할 수 없다: ${JSON.stringify(nowIso)}`);
+  let exp: string;
+  try {
+    exp = expiresAt(record.createdAt, rule.retentionDays);
+  } catch {
+    // 기산 시각·보존기간을 읽을 수 없는 건은 **지울 기한을 모른다**. 값을 되싣지 않는다(§10.3 —
+    // 호스트가 넣은 문자열에 무엇이 들어 있을지 알 수 없다).
+    return {
+      ...base,
+      status: 'blocked',
+      reasonKo: '기산 시각 또는 보존기간을 해석할 수 없어 파기 기한을 산출할 수 없다 (§8.2)',
+    };
+  }
 
   if (Date.parse(exp) > now) {
     return { ...base, status: 'retained', expiresAt: exp, reasonKo: `보존기간 ${rule.retentionDays}일 내` };
@@ -251,6 +279,14 @@ export interface DispositionPlan {
 /**
  * 파기 계획 산출. 계획만 만들고 실행하지 않는다("build now, activate on approval").
  * 다른 테넌트의 레코드가 섞여 들어오면 §11.1 위반으로 즉시 실패한다.
+ *
+ * **워크스페이스도 같은 무게로 본다.** `RetainedRecord.workspaceId` 는 선언만 되어 있고 이 함수가
+ * 보지 않았다 — 그래서 워크스페이스 스코프 정책(부서·브랜드별 보존기간)으로 스윕을 돌리면
+ * **같은 테넌트의 다른 워크스페이스 데이터가 그 정책의 기한으로 지워졌다.** 타입은 통과하고
+ * 테넌트 검사도 통과하므로 어디서도 터지지 않으며, 증상은 "우리 부서 녹취가 왜 없지"로 몇 달 뒤에
+ * 나타난다(되돌릴 수 없다). 워크스페이스를 선언한 정책은 **그 워크스페이스 레코드만** 받는다 —
+ * 워크스페이스가 적혀 있지 않은 레코드도 그 소속을 증명할 수 없으므로 받지 않는다.
+ * 테넌트 전역 정책(선언 없음)은 종전과 같다(레코드의 워크스페이스를 보지 않는다).
  */
 export function planDisposition(
   records: readonly RetainedRecord[],
@@ -262,8 +298,16 @@ export function planDisposition(
     : { tenantId: policy.tenantId };
   assertTenantScope(scope);
   for (const r of records) {
+    // 식별자에 개인정보가 섞여 있을 수 있다(통화 id 에 발신번호를 쓰는 호스트가 있다) — 사유 문구는
+    // 로그·오류 리포트로 흘러가므로 마스킹을 지난다(§10.3).
     if (r.tenantId !== policy.tenantId) {
-      throw new Error(`파기 계획에 타 테넌트 레코드 포함: ${r.id} (설계서 §11.1)`);
+      throw new Error(`파기 계획에 타 테넌트 레코드 포함: ${maskPii(r.id).text} (설계서 §11.1)`);
+    }
+    if (scope.workspaceId !== undefined && r.workspaceId !== scope.workspaceId) {
+      throw new Error(
+        `파기 계획에 다른 워크스페이스 레코드 포함: ${maskPii(r.id).text} ` +
+        `(정책 ${scope.workspaceId} ≠ 레코드 ${r.workspaceId === undefined ? '미선언' : maskPii(r.workspaceId).text}, 설계서 §11.1)`,
+      );
     }
   }
   const decisions = records.map((r) => decide(r, policy, nowIso));
