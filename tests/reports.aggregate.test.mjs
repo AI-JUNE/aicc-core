@@ -172,3 +172,61 @@ test('인텐트 상위 목록은 빈도순·동률 시 이름순으로 안정 �
   ]);
   assert.deepEqual(rp.topIntents(r.total, 1), [{ intent: 'billing', count: 2 }]);
 });
+
+// ── 같이 고친 결함 ───────────────────────────────────────────────────────────
+// 둘 다 예외가 아니라 **그럴듯한 표**로 나타난다. 원장에는 과거 호스트가 넣은 값도 남아 있고,
+// 기간 경계는 호스트가 쓰는 오프셋에 따라 뒤바뀐다.
+
+test('기간 경계를 시점으로 비교한다 — 오프셋이 다르면 문자열 비교가 앞뒤를 뒤바꾼다', behavioral, () => {
+  // 같은 시점의 두 표기. 문자열로 비교하면 '2026-09-01T00:00:00+09:00' > '2026-08-31T15:00:00Z' 이라
+  // 경계 직후의 통화가 통째로 기간 밖으로 떨어진다.
+  const events = [
+    ev.sessionEnded(meta({ occurredAt: '2026-08-31T15:30:00Z' }), { outcome: 'AUTO_RESOLVED', turnCount: 1 }),
+  ];
+  const r = rp.aggregateReport(events, { scope, granularity: 'total', from: '2026-09-01T00:00:00+09:00' });
+  assert.equal(r.total.sessionsEnded, 1, '같은 시점 기준으로 기간 안이다');
+  assert.equal(r.outOfRangeDropped, 0);
+});
+
+test('§13-3 오프셋 없는 기간 경계는 던진다 — 서버 시간대마다 다른 기간을 집계한다', behavioral, () => {
+  assert.throws(
+    () => rp.aggregateReport([], { scope, granularity: 'total', from: '2026-09-01T00:00:00' }),
+    /오프셋 명시 ISO8601/,
+  );
+  assert.throws(
+    () => rp.aggregateReport([], { scope, granularity: 'total', to: '2026-09-30' }),
+    /오프셋 명시 ISO8601/,
+  );
+});
+
+test('기간 필터가 있을 때 읽을 수 없는 시각은 범위 안으로도 0 으로도 넣지 않는다', behavioral, () => {
+  const e = ev.sessionEnded(meta(), { outcome: 'AUTO_RESOLVED', turnCount: 1 });
+  const r = rp.aggregateReport([{ ...e, occurred_at: '2026-09-01T10:00:00' }], {
+    scope, granularity: 'total', from: '2026-09-01T00:00:00Z',
+  });
+  assert.equal(r.timestampsRejected, 1);
+  assert.equal(r.outOfRangeDropped, 0, '제외 사유를 두 번 세지 않는다');
+  assert.equal(r.total.sessionsEnded, 0);
+});
+
+test('계약에 없는 열거값이 집계를 NaN 으로 만들지 않는다 — 건수로만 센다', behavioral, () => {
+  const ended = ev.sessionEnded(meta(), { outcome: 'AUTO_RESOLVED', turnCount: 1 });
+  const handoff = ev.handoffRequested(meta(), { reason: 'policy', toQueue: 'general' });
+  const started = ev.sessionStarted(meta(), {});
+  const events = [
+    { ...ended, outcome: 'DONE' },
+    { ...handoff, reason: '모르는사유' },
+    { ...started, channel: 'fax' },
+  ];
+  const r = rp.aggregateReport(events, { scope, granularity: 'total' });
+
+  for (const v of Object.values(r.total.outcomes)) assert.equal(Number.isNaN(v), false);
+  for (const v of Object.values(r.total.handoffReasons)) assert.equal(Number.isNaN(v), false);
+  for (const v of Object.values(r.total.channels)) assert.equal(Number.isNaN(v), false);
+  assert.equal(r.total.outcomesUnknown, 1);
+  assert.equal(r.total.handoffReasonsUnknown, 1);
+  assert.equal(r.total.channelsUnknown, 1);
+  // 세션·이관 건수 자체는 관측 그대로다 — 모르는 값 때문에 통화가 사라지지 않는다.
+  assert.equal(r.total.sessionsEnded, 1);
+  assert.equal(r.total.handoffs, 1);
+});

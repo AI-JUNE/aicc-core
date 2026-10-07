@@ -16,10 +16,18 @@ import type {
   HandoffRequestedEvent,
 } from '../events/schema.ts';
 import { assertTenantScope, type TenantScope } from '../core/tenancy.ts';
+import { isZonedIso } from '../events/periodLedger.ts';
 
 export type ReportGranularity = 'hour' | 'day' | 'month' | 'total';
 
-/** 버킷 키는 ISO 문자열 접두사로 만든다 — 로컬 타임존 변환을 Core 에 넣지 않는다(테넌트마다 다르다). */
+/**
+ * 버킷 키는 ISO 문자열 접두사로 만든다 — 로컬 타임존 변환을 Core 에 넣지 않는다(테넌트마다 다르다).
+ *
+ * 그 대가는 숨기지 않는다: 이벤트 시각의 오프셋이 섞이면(`Z` 와 `+09:00`) **같은 시점이 서로 다른
+ * 버킷으로 갈라진다**. `billing/usage.ts` 의 `bucketKey` 는 UTC 로 정규화하므로 그때 과금과 리포트가
+ * 다른 값을 보여준다. 규칙을 두 모듈에서 통일하지 않는 이유는 테넌트 시간대를 Core 가 정하지 않기
+ * 위해서이고(§13-3), 대신 `events/periodLedger.ts` 의 투영이 **오프셋이 섞였다는 관측**을 적는다.
+ */
 export function reportBucketKey(occurredAtIso: string, g: ReportGranularity): string {
   switch (g) {
     case 'hour': return occurredAtIso.slice(0, 13);
@@ -85,6 +93,20 @@ export interface ReportBucket {
   /** 세션 길이 표본(ms) — session.ended 의 duration_ms 가 있는 건만 */
   durationMs: number[];
   sessionsMissingDuration: number;
+  /**
+   * 계약에 없는 채널 값으로 온 이벤트 수.
+   *
+   * 이벤트는 §8.1 원장에서 오고 원장에는 과거 호스트가 넣은 값도 남아 있다. 모르는 키로
+   * `channels[e.channel] += 1` 을 하면 `undefined + 1` 이 되어 **그 채널 칸이 NaN 으로 굳고**,
+   * NaN 은 어떤 비교에서도 거짓이라 화면에서는 "집계 안 됨"이 아니라 그냥 빈 칸으로 보인다
+   * (`billing/usage.ts` 의 `usageValuesRejected` 와 같은 이유다). 0 으로도 그대로도 세지 않고
+   * 건수만 적는다 — 대응은 리포트 수정이 아니라 **그 이벤트를 만든 채널 어댑터 수정**이다.
+   */
+  channelsUnknown: number;
+  /** 계약에 없는 Outcome 값(§4.1). 위와 같은 이유로 따로 센다. */
+  outcomesUnknown: number;
+  /** 계약에 없는 이관 사유(§2). 위와 같은 이유로 따로 센다. */
+  handoffReasonsUnknown: number;
 }
 
 function newBucket(bucket: string): ReportBucket {
@@ -105,13 +127,38 @@ function newBucket(bucket: string): ReportBucket {
     latency: emptySamples(),
     durationMs: [],
     sessionsMissingDuration: 0,
+    channelsUnknown: 0,
+    outcomesUnknown: 0,
+    handoffReasonsUnknown: 0,
   };
+}
+
+/**
+ * 계약에 있는 키만 올린다. 열거값 목록을 여기서 다시 적지 않는 것이 핵심이다(§2) —
+ * **빈 버킷이 가진 키가 곧 계약**이므로, 열거형이 늘어나도 두 곳을 고칠 일이 없다.
+ */
+function bump(rec: Record<string, number>, key: unknown): boolean {
+  if (typeof key !== 'string' || !Object.prototype.hasOwnProperty.call(rec, key)) return false;
+  if (typeof rec[key] !== 'number') return false;
+  rec[key] += 1;
+  return true;
 }
 
 export interface ReportOptions {
   scope: TenantScope;
   granularity: ReportGranularity;
-  /** 기간 필터(ISO8601, 경계 포함). 생략하면 전체. */
+  /**
+   * 기간 필터(ISO8601 **오프셋 명시**, 경계 포함). 생략하면 전체.
+   *
+   * **시점으로 비교한다.** 문자열로 비교하면 `2026-10-01T00:00:00+09:00` 과
+   * `2026-09-30T15:00:00Z` 가 같은 시점인데도 앞뒤가 뒤바뀐다 — 그러면 같은 원장이 호스트가
+   * 어떤 오프셋을 쓰느냐에 따라 다른 리포트를 낸다. 오프셋 없는 경계는 **던진다**(설정 오류):
+   * `Date.parse('2026-10-01T00:00:00')` 는 성공하고 서버 로컬로 해석되므로, 통과시키면 같은
+   * 코드가 서버마다 다른 기간을 집계한다(§13-3).
+   *
+   * 기간 투영(`events/periodLedger.ts`)을 쓰는 경로는 **여기에 기간을 넘기지 않는다** —
+   * 투영은 반개구간 [from, to) 이고 이쪽은 양쪽 포함이라, 둘을 같이 쓰면 경계 해석이 두 개가 된다(§2).
+   */
   from?: string;
   to?: string;
   channels?: ChannelKind[];
@@ -125,7 +172,13 @@ export interface ReportSummary {
   eventsCounted: number;
   duplicatesDropped: number;
   foreignTenantDropped: number;
+  /** 기간·채널 필터로 제외한 이벤트 수. */
   outOfRangeDropped: number;
+  /**
+   * 기간 필터가 선언됐는데 시각을 시점으로 읽을 수 없어 제외한 이벤트 수(오프셋 미명시 포함).
+   * 0 으로도 범위 안으로도 넣지 않는다 — 넣으면 읽을 수 없는 시각이 조용히 이 기간의 지표가 된다.
+   */
+  timestampsRejected: number;
   buckets: ReportBucket[];
   /** 전 기간 합계 — 버킷과 같은 규칙으로 계산된 단일 버킷이다. */
   total: ReportBucket;
@@ -154,7 +207,7 @@ function pushLatency(b: ReportBucket, e: InteractionEvent): void {
 }
 
 function accumulate(b: ReportBucket, e: InteractionEvent): void {
-  b.channels[e.channel] += 1;
+  if (!bump(b.channels as unknown as Record<string, number>, e.channel)) b.channelsUnknown += 1;
 
   switch (e.type) {
     case 'session.started':
@@ -176,18 +229,30 @@ function accumulate(b: ReportBucket, e: InteractionEvent): void {
     case 'handoff.requested': {
       const h = e as HandoffRequestedEvent;
       b.handoffs += 1;
-      b.handoffReasons[h.reason] += 1;
+      if (!bump(b.handoffReasons as unknown as Record<string, number>, h.reason)) b.handoffReasonsUnknown += 1;
       break;
     }
     case 'session.ended': {
       const s = e as SessionEndedEvent;
       b.sessionsEnded += 1;
-      b.outcomes[s.outcome] += 1;
+      if (!bump(b.outcomes as unknown as Record<string, number>, s.outcome)) b.outcomesUnknown += 1;
       if (typeof s.duration_ms === 'number') b.durationMs.push(s.duration_ms);
       else b.sessionsMissingDuration += 1;
       break;
     }
   }
+}
+
+/** 기간 경계. 오프셋 없는 선언은 설정 오류다 — 위 `ReportOptions.from` 주석 참조. */
+function boundMs(bound: string | undefined, label: 'from' | 'to'): number | undefined {
+  if (bound === undefined) return undefined;
+  if (!isZonedIso(bound)) {
+    throw new Error(
+      `기간 경계(${label})가 오프셋 명시 ISO8601 이 아니다: ${JSON.stringify(bound)} — ` +
+      '오프셋이 없으면 같은 원장이 서버 시간대마다 다른 기간을 집계한다 (설계서 §13-3)',
+    );
+  }
+  return Date.parse(bound);
 }
 
 /**
@@ -206,13 +271,22 @@ export function aggregateReport(events: InteractionEvent[], opts: ReportOptions)
   const duplicatesDropped = sameTenant.length - unique.length;
 
   const channelFilter = opts.channels;
+  const fromMs = boundMs(opts.from, 'from');
+  const toMs = boundMs(opts.to, 'to');
+  let timestampsRejected = 0;
   const inRange = unique.filter(e => {
-    if (opts.from !== undefined && e.occurred_at < opts.from) return false;
-    if (opts.to !== undefined && e.occurred_at > opts.to) return false;
     if (channelFilter && !channelFilter.includes(e.channel)) return false;
+    if (fromMs === undefined && toMs === undefined) return true;
+    if (!isZonedIso(e.occurred_at)) {
+      timestampsRejected += 1;
+      return false;
+    }
+    const ms = Date.parse(e.occurred_at);
+    if (fromMs !== undefined && ms < fromMs) return false;
+    if (toMs !== undefined && ms > toMs) return false;
     return true;
   });
-  const outOfRangeDropped = unique.length - inRange.length;
+  const outOfRangeDropped = unique.length - inRange.length - timestampsRejected;
 
   const map = new Map<string, ReportBucket>();
   const total = newBucket('total');
@@ -237,6 +311,7 @@ export function aggregateReport(events: InteractionEvent[], opts: ReportOptions)
     duplicatesDropped,
     foreignTenantDropped,
     outOfRangeDropped,
+    timestampsRejected,
     buckets: [...map.values()].sort((a, b) => a.bucket.localeCompare(b.bucket)),
     total,
   };

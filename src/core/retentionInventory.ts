@@ -64,6 +64,7 @@
 import type { ChannelKind } from '../domain/types.ts';
 import type { InteractionEvent, TurnCompletedEvent } from '../events/schema.ts';
 import type { EventLog, ReadOptions } from '../events/store.ts';
+import { isZonedIso } from '../events/periodLedger.ts';
 import { assertTenantScope, type TenantScope } from './tenancy.ts';
 import { maskPii } from './policyGuard.ts';
 import {
@@ -239,13 +240,9 @@ function newCounters(): RetentionInventoryCounters {
   };
 }
 
-/**
- * 오프셋이 명시된 ISO8601 만 시각으로 받는다. 오프셋이 없으면 서버 시간대에 따라 기산 시점이
- * 몇 시간 움직이고, 그만큼 일찍 지워지거나 늦게 지워진다 — 보존기간 경계에서는 그것이 곧 위반이다.
- */
-function isZonedIso(s: unknown): boolean {
-  return typeof s === 'string' && /(?:Z|[+-]\d{2}:\d{2})$/.test(s.trim()) && !Number.isNaN(Date.parse(s));
-}
+// 오프셋이 명시된 ISO8601 만 시각으로 받는다. 오프셋이 없으면 서버 시간대에 따라 기산 시점이
+// 몇 시간 움직이고, 그만큼 일찍 지워지거나 늦게 지워진다 — 보존기간 경계에서는 그것이 곧 위반이다.
+// 판정은 `events/periodLedger.ts` 하나다(§2) — 같은 규칙을 두 곳에 두면 한쪽만 고쳐진다.
 
 interface SessionAcc {
   id: string;
