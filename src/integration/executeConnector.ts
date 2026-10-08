@@ -17,9 +17,10 @@
 //
 // 하지 않는 것: 네트워크 접근. 실제 호출은 주입된 `ConnectorPort` 가 하고, 이 파일은 순서만 지킨다.
 import type { ConsentPolicy, ConsentRecord } from '../consent/consent.ts';
-import { gateAction } from '../consent/consent.ts';
 import { maskPii } from '../core/policyGuard.ts';
 import type { TenantScope } from '../core/tenancy.ts';
+import { decideLegalBasis, type LegalBasisDecision } from '../legal/executeLegal.ts';
+import type { AcceptanceRecord, LegalDocument } from '../legal/documents.ts';
 import type { FlowInput } from '../flow/runner.ts';
 import type { HealthSample } from '../ops/fallback.ts';
 import {
@@ -37,6 +38,7 @@ export type BlockedReason =
   | 'residency'               // 국외이전 불가 테넌트에 해외 연동
   | 'consent_context_missing' // pii 파라미터가 있는데 동의 컨텍스트가 없다
   | 'consent_denied'          // §10.1 게이트가 막았다
+  | 'legal_notice_not_final'  // 동의는 있으나 고지 문안이 확정본이 아니거나 개정돼 재수락이 필요하다(§10.1)
   | 'missing_slots'           // 필수 슬롯이 비었다 — 빈 값으로 조회하면 엉뚱한 결과가 온다
   | 'idempotency_key_missing'
   | 'retry_without_backoff';  // 간격 없는 재시도는 힘들어하는 시스템을 더 밀어붙인다
@@ -78,12 +80,30 @@ export interface ExecuteBlocked {
 
 export type ExecuteOutcome = ExecuteOk | ExecuteFailed | ExecuteBlocked;
 
+/**
+ * 고지 문안 등록부 컨텍스트(§10.1).
+ *
+ * **선언하지 않으면 종전과 완전히 같다**(§13-3) — 문안 검사를 하지 않고 동의 게이트 결과만 쓴다.
+ * 선언하면 초안 문안·시행일 전 문안·개정 후 재수락 누락이 **호출 전에** 막힌다. 판정은
+ * `legal/executeLegal.ts` 하나가 만들고 이 파일은 순서만 지킨다(§2).
+ */
+export interface LegalContext {
+  /** 등록부 내용(`LegalRegistry.list()` 결과 그대로). */
+  docs: readonly LegalDocument[];
+  /** 문안 수락 기록. 없으면 재수락 판정을 하지 않고 "대조할 수 없다"로 적는다. */
+  acceptances?: readonly AcceptanceRecord[];
+  /** 고객에게 보여 준 언어. 기본 언어를 만들지 않는다(§13-3). */
+  locale: string;
+}
+
 export interface ConsentContext {
   policy: ConsentPolicy;
   records: readonly ConsentRecord[];
   /** 개인정보 원문이 아닌 참조여야 한다 — `assertSubjectRef` 가 확인한다. */
   subjectRef: string;
   now: string;
+  /** §10.1 고지 문안 검사. 선언하지 않으면 종전과 완전히 같다. */
+  legal?: LegalContext;
 }
 
 export interface ExecuteConnectorInput {
@@ -108,6 +128,15 @@ export interface ExecuteConnectorInput {
   onHealth?: (sample: HealthSample) => void;
   /** 관측 시각. 주입하지 않으면 헬스 샘플을 만들지 않는다 — 시각 없는 샘플은 신선도 판정을 못 한다(§13-3). */
   now?: () => string;
+  /**
+   * §10.1 근거 판정을 행위별로 그대로 넘긴다(`onHealth` 와 같은 모양).
+   *
+   * 왜 콜백인가: 판정에는 **막지 않은 사실**도 들어 있다 — "확정 여부를 확인할 수 없는 참조",
+   * "수락 기록이 없어 어느 문안으로 받은 동의인지 대조하지 못함". 결과를 `blocked` 하나로 접으면
+   * 그 사실이 사라지고, 사라진 사실은 점검받을 때 다시 만들 수 없다. 던져도 호출을 막지 않는다 —
+   * 기록용 훅의 버그로 통화가 끊기면 안 된다(§9.3).
+   */
+  onLegalBasis?: (decision: LegalBasisDecision) => void;
 }
 
 /** 포트가 규약을 어긴 값을 돌려줬을 때. `ok` 로도 `실패`로도 임의 해석하지 않고 형식 오류로 적는다. */
@@ -187,17 +216,48 @@ export async function executeConnector(input: ExecuteConnectorInput): Promise<Ex
     const actions = pii.length > 0 ? (['call_backend_with_pii'] as const) : ([] as const);
     const all = def.residency === 'overseas' ? [...actions, 'transfer_overseas' as const] : [...actions];
     for (const action of all) {
-      let decision;
+      // 판정은 `decideLegalBasis` 하나다 — 그 안에서 `gateAction` 을 부르고 결과를 그대로 싣는다(§2).
+      // `legal` 미선언이면 문안 검사를 건너뛰므로 `allowed` 는 종전의 게이트 결과와 같다(§13-3).
+      let basis: LegalBasisDecision;
       try {
-        decision = gateAction(c.policy, c.records, action, c.subjectRef, c.now, input.scope);
+        basis = decideLegalBasis({
+          scope: input.scope,
+          policy: c.policy,
+          consents: c.records,
+          subjectRef: c.subjectRef,
+          action,
+          now: c.now,
+          ...(c.legal !== undefined
+            ? {
+              docs: c.legal.docs,
+              locale: c.legal.locale,
+              ...(c.legal.acceptances !== undefined ? { acceptances: c.legal.acceptances } : {}),
+            }
+            : {}),
+        });
       } catch (e) {
         return { kind: 'blocked', reason: 'consent_denied', messageKo: maskPii(e instanceof Error ? e.message : String(e)).text };
       }
-      if (!decision.allow) {
-        const purposes = decision.blockedBy.map((b) => b.purpose).join(', ');
+
+      if (input.onLegalBasis) {
+        // 기록용 훅이 던져도 호출을 막지 않는다(§9.3).
+        try { input.onLegalBasis(basis); } catch { /* 무시 */ }
+      }
+
+      const gate = basis.gate;
+      if (!gate.allow) {
+        const purposes = gate.blockedBy.map((b) => b.purpose).join(', ');
         return {
           kind: 'blocked', reason: 'consent_denied',
-          messageKo: `동의 게이트가 호출을 막았습니다(${action}·${decision.reason}): ${purposes || '사유 없음'}`,
+          messageKo: `동의 게이트가 호출을 막았습니다(${action}·${gate.reason}): ${purposes || '사유 없음'}`,
+        };
+      }
+      if (!basis.allowed) {
+        // 동의는 있는데 문안이 흔들린 경우다. 같은 `consent_denied` 로 접지 않는다 —
+        // 조치가 다르다(동의를 다시 받는 것과 문안을 확정·재수락하는 것은 다른 일이다).
+        return {
+          kind: 'blocked', reason: 'legal_notice_not_final',
+          messageKo: `§10.1 고지 문안 근거가 없어 호출하지 않았습니다(${action}·${basis.status}): ${maskPii(basis.blockersKo.join(' / ')).text}`,
         };
       }
     }
