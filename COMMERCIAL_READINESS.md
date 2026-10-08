@@ -117,10 +117,24 @@
         이 파일에는 만료일·목적 매핑·자리표시자 정규식이 없다) · **종전과 완전히 같다**(§13-3: `docs` 를
         선언하지 않으면 문안 검사를 하지 않고 `allowed` 는 게이트 결과 그대로다 — 달라지는 것은
         `verified: false` 와 "확인하지 못했다"가 적힌다는 점뿐이다).
+        **소비 측 완결**: 새 판정 모듈을 열어 두고 아무도 부르지 않으면 (7) 과 같은 실패가 된다 —
+        그래서 §10.1 게이트가 실제로 걸려 있는 **유일한 자리**(`integration/executeConnector.ts` 의
+        pii 파라미터·해외 연동 경로)가 이제 `gateAction` 을 직접 부르지 않고 `decideLegalBasis` 를
+        지난다(§2 — 판정하는 곳이 둘이 되면 문안 검사가 한쪽에만 걸린다). `ConsentContext.legal` 을
+        선언하지 않으면 **종전과 완전히 같고**, 선언하면 초안 문안·시행일 전 문안·개정 후 재수락
+        누락이 **포트를 부르기 전에** 막힌다 — 막힌 뒤 호출이 나가면 개인정보는 이미 넘어간 것이다.
+        차단 사유는 `legal_notice_not_final` 로 **`consent_denied` 와 갈라 둔다**: 동의를 다시 받는
+        것과 문안을 확정·재수락하는 것은 다른 조치이고, 같은 사유로 접으면 운영이 고객에게 동의를
+        다시 묻는다. 막지 않은 사실은 `onLegalBasis` 콜백으로 판정 전체가 넘어간다(`blocked` 하나로
+        접으면 "확인할 수 없었다"가 사라진다) — 그 콜백이 던져도 호출을 막지 않는다(§9.3).
         **변이 검증(도구 출력 그대로)**: 필수 목적의 문안 결함을 막지 않으면 8건 실패 ·
-        수락 `stale` 을 무시하면 1건 실패 · 버전 고정의 정수 검사를 빼면 1건 실패 — 전부 원본에서는 통과한다.
+        수락 `stale` 을 무시하면 1건 실패 · 버전 고정의 정수 검사를 빼면 1건 실패 ·
+        커넥터에서 문안 판정을 무시하면 2건 실패 · `legal` 미선언에 기본 언어·빈 등록부를 넣으면
+        3건 실패 — 전부 원본에서는 통과한다.
         근거: `src/legal/executeLegal.ts` · `tests/legal.executeLegal.test.mjs`(26건 — 실제
-        `finalizeDocument`·`recordAcceptance`·`gateAction` 을 지나는 검사) · `API.md` 반영
+        `finalizeDocument`·`recordAcceptance`·`gateAction` 을 지나는 검사) ·
+        `src/integration/executeConnector.ts`(`ConsentContext.legal`·`onLegalBasis`·
+        `legal_notice_not_final`) · `tests/integration.executeConnector.test.mjs`(32건) · `API.md` 반영
       · 남은 것: 약관·처리방침 **문안 확정 + 승인 근거(approvalRef)·시행일** — 사람이 정한다 **[승인 필요]**,
         포털 화면(문서 표시·수락 UI)은 포털 저장소 과제, **문안 참조 규칙 적용**: 테넌트 동의 정책의
         `noticeRef` 를 등록부 참조(`legal:<종류>`)로 바꾸는 것은 설정 변경이며 그때까지 Core 는

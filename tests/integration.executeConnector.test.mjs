@@ -283,3 +283,111 @@ test('기록용 요청 사본은 pii 값을 지운다(§6.1 규약 2)', b, () =>
   assert.equal(red.params.rrn, '[REDACTED]');
   assert.equal(X.redactedRequestOf(d, {}, scope, 'i1', 'k'), undefined);
 });
+
+// ── §10.1 고지 문안 근거 (legal 컨텍스트) ────────────────────────────────────
+//
+// 여기서 고정하는 것: **초안 문안으로 받은 동의로는 개인정보 조회가 나가지 않는다.** 그리고
+// 그 검사를 선언하지 않은 테넌트는 **종전과 완전히 같다** — 새 검사가 조용히 기본값으로 켜지면
+// 문안을 아직 올리지 않은 테넌트의 모든 조회가 그날부터 막힌다(§13-3).
+
+let L = null, D = null;
+try {
+  L = await import('../src/legal/executeLegal.ts');
+  D = await import('../src/legal/documents.ts');
+} catch { /* 구형 런타임 */ }
+const bl = { skip: X && L && D ? false : '타입 스트리핑 미지원 런타임' };
+
+const { createHash } = await import('node:crypto');
+const sha = (s) => createHash('sha256').update(s).digest('hex');
+const LOCALE = 'ko-KR';
+const APPROVAL = { approvalRef: 'LEGAL-2026-09-01', approvedBy: '김법무', approvedAt: '2026-09-01T00:00:00Z' };
+
+const privacyDraft = (over = {}) =>
+  ({ kind: 'privacy_policy', locale: LOCALE, version: 1, status: 'draft', content: '처리방침 본문', ...over });
+const privacyFinal = (over = {}) =>
+  D.finalizeDocument(privacyDraft(over), { approval: APPROVAL, effectiveFrom: '2026-09-15T00:00:00Z' }, sha);
+
+/** 등록부를 가리키는 정책. 위 `policy()` 는 noticeRef 가 없어 'absent' 가 된다. */
+const refPolicy = (over = {}) => policy({
+  requirements: [{ purpose: 'personal_data_collection', required: true, noticeRef: 'legal:privacy_policy' }],
+  ...over,
+});
+
+/** pii 파라미터가 선언된 커넥터 — 동의 게이트가 실제로 걸리는 유일한 자리다. */
+const piiDef = () => def({ params: [{ name: 'rrn', fromSlot: 'account_no', required: true, pii: true }] });
+
+test('legal 컨텍스트를 선언하지 않으면 종전과 완전히 같다(§13-3)', bl, async () => {
+  const r = await run({ def: piiDef(), consent: consentCtx() });
+  assert.equal(r.kind, 'ok', '문안을 선언하지 않은 테넌트의 조회가 새 검사로 막히면 안 된다');
+});
+
+test('확정본을 가리키는 정책이면 호출이 나가고, 판정은 콜백으로 그대로 넘어온다', bl, async () => {
+  const seen = [];
+  const r = await run({
+    def: piiDef(),
+    consent: consentCtx({ policy: refPolicy(), legal: { docs: [privacyFinal()], acceptances: [], locale: LOCALE } }),
+    onLegalBasis: (d) => seen.push(d),
+  });
+  assert.equal(r.kind, 'ok');
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].allowed, true);
+  assert.equal(seen[0].verified, false, '수락 기록이 없다는 사실은 사라지지 않는다');
+  assert.equal(seen[0].notices.checks[0].status, 'final');
+});
+
+test('초안 문안뿐이면 개인정보 조회가 나가지 않는다 — 포트를 아예 부르지 않는다(§10.1)', bl, async () => {
+  const port = recordingPort([{ ok: true, data: { balance: '10000' } }]);
+  const r = await run({
+    def: piiDef(),
+    port,
+    consent: consentCtx({ policy: refPolicy(), legal: { docs: [privacyDraft()], locale: LOCALE } }),
+  });
+  assert.equal(r.kind, 'blocked');
+  assert.equal(r.reason, 'legal_notice_not_final', '동의를 다시 받는 것과 문안을 확정하는 것은 다른 조치다');
+  assert.deepEqual(port.calls, [], '막혔는데 호출이 나가면 개인정보가 이미 넘어간 것이다');
+});
+
+test('문안이 개정되면 이전 수락으로는 조회가 나가지 않는다', bl, async () => {
+  const v1 = privacyFinal();
+  const acceptances = D.recordAcceptance([], {
+    tenantId: 't1', subjectRef: 'cust_hash_1', at: '2026-09-16T00:00:00Z', via: 'voice', doc: v1,
+  });
+  const v2 = D.finalizeDocument(privacyDraft({ version: 2, content: '개정된 처리방침 본문' }),
+    { approval: APPROVAL, effectiveFrom: '2026-09-18T00:00:00Z' }, sha);
+  const r = await run({
+    def: piiDef(),
+    consent: consentCtx({ policy: refPolicy(), legal: { docs: [v1, v2], acceptances, locale: LOCALE } }),
+  });
+  assert.equal(r.kind, 'blocked');
+  assert.equal(r.reason, 'legal_notice_not_final');
+  assert.match(r.messageKo, /재수락/);
+});
+
+test('동의 자체가 없으면 문안보다 동의를 먼저 적는다 — 조치가 엉뚱해지지 않게', bl, async () => {
+  const r = await run({
+    def: piiDef(),
+    consent: consentCtx({ policy: refPolicy(), records: [], legal: { docs: [privacyDraft()], locale: LOCALE } }),
+  });
+  assert.equal(r.kind, 'blocked');
+  assert.equal(r.reason, 'consent_denied');
+});
+
+test('판정 콜백이 던져도 호출을 막지 않는다 — 기록용 훅의 버그로 통화가 끊기면 안 된다(§9.3)', bl, async () => {
+  const r = await run({
+    def: piiDef(),
+    consent: consentCtx({ policy: refPolicy(), legal: { docs: [privacyFinal()], locale: LOCALE } }),
+    onLegalBasis: () => { throw new Error('훅 버그'); },
+  });
+  assert.equal(r.kind, 'ok');
+});
+
+test('문안 설정 오류(locale 누락)는 호출하지 않고 막는다 — 던지면 통화가 끊긴다', bl, async () => {
+  const port = recordingPort([{ ok: true, data: { balance: '10000' } }]);
+  const r = await run({
+    def: piiDef(),
+    port,
+    consent: consentCtx({ policy: refPolicy(), legal: { docs: [privacyFinal()] } }),
+  });
+  assert.equal(r.kind, 'blocked');
+  assert.deepEqual(port.calls, []);
+});
