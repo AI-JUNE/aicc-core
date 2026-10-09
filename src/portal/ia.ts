@@ -113,6 +113,11 @@ export const PORTAL_ROUTES: PortalRoute[] = [
   { id: 'settings.members', section: 'settings', path: '/settings/members', titleKo: '사용자·권한', roles: ['tenant_owner', 'admin'], pii: true, mutates: true },
   { id: 'settings.engines', section: 'settings', path: '/settings/engines', titleKo: '엔진 어댑터', roles: ['tenant_owner', 'admin'], pii: false, mutates: true },
   { id: 'settings.retention', section: 'settings', path: '/settings/retention', titleKo: '보존·파기 정책', roles: ['tenant_owner', 'admin'], pii: false, mutates: true },
+  // 동의 이력 조회·철회 처리(§10.1 정보주체 권리행사). 라우트가 없으면 `decideAccess` 가
+  // `unknown_route` 로 거부하므로 **철회는 권한 검사·감사를 거쳐 실행될 수 없다** — 그러면
+  // 호스트가 만드는 철회 화면은 IA 밖 화면이 되고, 그쪽이 `screenMap.ts` 가 "훨씬 위험하다"고
+  // 적어 둔 경우다(권한 검사와 감사 기록을 안 거치는 화면).
+  { id: 'settings.consent', section: 'settings', path: '/settings/consent', titleKo: '동의 이력·철회', roles: ['tenant_owner', 'admin'], pii: true, mutates: true },
 ];
 
 /** 보유 역할 집합 전개 */
