@@ -51,7 +51,8 @@
 //    판정하지 않고 거절한다 — 0 으로 읽으면 모든 오퍼가 즉시 만료되고, 무한으로 읽으면 (가)다.
 //  - **엔진·백엔드 상태로 집계하지 않는다.** 상담사가 안 받는 것은 장애가 아니다 — §9.3 폴백에
 //    넣으면 점심시간마다 전 채널이 AI 중단으로 떨어진다. 그래서 헬스·폴백 모듈을 참조하지 않는다.
-//  - **던지지 않는다.** 실패는 전부 결과값이다(`refused`). 통화를 끊는 판단은 채널이 한다.
+//  - **던지는 것은 격리 위반 하나뿐이다**(§11.1) — 남의 테넌트 설정으로 상담사를 고르는 것은
+//    폴백할 사안이 아니다. 그 밖의 실패는 전부 결과값이다(`refused`); 통화를 끊는 판단은 채널이 한다.
 //  - **고객을 큐에서 빼지 않는다.** 제안할 상담사가 없는 것은 **한도 소진이 아니다** —
 //    둘을 같게 적으면 운영은 "재배정 한도를 늘리면 되겠네"로 읽고 원인은 상담사 부재다.
 import type { TenantScope } from '../core/tenancy.ts';
@@ -102,7 +103,7 @@ export type OfferStepCode =
   | 'cancelled'
   /** 재배정 한도 소진 → §9.3 대안 */
   | 'alternative'
-  /** 설정·형태 오류·중복 요청 — **원장은 입력 그대로다** */
+  /** 설정·형태 오류·중복 요청 — **요청이 반영되지 않았고 원장은 입력 그대로다** */
   | 'refused';
 
 export interface OfferStep {
@@ -136,11 +137,13 @@ function isOpen(o: AssignmentOffer): boolean {
 /** 정책 검증. 없는 값을 추정하지 않는다 — 0ms 는 모든 오퍼를 즉시 만료시킨다(§13-3). */
 function policyIssues(policy: OfferPolicy): string[] {
   const out: string[] = [];
-  if (!Number.isInteger(policy.timeoutMs) || policy.timeoutMs <= 0) {
-    out.push(`오퍼 응답 한도(timeoutMs)는 양수 정수여야 한다: ${String(policy?.timeoutMs)}`);
+  const timeoutMs = policy?.timeoutMs;
+  const maxAttempts = policy?.maxAttempts;
+  if (!Number.isInteger(timeoutMs) || (timeoutMs as number) <= 0) {
+    out.push(`오퍼 응답 한도(timeoutMs)는 양수 정수여야 한다: ${String(timeoutMs)}`);
   }
-  if (!Number.isInteger(policy.maxAttempts) || policy.maxAttempts < 1) {
-    out.push(`재배정 한도(maxAttempts)는 1 이상의 정수여야 한다: ${String(policy?.maxAttempts)}`);
+  if (!Number.isInteger(maxAttempts) || (maxAttempts as number) < 1) {
+    out.push(`재배정 한도(maxAttempts)는 1 이상의 정수여야 한다: ${String(maxAttempts)}`);
   }
   return out;
 }
@@ -226,7 +229,8 @@ function candidateIssues(candidates: readonly string[]): string[] {
     if (seen.has(id)) out.push(`후보 상담사 목록에 중복이 있다: ${mask(id)}`);
     seen.add(id);
     if (maskPii(id).masked) {
-      out.push(`상담사 id 에 개인정보 패턴이 있다 — 식별자로 쓸 수 없다 (설계서 §10.3)`);
+      // 원문은 적지 않는다 — 차단한 값을 결과에 담으면 차단이 무의미해진다.
+      out.push('상담사 id 에 개인정보 패턴이 있다 — 식별자로 쓸 수 없다 (설계서 §10.3)');
     }
   }
   return out;
@@ -504,6 +508,26 @@ export function settleOffer(
     nowIso: p.nowIso,
     ...(p.summaryMasked !== undefined ? { summaryMasked: p.summaryMasked } : {}),
   });
+  if (next.code === 'refused') {
+    // **이어 주기가 실패했다고 이미 반영한 전이를 되돌리지 않는다.** `refused` 로 돌려주면
+    // 호출자는 "아무 일도 없었다"로 읽고 거절·무응답 사실이 사라진다 — 그러면 (가)가
+    // 되살아난다(한도가 깎이지 않은 채 같은 attempt 로 다시 돌아간다).
+    // 전이는 반영된 그대로 두고, 이어 주지 못한 **이유**를 `requeue` 에 실어 보낸다.
+    return {
+      code: 'requeue',
+      ledger: nextLedger,
+      offer: outcome.offer,
+      attempt,
+      skipped: next.skipped,
+      issues: next.issues,
+      warnings: [
+        ...warnings,
+        ...next.warnings,
+        '다음 오퍼를 열지 못했다 — 사유를 해소한 뒤 openOffer 를 다시 불러야 고객이 큐에서 풀린다',
+      ],
+      reasonKo: mask(`${outcome.reasonKo} · 다음 제안 실패`),
+    };
+  }
   return {
     ...next,
     warnings: [...warnings, ...next.warnings],
