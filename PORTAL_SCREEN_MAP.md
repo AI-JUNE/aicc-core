@@ -3,8 +3,8 @@
 `src/portal/ia.ts` 의 라우트 표와 실제 화면 구현을 대조한 결과다.
 **이 문서는 `src/portal/screenMap.ts` 에서 생성된다 — 직접 고치지 말 것.**
 
-- 라우트 25건 — 구현 0 · 작업중 0 · 미착수 25 · 보류 0
-- 감사 대상(개인정보 열람·상태 변경) 15건 중 접근 기록 배선 완료 0건 (§10.2)
+- 라우트 26건 — 구현 0 · 작업중 0 · 미착수 26 · 보류 0
+- 감사 대상(개인정보 열람·상태 변경) 16건 중 접근 기록 배선 완료 0건 (§10.2)
 
 진행률(%)은 적지 않는다. 실측 건수만 둔다(§13-3).
 
@@ -67,7 +67,8 @@
 | `settings.members` | `/settings/members` | tenant_owner, admin | O | O | 미착수 | - | 필요 |
 | `settings.engines` | `/settings/engines` | tenant_owner, admin | - | O | 미착수 | - | 필요 |
 | `settings.retention` | `/settings/retention` | tenant_owner, admin | - | O | 미착수 | - | 필요 |
+| `settings.consent` | `/settings/consent` | tenant_owner, admin | O | O | 미착수 | - | 필요 |
 
 ## 비고
 
-- 포털 저장소 미착수(2026-09-03 기준). Core 측 계약은 준비됨. — 25건 (dashboard.overview, dashboard.outcomes, interactions.list, interactions.detail, interactions.handoff, studio.flows, studio.editor, studio.validate, studio.simulate, studio.publish, studio.knowledge, operations.queues, operations.campaigns, operations.disclosure, operations.health, qa.review, qa.testsets, reports.builder, reports.export, reports.audit, reports.settlement, settings.tenant, settings.members, settings.engines, settings.retention)
+- 포털 저장소 미착수(2026-09-03 기준). Core 측 계약은 준비됨. — 26건 (dashboard.overview, dashboard.outcomes, interactions.list, interactions.detail, interactions.handoff, studio.flows, studio.editor, studio.validate, studio.simulate, studio.publish, studio.knowledge, operations.queues, operations.campaigns, operations.disclosure, operations.health, qa.review, qa.testsets, reports.builder, reports.export, reports.audit, reports.settlement, settings.tenant, settings.members, settings.engines, settings.retention, settings.consent)

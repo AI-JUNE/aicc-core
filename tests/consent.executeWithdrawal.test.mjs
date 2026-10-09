@@ -186,12 +186,32 @@ test('필수 목적 철회 후 gateAction 이 그 행위를 막는다(실제로 
   assert.equal(r.recheck[0].decision.reason, 'consent_missing');
 });
 
-test('선택 목적 철회는 필수 게이트를 막지 않는다', b, () => {
+test('결함 재현: gateAction 은 선택 목적을 막지 않으므로 철회해도 allow 가 참이다', b, () => {
+  const store = EC.createMemoryConsentStore([granted('personal_data_collection'), granted('marketing')]);
+  const after = [...store.list(SUBJ), C.withdraw(policy(), { subjectRef: SUBJ, purpose: 'marketing', via: 'portal', at: AT })];
+  const d = C.gateAction(policy(), after, 'marketing_followup', SUBJ, AT, SCOPE);
+  // 게이트 설계는 옳다(선택 목적은 막지 않는다). 위험한 것은 이 true 를 그대로 읽는 것이다.
+  assert.equal(d.allow, true);
+});
+
+test('선택 목적 철회는 게이트를 막지 않는다 — 그 사실을 드러낸다(§10.1)', b, () => {
   const store = EC.createMemoryConsentStore([granted('personal_data_collection'), granted('marketing')]);
   const r = run(store, { purposes: ['marketing'], recheckActions: ['call_backend_with_pii', 'marketing_followup'] });
   assert.equal(r.status, 'ok');
+  // 필수 게이트는 그대로 열려 있다.
   assert.equal(r.recheck[0].decision.allow, true);
-  assert.equal(r.recheck[1].decision.allow, false);
+  assert.deepEqual(r.recheck[0].withdrawnButAllowed, []);
+  // 거둔 목적인데도 막지 않는 것은 드러난다 — 축소 실행은 호출자가 한다.
+  assert.equal(r.recheck[1].decision.allow, true);
+  assert.deepEqual(r.recheck[1].withdrawnButAllowed, ['marketing']);
+  assert.ok(r.warnings.some((w) => w.includes('축소 실행')));
+});
+
+test('필수 목적 철회는 withdrawnButAllowed 를 만들지 않는다 — 게이트가 이미 막는다', b, () => {
+  const store = EC.createMemoryConsentStore([granted('personal_data_collection')]);
+  const r = run(store, { recheckActions: ['call_backend_with_pii'] });
+  assert.equal(r.recheck[0].decision.allow, false);
+  assert.deepEqual(r.recheck[0].withdrawnButAllowed, []);
 });
 
 test('재판정을 선언하지 않으면 하지 않는다(§13-3)', b, () => {
@@ -300,24 +320,44 @@ test('미승인 정책에서는 기록을 만들지 않고 설정 결함으로 �
 
 test('정책 자체가 깨져 있으면 철회를 처리하지 않는다', b, () => {
   const store = EC.createMemoryConsentStore([granted('personal_data_collection')]);
+  // 버전 오류·목적 중복은 validateConsentPolicy 가 오류로 잡는다.
+  assert.equal(run(store, {}, policy({ version: 0 })).status, 'refused');
+  const dup = policy({
+    requirements: [
+      { purpose: 'personal_data_collection', required: true },
+      { purpose: 'personal_data_collection', required: false },
+    ],
+  });
+  assert.equal(run(store, {}, dup).status, 'refused');
+  assert.equal(store.list(SUBJ).length, 1);
+});
+
+test('목적이 하나도 선언되지 않은 정책은 경고이며, 거둘 것이 없다로 끝난다', b, () => {
+  // 경고를 오류로 올리지 않는다 — 올리면 선언 전 테넌트의 철회 요청이 "처리 불가"가 된다.
+  const store = EC.createMemoryConsentStore([granted('personal_data_collection')]);
   const r = run(store, {}, policy({ requirements: [] }));
-  assert.equal(r.status, 'refused');
+  assert.equal(r.status, 'nothing_to_withdraw');
+  assert.equal(r.results[0].outcome, 'undeclared');
 });
 
 // ── 경계 ─────────────────────────────────────────────────────────────────────
 
-test('판정을 복사하지 않는다 — 만료일·목적 매핑·필수 판정이 이 파일에 없다(§2)', b, () => {
-  const code = SRC.split('\n').filter((l) => !l.trimStart().startsWith('//') && !l.trimStart().startsWith('*')).join('\n');
-  assert.ok(!code.includes('validForDays'));
-  assert.ok(!code.includes('ACTION_PURPOSES'));
+const codeOnly = () =>
+  SRC.split('\n').filter((l) => !l.trimStart().startsWith('//') && !l.trimStart().startsWith('*')).join('\n');
+
+test('판정을 복사하지 않는다 — 만료일·필수 판정·목적 매핑 사본이 이 파일에 없다(§2)', b, () => {
+  const code = codeOnly();
+  assert.ok(!code.includes('validForDays'));          // 만료는 currentState 하나
   assert.ok(!code.includes('86_400_000'));
-  assert.ok(!code.includes('.required'));
+  assert.ok(!code.includes('.required'));             // 필수 판정은 gateAction 하나
+  assert.ok(!/ACTION_PURPOSES\s*[:=]\s*\{/.test(code)); // 매핑을 다시 적지 않고 읽기만 한다
   assert.ok(code.includes('currentState(') && code.includes('gateAction(') && code.includes('withdraw('));
 });
 
 test('개인정보 파기 경로를 겸하지 않는다(§8.2 와 분리)', b, () => {
-  assert.ok(!SRC.includes('retentionInventory'));
-  assert.ok(!SRC.includes('DisposalPort'));
+  const code = codeOnly();
+  assert.ok(!code.includes('retentionInventory'));
+  assert.ok(!code.includes('DisposalPort'));
 });
 
 test('계약 버전과 라우트 id 가 노출된다', b, () => {

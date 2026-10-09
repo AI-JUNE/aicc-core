@@ -29,7 +29,13 @@
 //      이다. 기록만 쌓고 게이트를 확인하지 않으면 "철회했는데 여전히 조회된다"가 남는다.
 //      그래서 철회 후 `gateAction` 을 **실제로 다시 불러** 결과에 적는다. 다만 **통화를 끊지
 //      않는다** — `allow: false` 는 "그 행위를 하지 말라"이지 "통화를 종료하라"가 아니다
-//      (`executeLegal` 과 같은 경계). 선택 목적 철회로 필수 게이트가 막히지 않는 것도 그대로다.
+//      (`executeLegal` 과 같은 경계).
+//      **여기서 제일 비싼 것이 드러났다**: `gateAction` 은 선언대로 **필수 목적만** 막는다
+//      ("선택 목적은 막지 않는다 — 호출자가 축소 실행을 선택한다"). 그래서 마케팅 동의를
+//      철회해도 `marketing_followup` 은 여전히 `allow: true` 다. 게이트 설계는 옳지만, 철회
+//      화면이 그 `true` 를 그대로 읽으면 **거둔 동의로 마케팅이 계속 나간다** — 철회 사고 중
+//      제일 흔한 모양이다. 판정을 고치지 않고(§2) `withdrawnButAllowed` 로 **드러낸다**:
+//      "이번에 거둔 목적인데 게이트는 막지 않는다 — 축소 실행은 호출자가 해야 한다."
 //  (바) **기록이 저장되지 않으면 철회는 일어나지 않았다.** `executeConsent` 가 저장을 호스트에
 //      맡긴 것은 통화 중 판정이라서다(기록 실패는 "동의 없음"으로 남아 게이트가 막는 쪽으로
 //      안전하게 기운다). 철회는 **반대 방향으로 기울어 위험하다** — 저장이 실패하면 동의가
@@ -59,7 +65,8 @@ import type {
   ConsentPolicy, ConsentPurpose, ConsentRecord, ConsentState, GateDecision, GatedAction,
 } from './consent.ts';
 import {
-  assertSubjectRef, consentPolicyOk, currentState, gateAction, validateConsentPolicy, withdraw,
+  ACTION_PURPOSES, assertSubjectRef, consentPolicyOk, currentState, gateAction,
+  validateConsentPolicy, withdraw,
 } from './consent.ts';
 import type { ConsentStore } from './executeConsent.ts';
 
@@ -123,6 +130,18 @@ export interface WithdrawalRequest {
   recheckActions?: readonly GatedAction[];
 }
 
+export interface RecheckResult {
+  action: GatedAction;
+  /** `gateAction` 결과 그대로. 여기서 다시 판정하지 않는다(§2). */
+  decision: GateDecision;
+  /**
+   * **이번에 거둔 목적인데 게이트가 막지 않는 것**(선택 목적이라서다).
+   * 비어 있지 않으면 **축소 실행은 호출자가 해야 한다** — 이 값을 보지 않고 `allow: true` 만
+   * 읽으면 거둔 동의로 그 행위가 계속 나간다(§10.1).
+   */
+  withdrawnButAllowed: readonly ConsentPurpose[];
+}
+
 export interface WithdrawalResult {
   status: WithdrawalStatusCode;
   messageKo: string;
@@ -136,7 +155,7 @@ export interface WithdrawalResult {
    * 철회 후 행위 게이트 재판정(`recheckActions` 를 선언한 경우에만).
    * `allow: false` 는 "그 행위를 하지 말라"이지 "통화를 종료하라"가 아니다.
    */
-  recheck?: readonly { action: GatedAction; decision: GateDecision }[];
+  recheck?: readonly RecheckResult[];
   /** 거부·설정 결함 사유(마스킹 경유). */
   issues: readonly string[];
   warnings: readonly string[];
@@ -223,16 +242,13 @@ export function executeWithdrawal(
     // 주체 참조에 개인정보 원문이 오면 거부한다 — **원문은 결과에도 담지 않는다**(§10.3).
     issues.push(e instanceof Error ? e.message : '동의 주체 참조가 성립하지 않는다');
   }
+  // 미승인 정책은 **여기서 다시 보지 않는다**(§2) — `validateConsentPolicy` 가 `E_NOT_APPROVED`
+  // 를 오류로 내므로 아래 한 줄이 이미 거절한다. `policy.approved` 를 또 읽으면 승인 규칙이 두
+  // 곳에 생기고, 그 상태에서 `gateAction` 은 이미 모든 행위를 막고 있으므로(= 철회가 더할 효과가
+  // 없다) 판정을 늘릴 이유도 없다. 변이 검증으로 중복임을 확인했다(빼도 실패 0건).
   const policyIssues = validateConsentPolicy(policy);
   if (!consentPolicyOk(policyIssues)) {
     issues.push(...policyIssues.filter((i) => i.severity === 'error').map((i) => i.messageKo));
-  }
-  if (!policy.approved) {
-    // `consent.ts` 가 미승인 정책의 기록 생성을 막는다. 그 상태에서는 `gateAction` 이 이미
-    // 전부를 막고 있으므로 철회가 더할 효과가 없다 — 조용히 넘기지 않고 설정 결함으로 적는다.
-    issues.push(
-      '미승인 동의 정책으로는 철회 기록을 만들 수 없다 — 이 상태에서는 모든 행위가 이미 차단돼 있다 (설계서 §10.1)',
-    );
   }
   if (issues.length > 0) {
     // 형태·설정 오류는 기록하지 않는다 — 처리가 일어나지 않았고, 남기면 조사에서 잡음이 된다.
@@ -337,7 +353,9 @@ export function executeWithdrawal(
       chain: outcome.chain,
       recorded: outcome.recorded,
       ...(outcome.record !== undefined ? { record: outcome.record } : {}),
-      ...(recheck(policy, history, req) ?? {}),
+      // 거둔 목적이 없으므로 `withdrawnButAllowed` 는 비어 있다 — 그래도 재판정은 돌려준다
+      // (운영자가 "지금 무엇이 허용돼 있는가"를 같은 화면에서 봐야 한다).
+      ...(recheck(policy, history, req, [], warnings) ?? {}),
     };
   }
 
@@ -406,7 +424,7 @@ export function executeWithdrawal(
     chain: outcome.chain,
     recorded: outcome.recorded,
     ...(outcome.record !== undefined ? { record: outcome.record } : {}),
-    ...(recheck(policy, after, req) ?? {}),
+    ...(recheck(policy, after, req, stored.map((r) => r.purpose), warnings) ?? {}),
   };
 }
 
@@ -419,15 +437,26 @@ function recheck(
   policy: ConsentPolicy,
   records: readonly ConsentRecord[],
   req: WithdrawalRequest,
-): { recheck: readonly { action: GatedAction; decision: GateDecision }[] } | undefined {
+  withdrawnPurposes: readonly ConsentPurpose[],
+  warnings: string[],
+): { recheck: readonly RecheckResult[] } | undefined {
   const actions = req.recheckActions;
   if (actions === undefined || actions.length === 0) return undefined;
-  const out: { action: GatedAction; decision: GateDecision }[] = [];
+  const out: RecheckResult[] = [];
   for (const action of actions) {
-    out.push({
-      action,
-      decision: gateAction(policy, records, action, req.subjectRef, req.at, req.scope),
-    });
+    const decision = gateAction(policy, records, action, req.subjectRef, req.at, req.scope);
+    // 목적 매핑은 `ACTION_PURPOSES` 하나를 **읽는다** — 여기서 다시 적지 않는다(§2).
+    // 필수 여부를 재판정하지 않고 **게이트의 결론(allow)** 과 대조하는 것이 요점이다.
+    const touched = decision.allow
+      ? ACTION_PURPOSES[action].filter((p) => withdrawnPurposes.includes(p))
+      : [];
+    if (touched.length > 0) {
+      warnings.push(
+        `${action}: 거둔 목적(${touched.join(', ')})이지만 게이트는 막지 않는다 — `
+        + '선택 목적이므로 축소 실행은 호출자가 해야 한다 (설계서 §10.1)',
+      );
+    }
+    out.push({ action, decision, withdrawnButAllowed: touched });
   }
   return { recheck: out };
 }
