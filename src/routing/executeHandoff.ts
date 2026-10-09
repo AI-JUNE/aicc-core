@@ -135,9 +135,15 @@ function mask(text: string): string {
  */
 const INSTANT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
 
-function isInstant(value: unknown): value is string {
+/**
+ * 라우팅 경로의 시각 판정은 이 함수 하나다(§2) — 배정 오퍼(`executeOffer.ts`)도 같은 것을 쓴다.
+ * 두 곳이 다른 엄격도로 판정하면 **같은 문자열이 이관에서는 거부되고 오퍼에서는 통과한다**.
+ */
+export function isRoutingInstant(value: unknown): value is string {
   return typeof value === 'string' && INSTANT_RE.test(value) && !Number.isNaN(Date.parse(value));
 }
+
+const isInstant = isRoutingInstant;
 
 function sameSnapshot(a: QueueSnapshot, b: QueueSnapshot): boolean {
   return a.waiting === b.waiting
@@ -199,7 +205,7 @@ function sanitizeSnapshots(
  * `selectQueue` 는 `tenantId` 만 보므로 여기서 한 겹 더 잠근다(§11.1).
  * **던진다** — 옆 워크스페이스 큐로 고객을 보내는 것은 폴백할 사안이 아니다.
  */
-function assertConfigScope(cfg: RoutingConfig, scope: TenantScope): void {
+export function assertRoutingScope(cfg: RoutingConfig, scope: TenantScope): void {
   assertTenantScope(scope);
   if (cfg.tenantId !== scope.tenantId) {
     throw new Error('다른 테넌트의 라우팅 설정으로 이관할 수 없다 (설계서 §11.1)');
@@ -217,7 +223,7 @@ function assertConfigScope(cfg: RoutingConfig, scope: TenantScope): void {
  * 어느 단계에서 걸려도 "사람을 놓을 수 있는 큐 id"가 생기지 않는다.
  */
 export function executeHandoff(cfg: RoutingConfig, req: HandoffRequest): HandoffPlacement {
-  assertConfigScope(cfg, req.scope);
+  assertRoutingScope(cfg, req.scope);
 
   const warnings: string[] = [];
   const summaryPresent = typeof req.summaryMasked === 'string' && req.summaryMasked.length > 0;
@@ -343,7 +349,7 @@ export function placementAfterExhausted(
   cfg: RoutingConfig,
   p: ExhaustedParams,
 ): AlternativePlacement {
-  assertConfigScope(cfg, p.scope);
+  assertRoutingScope(cfg, p.scope);
   const summaryPresent = typeof p.summaryMasked === 'string' && p.summaryMasked.length > 0;
   const warnings: string[] = [];
   if (!summaryPresent) {
