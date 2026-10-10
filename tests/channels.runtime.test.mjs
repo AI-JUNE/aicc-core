@@ -53,7 +53,7 @@ function fakePort(id = 'callbot', capsOver = {}, over = {}) {
   };
 }
 
-function build({ flows = [flowBilling], registry, port = fakePort(), ports, samples = [], policy = {}, components, reprompt, timing, routing, connectors, channelSwitch, disclosure, intent, knowledge, consent, qa } = {}) {
+function build({ flows = [flowBilling], registry, port = fakePort(), ports, samples = [], policy = {}, components, reprompt, timing, routing, connectors, channelSwitch, disclosure, intent, knowledge, consent, qa, observability } = {}) {
   const collector = B.createCollectorSink('t');
   const bus = B.createEventBus({
     scope: SCOPE, sinks: [collector],
@@ -82,6 +82,7 @@ function build({ flows = [flowBilling], registry, port = fakePort(), ports, samp
     ...(knowledge !== undefined ? { knowledge } : {}),
     ...(consent !== undefined ? { consent } : {}),
     ...(qa !== undefined ? { qa } : {}),
+    ...(observability !== undefined ? { observability } : {}),
   });
   return { core, port, collector, health };
 }
@@ -2345,4 +2346,206 @@ test('호스트가 넘긴 동의 컨텍스트는 덮어쓰지 않는다 — 그 
     CN.gateAction(CPOLICY(), seeded, 'call_backend_with_pii', 'sha256:host', NOW, SCOPE).allow,
     true,
   );
+});
+
+// ── 관측 배선(§13·§9.3·§10.3·§11.1·§13-3) ────────────────────────────────────
+//
+// 고정하는 것은 "로그가 남는다"가 아니라 **배선이 없던 동안의 상태**(통화가 예외로 죽어도
+// 아무 기록이 없다)와 **배선을 켰을 때 새로 생길 수 있는 사고**(발화가 로그로 새고,
+// 선언된 장애가 알림 폭주가 되고, 로거 예외가 통화를 끊는 것)다.
+
+let OBS = null, LG = null, EM = null;
+try {
+  OBS = await import('../src/obs/executeObservability.ts');
+  LG = await import('../src/obs/logger.ts');
+  EM = await import('../src/obs/errorMonitor.ts');
+} catch { /* 구형 런타임 */ }
+const bo = { skip: (R && OBS && LG && EM) ? false : '타입 스트리핑 미지원 런타임' };
+
+function obsWiring(over = {}) {
+  const sink = LG.createMemorySink();
+  const sent = [];
+  return {
+    records: sink.records,
+    sent,
+    binding: {
+      logger: LG.createLogger({ minLevel: 'debug', sink }),
+      monitor: EM.createErrorMonitor({ transport: (r) => sent.push(r) }),
+      ...over,
+    },
+  };
+}
+
+test('배선이 없으면 종전과 완전히 같다 — 실측도 만들지 않는다(§13-3)', bo, async () => {
+  const { core } = build();
+  await core.start(req());
+  assert.equal(core.observability(), undefined, '관측 실측을 0건으로 지어내지 않는다');
+  assert.equal(core.flushObservability(), 0);
+});
+
+test('배선 전에는 턴이 예외로 죽어도 아무 기록이 남지 않았다(결함 재현)', bo, async () => {
+  const { core } = build();
+  await assert.rejects(() => core.send('없는_세션', { input: { kind: 'utterance', text: 'x' } }));
+  assert.equal(core.observability(), undefined);
+});
+
+test('진입점 네 곳 모두가 관측된다 — 조기 반환 경로를 빠뜨리지 않는다', bo, async () => {
+  const w = obsWiring();
+  const { core } = build({ observability: w.binding });
+  await core.start(req());
+  await core.send('i_test1', { input: { kind: 'utterance', text: '홍길동' } });
+  core.reportHealth({ adapter: 'callbot', samples: [], observedAt: NOW });
+  await core.end('i_test1', '고객 종료');
+  await core.end('i_test1', '중복 종료');      // 이미 종료된 세션 — 조기 반환 경로
+  assert.deepEqual(w.records.map((r) => r.event), [
+    'core.session.start', 'core.turn.send', 'core.health.report', 'core.session.end', 'core.session.end',
+  ]);
+  assert.equal(core.observability().recorded, 5);
+});
+
+test('예외는 error 로 기록되고 수집기로 올라가며 그대로 다시 던져진다', bo, async () => {
+  const w = obsWiring();
+  const { core } = build({ observability: w.binding });
+  await assert.rejects(() => core.send('없는_세션', { input: { kind: 'utterance', text: 'x' } }));
+  assert.equal(w.records.length, 1);
+  assert.equal(w.records[0].level, 'error');
+  assert.equal(w.records[0].fields.outcome, 'threw');
+  assert.equal(w.records[0].tenantId, 'goone');
+  assert.equal(w.sent.length, 1);
+  assert.equal(core.observability().captured, 1);
+});
+
+test('테넌트 격리 위반도 기록된다 — 로그의 테넌트는 Core 가 강제하는 값이다(§11.1)', bo, async () => {
+  const w = obsWiring();
+  const { core } = build({ observability: w.binding });
+  await assert.rejects(() => core.start(req({ scope: { tenantId: 'other' } })));
+  assert.equal(w.records[0].tenantId, 'goone', '호스트가 주장한 테넌트를 적으면 그 로그로 격리 사고를 조사할 수 없다');
+  assert.equal(w.records[0].fields.adapter, 'callbot');
+});
+
+test('발화·슬롯 값·상담사 요약은 로그 어디에도 남지 않는다(§10.3)', bo, async () => {
+  const w = obsWiring();
+  const { core } = build({ flows: [flowHandoff], observability: w.binding });
+  await core.start(req({ flowId: 'care' }));
+  await core.send('i_test1', { input: { kind: 'utterance', text: '제 이름은 홍길동이고 900101-1234567 입니다' } });
+  const dump = w.records.map((r) => LG.formatLine(r)).join('\n');
+  for (const leaked of ['홍길동', '900101', '주민등록번호']) {
+    assert.ok(!dump.includes(leaked), `로그에 본문이 남았다(${leaked})`);
+  }
+  const last = w.records[w.records.length - 1];
+  assert.equal(last.fields.handoffSummaryAttached, true);
+  assert.equal(last.fields.status, 'transferred');
+});
+
+test('채널이 준 상관관계 id 로 세션 전체가 이어진다 — Core 가 id 를 만들지 않는다(§13-3)', bo, async () => {
+  const w = obsWiring();
+  const { core } = build({ observability: w.binding });
+  await core.start(req({ correlationId: 'call_7f3a91' }));
+  await core.send('i_test1', { input: { kind: 'utterance', text: '값' } });
+  await core.end('i_test1', '종료');
+  assert.deepEqual(w.records.map((r) => r.requestId), ['call_7f3a91', 'call_7f3a91', 'call_7f3a91']);
+
+  const w2 = obsWiring();
+  const { core: c2 } = build({ observability: w2.binding });
+  await c2.start(req());
+  assert.equal(w2.records[0].requestId, undefined, '주지 않으면 만들지 않는다');
+});
+
+test('상관관계 id 에 발신번호를 넣은 호스트의 값은 로그에 실리지 않고 건수로 드러난다', bo, async () => {
+  const w = obsWiring();
+  const { core } = build({ observability: w.binding });
+  await core.start(req({ correlationId: '010-1234-5678' }));
+  assert.equal(w.records[0].requestId, undefined);
+  assert.ok(!LG.formatLine(w.records[0]).includes('1234'));
+  assert.equal(core.observability().droppedIds, 1);
+});
+
+test('장애 폴백으로 끝난 세션도 기록되고, 수집기로는 올라가지 않는다(§9.3)', bo, async () => {
+  const w = obsWiring();
+  const { core } = build({
+    samples: [{ component: 'telephony', state: 'down', observedAt: NOW }],
+    policy: { legacyIvrAvailable: true },
+    observability: w.binding,
+  });
+  await core.start(req());
+  assert.equal(w.records[0].level, 'warn');
+  assert.equal(typeof w.records[0].fields.fallbackMode, 'string');
+  assert.equal(w.sent.length, 0, '선언된 장애를 턴마다 알림으로 올리면 진짜 예외가 상한에 밀려 버려진다');
+});
+
+test('선언하지 않은 컴포넌트의 헬스 샘플이 버려진 사실이 드러난다(§9.3)', bo, () => {
+  const w = obsWiring();
+  const { core } = build({ components: ['telephony'], observability: w.binding });
+  core.reportHealth({
+    adapter: 'callbot',
+    samples: [
+      { component: 'telephony', state: 'up', observedAt: NOW },
+      { component: 'llm', state: 'down', observedAt: NOW },
+    ],
+    observedAt: NOW,
+  });
+  const rec = w.records[0];
+  assert.equal(rec.level, 'warn');
+  assert.equal(rec.fields.offered, 2);
+  assert.equal(rec.fields.samples, 1);
+  assert.equal(rec.fields.ignored, 1);
+  assert.equal(rec.fields.registered, true);
+});
+
+test('등록되지 않은 채널의 헬스 보고는 통째로 버려진다는 사실이 남는다', bo, () => {
+  const w = obsWiring();
+  const { core } = build({ observability: w.binding });
+  core.reportHealth({ adapter: 'chatbot', samples: [{ component: 'llm', state: 'down', observedAt: NOW }], observedAt: NOW });
+  assert.equal(w.records[0].level, 'warn');
+  assert.equal(w.records[0].fields.registered, false);
+  assert.equal(w.records[0].fields.offered, 1);
+  assert.equal(w.records[0].fields.samples, 0);
+});
+
+test('시계를 주면 실측 소요가 남고, 주지 않으면 만들지 않는다(§13-3)', bo, async () => {
+  let t = 0;
+  const w = obsWiring({ clock: () => (t += 7) });
+  const { core } = build({ observability: w.binding });
+  await core.start(req());
+  assert.equal(typeof w.records[0].durationMs, 'number');
+
+  const w2 = obsWiring();
+  const { core: c2 } = build({ observability: w2.binding });
+  await c2.start(req());
+  assert.equal(w2.records[0].durationMs, undefined);
+  assert.equal(w2.records[0].at, undefined, '로거에 시계가 없으면 시각도 만들지 않는다');
+});
+
+test('로거가 던져도 통화는 끊기지 않고 실패가 집계된다(§9.3)', bo, async () => {
+  const boom = () => { throw new Error('sink 폭발'); };
+  const logger = {
+    minLevel: 'info', debug: boom, info: boom, warn: boom, error: boom,
+    child() { return logger; }, async time(_e, run) { return run(); },
+  };
+  const { core } = build({ observability: { logger } });
+  const r = await core.start(req());
+  assert.equal(r.status, 'running');
+  assert.equal(core.observability().failed, 1);
+  assert.equal(core.observability().logged, 0);
+});
+
+test('관측은 턴 결과에 아무것도 싣지 않는다 — 배선 유무로 결과가 달라지지 않는다', bo, async () => {
+  const w = obsWiring();
+  const a = build({ observability: w.binding });
+  const c = build();
+  const ra = await a.core.start(req());
+  const rc = await c.core.start(req());
+  assert.deepEqual(Object.keys(ra).sort(), Object.keys(rc).sort());
+  assert.deepEqual(ra.state, rc.state);
+  assert.equal(ra.events.length, rc.events.length);
+});
+
+test('과금 근거를 못 실은 종료는 warn 으로 드러난다(§11.2)', bo, async () => {
+  const w = obsWiring();
+  const { core } = build({ observability: w.binding });
+  await core.start(req());
+  await core.end('i_test1', '종료', { billableMs: -1 });
+  const last = w.records[w.records.length - 1];
+  assert.equal(last.level, 'warn');
+  assert.equal(last.fields.billableMsRecorded, false);
 });

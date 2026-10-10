@@ -109,7 +109,6 @@ export function loggableId(value: unknown): LoggableId {
   }
   // 제어문자·줄바꿈. `formatLine` 은 JSON 이라 이스케이프하지만, 텍스트 sink·수집기가 그대로
   // 쓰면 한 줄이 두 줄로 쪼개져 그 뒤의 집계·검색이 어긋난다. 애초에 id 에 있을 값이 아니다.
-  // eslint-disable-next-line no-control-regex
   if (/[\u0000-\u001f\u007f]/.test(value)) {
     return { ok: false, reasonKo: '식별자에 제어문자·줄바꿈이 있습니다.' };
   }
@@ -149,6 +148,8 @@ export interface ObservedHealth {
   adapter?: string;
   /** 등록된 채널의 보고인가. false 면 그 보고는 **통째로 버려진다**. */
   registered: boolean;
+  /** 채널이 올린 샘플 수(기록 여부와 무관). 들어온 것과 들어간 것이 다르면 그 차이가 신호다. */
+  offered: number;
   /** 레지스트리에 기록된 샘플. */
   accepted: readonly HealthSample[];
   /** 선언하지 않은 컴포넌트라 버려진 샘플 수. */
@@ -282,8 +283,12 @@ function reasonsOnce(reasons: string[], text: string): void {
 function healthFields(h: ObservedHealth, out: Record<string, string | number | boolean>, reasons: string[]): void {
   if (h.adapter !== undefined && KNOWN_ADAPTERS.includes(h.adapter)) out.adapter = h.adapter;
   out.registered = h.registered;
+  out.offered = h.offered;
   out.samples = h.accepted.length;
   out.ignored = h.ignored;
+  if (h.registered && h.offered === 0) {
+    reasons.push('헬스 보고에 샘플이 한 건도 없습니다 — 상태를 올렸다는 사실만으로는 §9.3 판정이 움직이지 않습니다.');
+  }
   if (h.accepted.length > 0) {
     out.components = [...new Set(h.accepted.map((s) => s.component))].join(',');
     for (const [state, n] of Object.entries(countStates(h.accepted))) out[`state_${state}`] = n;

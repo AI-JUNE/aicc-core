@@ -64,6 +64,8 @@ import {
 } from '../consent/executeConsent.ts';
 import type { TurnBillingNote } from '../billing/turnUsage.ts';
 import { attachTurnUsage, billingNoteOrUndefined, checkBillableMs, mergeTurnUsage, usageNote } from '../billing/turnUsage.ts';
+import type { CoreOp, ObservabilityBinding, ObservedCall, Observer, ObserverStats } from '../obs/executeObservability.ts';
+import { createObserver, isKnownAdapter } from '../obs/executeObservability.ts';
 import type { ForbiddenPhraseRule, QaReport, QaRuleSet } from '../qa/compliance.ts';
 import type { ComplianceBuffer, ComplianceTurnNote } from '../qa/executeCompliance.ts';
 import {
@@ -460,6 +462,18 @@ export interface ConversationCoreOptions {
    * 않고, 그 사실이 `W_QA_UNBOUND` 경고로 남는다.
    */
   qa?: ComplianceBinding;
+  /**
+   * 관측(§13·§9.3·§10.3). **주지 않으면 종전과 완전히 같다**(§13-3) — 로그 한 줄도 남지 않는다.
+   *
+   * 이 배선이 없던 동안 `obs/logger.ts`·`obs/errorMonitor.ts` 는 저장소에 있으나 **아무도
+   * 부르지 않는** 상태였다. 그 상태에서 통화가 예외로 죽으면 어디에도 테넌트·상호작용·
+   * 실패 코드가 남지 않는데, 사후분석에서 필요한 것이 정확히 그 셋이다.
+   *
+   * 무엇을 싣고 무엇을 싣지 않을지는 `obs/executeObservability.ts` 가 정한다 —
+   * 여기서 결과를 펼쳐 로그에 넘기면 발화·슬롯 값·상담사 요약이 그대로 따라 나간다
+   * (`maskPii` 는 이름·주소를 가리지 않는다, §10.3).
+   */
+  observability?: ObservabilityBinding;
   now?: () => string;
   newInteractionId?: (req: ChannelSessionRequest) => string;
   onPublish?: (results: PublishResult[]) => void;
@@ -470,6 +484,14 @@ export interface ConversationCore extends ConversationCorePort {
   warnings(): ContractIssue[];
   capabilitiesOf(adapter: ChannelAdapterId): ChannelCapabilities | undefined;
   sessions: SessionStore;
+  /**
+   * 관측 실측. 배선이 없으면 `undefined` — **0 건으로 적지 않는다**(§13-3).
+   * `failed` 가 0 이 아니면 로거·수집기가 던지고 있다는 뜻이고, `droppedIds` 가 0 이 아니면
+   * 호스트의 id 생성 규칙이 개인정보 패턴에 걸린다는 뜻이다(§10.3).
+   */
+  observability(): ObserverStats | undefined;
+  /** 수집기에 남은 억제분 방출(프로세스 종료 직전). 배선이 없으면 0. */
+  flushObservability(): number;
 }
 
 function stubState(flowId: string, flowVersion: number, channel: ChannelKind, status: RunStatus): FlowState {
@@ -493,6 +515,57 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
   const warnings: ContractIssue[] = [];
   const regs = new Map<ChannelAdapterId, ChannelRegistration>();
   const declared = new Map<ChannelAdapterId, Set<ComponentId>>();
+  // 배선을 선언하지 않으면 관측기를 만들지 않는다 — `record` 호출 자체가 없어 종전과 완전히 같다(§13-3).
+  const observer: Observer | undefined = opts.observability === undefined
+    ? undefined
+    : createObserver(opts.observability);
+
+  /** 실측 소요. 시계가 없으면 **필드를 만들지 않는다**(§13-3). */
+  function durationOf(started: number | undefined): { durationMs?: number } {
+    const d = observer?.elapsed(started);
+    return d === undefined ? {} : { durationMs: d };
+  }
+
+  /**
+   * 진입점 한 번을 관측한다. 성공·예외 **양쪽** 경로에서 기록하고 예외는 그대로 다시 던진다 —
+   * 삼키면 채널이 실패를 모른 채 다음 턴을 보낸다(품질기준 §3).
+   *
+   * 결과를 감싸지 않고 **바깥에서** 재므로 `port.present`·이벤트 발행까지 포함한 실제 소요가 남고,
+   * 조기 반환 경로(폴백 종료·이미 끝난 세션·합류)를 하나도 빠뜨리지 않는다.
+   */
+  async function observe(
+    op: CoreOp,
+    hint: { adapter?: ChannelAdapterId; correlationId?: string; interactionId?: string },
+    run: () => Promise<ChannelTurnResult>,
+  ): Promise<ChannelTurnResult> {
+    if (observer === undefined) return run();
+    const started = observer.startedAt();
+    const facts = (result?: ChannelTurnResult): ObservedCall => {
+      const id = hint.interactionId ?? result?.interactionId;
+      const rec = id === undefined ? undefined : sessions.get(id);
+      // 스코프는 **Core 가 강제하는 것**이다(§11.1). 세션 기록의 스코프는 테넌트가 일치할 때만
+      // 쓴다 — 워크스페이스 구분이 로그에 보여야 하지만, 테넌트가 다른 값을 적으면 그 로그로는
+      // 격리 사고를 조사할 수 없다.
+      const scope = rec !== undefined && rec.scope.tenantId === opts.scope.tenantId ? rec.scope : opts.scope;
+      const correlationId = hint.correlationId ?? rec?.correlationId;
+      const adapter = hint.adapter ?? rec?.adapter;
+      return {
+        op,
+        scope,
+        ...(id !== undefined ? { interactionId: id } : {}),
+        ...(correlationId !== undefined ? { correlationId } : {}),
+        ...(adapter !== undefined ? { adapter } : {}),
+      };
+    };
+    try {
+      const result = await run();
+      observer.record({ ...facts(result), result, ...durationOf(started) });
+      return result;
+    } catch (e) {
+      observer.record({ ...facts(), error: e, ...durationOf(started) });
+      throw e;
+    }
+  }
 
   /**
    * 실행할 시나리오 조회 — **배포본 경로가 있으면 그것만 쓴다**(§5.3).
@@ -1711,12 +1784,12 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     return result;
   }
 
-  const core: ConversationCore = {
-    contractVersion: CHANNEL_CONTRACT_VERSION,
-    sessions,
-    warnings: () => [...warnings],
-    capabilitiesOf: (adapter) => regs.get(adapter)?.port.capabilities,
-
+  /**
+   * 진입점 본체. 관측은 아래 `core` 에서 이 셋을 **감싸서** 한다 — 본체 안에 기록을 흩어 두면
+   * 조기 반환 경로(장애 폴백 종료·이미 끝난 세션·합류·커넥터 조기 종료)에서 하나는 반드시 빠지고,
+   * 빠진 쪽은 "로그에 없으니 그런 통화는 없었다"로 읽힌다.
+   */
+  const impl = {
     async start(req: ChannelSessionRequest): Promise<ChannelTurnResult> {
       assertTenantScope(req.scope);
       if (req.scope.tenantId !== opts.scope.tenantId) {
@@ -1995,14 +2068,56 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       await reg.port.end(interactionId, reasonKo);
       return result;
     },
+  };
+
+  const core: ConversationCore = {
+    contractVersion: CHANNEL_CONTRACT_VERSION,
+    sessions,
+    warnings: () => [...warnings],
+    capabilitiesOf: (adapter) => regs.get(adapter)?.port.capabilities,
+    observability: () => observer?.stats(),
+    flushObservability: () => observer?.flush() ?? 0,
+
+    start: (req) => observe(
+      'start',
+      { adapter: req.adapter, ...(req.correlationId !== undefined ? { correlationId: req.correlationId } : {}) },
+      () => impl.start(req),
+    ),
+    send: (interactionId, turn) => observe('send', { interactionId }, () => impl.send(interactionId, turn)),
+    end: (interactionId, reasonKo, input) => observe('end', { interactionId }, () => impl.end(interactionId, reasonKo, input)),
 
     reportHealth(report: ChannelHealthReport): void {
       const allowed = declared.get(report.adapter);
-      if (!allowed) return;    // 등록되지 않은 채널의 보고는 받지 않는다
-      for (const s of report.samples) {
-        // 선언하지 않은 컴포넌트의 샘플은 무시한다 — 아무 채널이나 전체 폴백을 유발할 수 없다(§9.3).
-        if (allowed.has(s.component)) opts.health.record(s);
+      const accepted: HealthSample[] = [];
+      let ignored = 0;
+      if (allowed !== undefined) {
+        for (const s of report.samples) {
+          // 선언하지 않은 컴포넌트의 샘플은 무시한다 — 아무 채널이나 전체 폴백을 유발할 수 없다(§9.3).
+          if (allowed.has(s.component)) {
+            opts.health.record(s);
+            accepted.push(s);
+          } else {
+            ignored += 1;
+          }
+        }
       }
+      // 버려진 보고를 관측에 남긴다. 이 자리는 **조용한 실패의 전형**이었다 — 등록되지 않은
+      // 채널이나 선언하지 않은 컴포넌트의 샘플은 통째로 사라지는데, 헬스를 성실히 올리는 채널과
+      // 아무 신호도 전달되지 않는 채널이 바깥에서 구분되지 않았다(§9.3).
+      observer?.record({
+        op: 'health',
+        scope: opts.scope,
+        ...(isKnownAdapter(report.adapter) ? { adapter: report.adapter } : {}),
+        health: {
+          ...(isKnownAdapter(report.adapter) ? { adapter: report.adapter } : {}),
+          registered: allowed !== undefined,
+          // 등록되지 않은 채널의 보고는 순회하지 않으므로(종전 동작) 개수만 센다 —
+          // 배열이 아닌 값을 0 으로 적지 않기 위해 형태를 확인한다.
+          offered: Array.isArray(report.samples) ? report.samples.length : 0,
+          accepted,
+          ignored,
+        },
+      });
     },
   };
 
