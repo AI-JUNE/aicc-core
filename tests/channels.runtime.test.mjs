@@ -53,7 +53,7 @@ function fakePort(id = 'callbot', capsOver = {}, over = {}) {
   };
 }
 
-function build({ flows = [flowBilling], registry, port = fakePort(), ports, samples = [], policy = {}, components, reprompt, timing, routing, connectors, channelSwitch, disclosure, intent, knowledge, consent, qa, observability } = {}) {
+function build({ flows = [flowBilling], registry, port = fakePort(), ports, samples = [], policy = {}, components, reprompt, timing, routing, connectors, channelSwitch, disclosure, intent, knowledge, consent, qa, observability, recovery } = {}) {
   const collector = B.createCollectorSink('t');
   const bus = B.createEventBus({
     scope: SCOPE, sinks: [collector],
@@ -83,6 +83,7 @@ function build({ flows = [flowBilling], registry, port = fakePort(), ports, samp
     ...(consent !== undefined ? { consent } : {}),
     ...(qa !== undefined ? { qa } : {}),
     ...(observability !== undefined ? { observability } : {}),
+    ...(recovery !== undefined ? { recovery } : {}),
   });
   return { core, port, collector, health };
 }
@@ -2548,4 +2549,196 @@ test('과금 근거를 못 실은 종료는 warn 으로 드러난다(§11.2)', b
   const last = w.records[w.records.length - 1];
   assert.equal(last.level, 'warn');
   assert.equal(last.fields.billableMsRecorded, false);
+});
+
+// ── readiness 배선(§9.3·§13) ────────────────────────────────────────────────
+//
+// 배선이 없던 동안 `ops/health.ts` 의 `checkHealth`·`approvalPendingProbe` 를 부르는 곳은
+// 저장소 전체에서 자기 테스트뿐이었다 — 즉 /health 응답을 만드는 자리가 Core 에 없었고,
+// 호스트가 직접 짜면 §9.3 폴백 상태는 그 응답에 **닿지 않는다**(엔진 HTTP 는 200 인데
+// 모든 통화가 상담사 직결로 떨어진 상태가 `up`·200 으로 보고된다).
+
+const okProbe = (name, over = {}) => ({
+  name, kind: 'db', critical: true, check: async () => ({ status: 'up' }), ...over,
+});
+const depOf = (r, name) => r.dependencies.find((d) => d.name === name);
+
+test('readiness 가 등록된 채널의 선언 컴포넌트를 그대로 싣는다 — 목록을 만들지 않는다', bo, async () => {
+  const { core } = build({ samples: P.CHANNEL_COMPONENTS.callbot.map((c) => ({ component: c, state: 'up', observedAt: NOW })) });
+  const r = await core.readiness({ timeoutMs: 500 });
+  assert.equal(r.kind, 'readiness');
+  assert.equal(r.status, 'up');
+  assert.deepEqual(
+    r.core.components.map((c) => c.component).sort(),
+    [...P.CHANNEL_COMPONENTS.callbot].sort(),
+  );
+  assert.deepEqual(r.core.fallback.map((f) => f.channel), ['voice']);
+  assert.deepEqual(r.core.warningsKo, []);
+});
+
+test('통화가 올린 샘플을 그대로 읽는다 — readiness 가 다른 레지스트리를 보지 않는다', bo, async () => {
+  const { core } = build();
+  core.reportHealth({ adapter: 'callbot', samples: [{ component: 'stt', state: 'down', observedAt: NOW }] });
+  const r = await core.readiness({ timeoutMs: 500 });
+  assert.equal(depOf(r, 'core:stt').status, 'down');
+  assert.equal(r.core.fallback[0].aiAllowed, false);
+});
+
+test('AI 응대가 멈춘 상태에서도 503 을 내지 않는다 — 폴백 경로가 이 프로세스를 지난다', bo, async () => {
+  const { core } = build({ samples: [{ component: 'llm', state: 'down', observedAt: NOW }] });
+  const r = await core.readiness({ timeoutMs: 500, probes: [okProbe('primary-db')] });
+  assert.equal(r.core.fallback[0].aiAllowed, false);
+  assert.equal(r.status, 'degraded');
+  assert.equal(r.httpStatus, 200);
+  assert.ok(r.core.components.every((c) => c.component !== 'llm' || c.state === 'down'));
+  assert.ok(r.dependencies.filter((d) => d.name.startsWith('core:')).every((d) => d.critical === false));
+});
+
+test('호스트가 선언한 필수 프로브 장애는 그대로 503 이다(§6.2)', bo, async () => {
+  const { core } = build({ samples: P.CHANNEL_COMPONENTS.callbot.map((c) => ({ component: c, state: 'up', observedAt: NOW })) });
+  const r = await core.readiness({
+    timeoutMs: 500,
+    probes: [okProbe('primary-db', { check: async () => ({ status: 'down', detail: '접속 거부' }) })],
+  });
+  assert.equal(r.httpStatus, 503);
+});
+
+test('활성화 전 컴포넌트는 샘플을 읽지 않고 [승인 필요] 로 적힌다', bo, async () => {
+  const { core } = build({ samples: [{ component: 'llm', state: 'up', observedAt: NOW, latencyMs: 5 }] });
+  const r = await core.readiness({ timeoutMs: 500, approvalPending: ['llm'] });
+  assert.equal(depOf(r, 'core:llm').status, 'degraded');
+  assert.match(depOf(r, 'core:llm').detail, /\[승인 필요\]/);
+  assert.equal(r.httpStatus, 200);
+});
+
+test('readiness 는 런타임 시계를 쓴다 — 자기 시계로 낡음을 다시 판정하지 않는다', bo, async () => {
+  // NOW 보다 한참 전의 샘플. staleAfterMs(60s)를 넘겼으므로 up 으로 믿지 않는다.
+  const { core } = build({ samples: [{ component: 'stt', state: 'up', observedAt: '2026-09-01T08:00:00.000Z' }] });
+  const r = await core.readiness({ timeoutMs: 500 });
+  assert.equal(r.core.components.find((c) => c.component === 'stt').state, 'unknown');
+});
+
+test('채널이 등록되지 않으면 점검하지 못한 사실을 적는다 — 0건을 정상으로 읽지 않는다', bo, async () => {
+  const { core } = build({ ports: [] });
+  const r = await core.readiness({ timeoutMs: 500 });
+  assert.deepEqual(r.core.components, []);
+  assert.deepEqual(r.core.fallback, []);
+  assert.equal(r.core.warningsKo.length, 2);
+});
+
+test('readiness 는 던지지 않는다 — 프로브가 터져도 보고서가 나온다', bo, async () => {
+  const { core } = build();
+  const r = await core.readiness({
+    timeoutMs: 500,
+    probes: [okProbe('primary-db', { check() { throw new Error('동기 폭발'); } })],
+  });
+  assert.equal(depOf(r, 'primary-db').status, 'down');
+  assert.ok(r.core);
+});
+
+// ── 복구 프로브 배선(§9.3) ──────────────────────────────────────────────────
+//
+// 배선이 없던 동안 `ops/recoveryProbe.ts` 를 부르는 곳은 자기 테스트뿐이었다 — 폴백이 걸리면
+// 엔진 호출이 멈춰 새 샘플이 생기지 않으므로 **폴백에서 빠져나오는 길이 없었다.**
+
+const upProbe = (component) => ({
+  component,
+  check: async () => ({ component, state: 'up', observedAt: NOW }),
+});
+const recoveryBinding = (component = 'llm', over = {}) => ({
+  schedules: [{ probe: upProbe(component), intervalMs: 1000, timeoutMs: 500 }],
+  ...over,
+});
+
+test('미배선: 폴백에서 빠져나올 길이 없다는 사실을 경고로 드러낸다(§9.3)', bo, () => {
+  const { core } = build();
+  const w = core.warnings().filter((i) => i.code === 'W_RECOVERY_UNBOUND');
+  assert.equal(w.length, 1);
+  assert.match(w[0].messageKo, /폴백에서 빠져나오는 길/);
+});
+
+test('미배선: runRecoveryProbes 는 빈 보고서가 아니라 undefined 다(§13-3)', bo, async () => {
+  const { core } = build();
+  assert.equal(await core.runRecoveryProbes(), undefined);
+  assert.equal(core.recoveryLastRunAt('llm'), undefined);
+});
+
+test('배선 있음: 나쁜 컴포넌트를 다시 확인해 같은 레지스트리에 복구를 기록한다', bo, async () => {
+  const { core, health } = build({
+    samples: [{ component: 'llm', state: 'down', observedAt: NOW }],
+    recovery: recoveryBinding('llm'),
+  });
+  assert.equal(core.warnings().some((i) => i.code === 'W_RECOVERY_UNBOUND'), false);
+  const r = await core.runRecoveryProbes();
+  assert.deepEqual(r.recovered, ['llm']);
+  // 통화가 올린 샘플과 **같은** 레지스트리여야 한다 — 다르면 보고서만 복구로 찍힌다.
+  assert.equal(health.latest('llm').state, 'up');
+  assert.equal(core.recoveryLastRunAt('llm'), NOW);
+});
+
+test('복구가 폴백 판정에 그대로 반영된다 — readiness 가 같은 사실을 본다', bo, async () => {
+  const { core } = build({
+    samples: [{ component: 'llm', state: 'down', observedAt: NOW }],
+    recovery: recoveryBinding('llm'),
+  });
+  const before = await core.readiness({ timeoutMs: 500 });
+  assert.equal(before.core.fallback[0].aiAllowed, false);
+  await core.runRecoveryProbes();
+  const after = await core.readiness({ timeoutMs: 500 });
+  assert.equal(after.core.fallback[0].aiAllowed, true);
+});
+
+test('정상인 컴포넌트는 찌르지 않는다 — 합성 요청은 비용이다(§11.2)', bo, async () => {
+  let calls = 0;
+  const probe = { component: 'llm', check: async () => { calls += 1; return { component: 'llm', state: 'up', observedAt: NOW }; } };
+  const { core } = build({
+    samples: [{ component: 'llm', state: 'up', observedAt: NOW }],
+    recovery: { schedules: [{ probe, intervalMs: 1000, timeoutMs: 500 }] },
+  });
+  const r = await core.runRecoveryProbes();
+  assert.equal(calls, 0);
+  assert.equal(r.attempts.find((a) => a.component === 'llm').skipped, 'healthy');
+});
+
+test('프로브가 없는 나쁜 컴포넌트는 "확인할 길이 없다"로 드러난다', bo, async () => {
+  const { core } = build({
+    samples: [{ component: 'stt', state: 'down', observedAt: NOW }, { component: 'llm', state: 'down', observedAt: NOW }],
+    recovery: recoveryBinding('llm'),
+  });
+  const r = await core.runRecoveryProbes();
+  assert.ok(r.unprobed.includes('stt'), '감시 목록은 등록된 채널의 선언 컴포넌트다');
+});
+
+test('등록된 채널이 올리지 않는 컴포넌트의 프로브는 생성 시점에 거부한다(§9.3)', bo, () => {
+  assert.throws(
+    () => build({ port: fakePort('chatbot'), recovery: recoveryBinding('stt') }),
+    /등록된 채널이 올리지 않는 컴포넌트/,
+  );
+});
+
+test('빈 배선은 "확인하고 있다"로 남으므로 거부한다(§13-3)', bo, () => {
+  assert.throws(() => build({ recovery: { schedules: [] } }), /프로브가 없습니다/);
+});
+
+test('호스트는 레지스트리·정책·시계를 주장할 수 없다 — 받지 않는다', bo, async () => {
+  const other = F.createHealthRegistry([]);
+  const { core, health } = build({
+    samples: [{ component: 'llm', state: 'down', observedAt: NOW }],
+    // 넘겨도 무시된다(타입에 없다). 받으면 프로브가 아무도 읽지 않는 곳에 쓴다.
+    recovery: { ...recoveryBinding('llm'), registry: other, policy: { staleAfterMs: 1 }, now: () => '2000-01-01T00:00:00.000Z' },
+  });
+  await core.runRecoveryProbes();
+  assert.equal(health.latest('llm').state, 'up');
+  assert.deepEqual(other.snapshot(), []);
+});
+
+test('복구 프로브는 던지지 않는다 — 프로브가 터져도 보고서가 나온다', bo, async () => {
+  const probe = { component: 'llm', check() { throw new Error('동기 폭발'); } };
+  const { core } = build({
+    samples: [{ component: 'llm', state: 'down', observedAt: NOW }],
+    recovery: { schedules: [{ probe, intervalMs: 1000, timeoutMs: 500 }] },
+  });
+  const r = await core.runRecoveryProbes();
+  assert.deepEqual(r.recovered, []);
+  assert.ok(r.attempts.some((a) => a.component === 'llm' && a.ran === true));
 });

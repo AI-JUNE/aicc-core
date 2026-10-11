@@ -33,6 +33,8 @@ import { decideFallbackMode } from '../ops/fallback.ts';
 import type { BuildInfo, DependencyProbe, Scheduler } from '../ops/health.ts';
 import type { CoreReadinessReport } from '../ops/executeHealth.ts';
 import { runReadiness } from '../ops/executeHealth.ts';
+import type { ProbeSchedule, RecoveryProbeRunner, RecoveryRunReport } from '../ops/recoveryProbe.ts';
+import { createRecoveryProbeRunner } from '../ops/recoveryProbe.ts';
 import type { SummaryOptions } from '../core/handoffSummary.ts';
 import { buildHandoffSummary, requiredSlotsOf } from '../core/handoffSummary.ts';
 import type { AdmissionOptions, QueueSnapshot, RoutingConfig } from '../routing/agentQueue.ts';
@@ -477,9 +479,43 @@ export interface ConversationCoreOptions {
    * (`maskPii` 는 이름·주소를 가리지 않는다, §10.3).
    */
   observability?: ObservabilityBinding;
+  /**
+   * 복구 프로브(§9.3). **주지 않으면 종전과 완전히 같다**(§13-3) — `runRecoveryProbes()` 는
+   * `undefined` 를 돌려주고(빈 보고서가 아니다: "확인했고 0건"과 "확인하지 않았다"는 다르다)
+   * 컴포넌트를 올리는 채널이 등록돼 있으면 `W_RECOVERY_UNBOUND` 경고로 드러낸다.
+   *
+   * 이 배선이 없는 동안 `ops/recoveryProbe.ts` 는 저장소에 있으나 **아무도 부르지 않는**
+   * 상태였고, 증상은 예외가 아니라 **폴백이 풀리지 않는 것**이다 — L2 가 `down` 이 되면
+   * 엔진 호출 자체가 멈춰 새 샘플이 생기지 않으므로, 보수적 테넌트는 사람이 손대기 전까지
+   * 영구 상담사 직결이고 그렇지 않은 테넌트는 **증거 없이** AI 를 재개한다.
+   */
+  recovery?: RecoveryBinding;
   now?: () => string;
   newInteractionId?: (req: ChannelSessionRequest) => string;
   onPublish?: (results: PublishResult[]) => void;
+}
+
+/**
+ * 복구 프로브 배선(§9.3). **레지스트리·정책·시계·감시 목록을 받지 않는다** — 호스트가 그것들을
+ * 주장하면 /health 배선과 같은 사고가 난다: 프로브가 **통화가 올린 샘플과 다른 레지스트리**에
+ * 샘플을 쓰고, 그러면 복구 보고서에는 `recovered` 가 찍히는데 채널은 계속 상담사 직결이다.
+ * 정책이 어긋나면 "지금 나쁜 컴포넌트" 집합이 `decideFallbackMode` 와 갈라져 **엉뚱한 것을
+ * 찌른다**(§2 가 지적한 이중 관리가 프로브 대상의 형태로 재발한다).
+ *
+ * 실프로브(합성콜·핑) 구현과 연결은 **[승인 필요]** — 여기서 받는 것은 그 구현이다.
+ */
+export interface RecoveryBinding {
+  /** 컴포넌트별 프로브·간격·제한 시간. 간격·제한 시간 기본값 없음(§13-3). */
+  schedules: ProbeSchedule[];
+  /** 소요 실측용 단조 시계(ms). 없으면 `latencyMs` 를 만들지 않는다(§13-3). */
+  monotonic?: () => number;
+  /**
+   * 몇 번 **연속** 성공해야 복구로 기록할지. 선언하지 않으면 관측한 그대로 적는다
+   * (관측을 그대로 적는 것은 정책이 아니다) — 깜빡이는 엔진이 채널을 왕복시키는 대가를
+   * 치를지는 테넌트가 정한다.
+   */
+  confirmSuccesses?: number;
+  scheduler?: Scheduler;
 }
 
 /**
@@ -526,6 +562,15 @@ export interface ConversationCore extends ConversationCorePort {
    * 호스트 프로브에만 있다. 어떤 경우에도 던지지 않는다.
    */
   readiness(req: ReadinessRequest): Promise<CoreReadinessReport>;
+  /**
+   * 복구 프로브 1회 실행(§9.3). **타이머를 Core 가 돌리지 않는다** — 호스트가 부른다
+   * (Core 가 몰래 켠 인터벌은 끌 수도 없고 프로세스 종료를 막는다). 배선이 없으면
+   * `undefined` — **빈 보고서를 돌려주지 않는다**("확인했고 0건"으로 읽힌다, §13-3).
+   * 어떤 경우에도 던지지 않는다(복구 확인 루프가 예외로 죽으면 복구도 같이 죽는다).
+   */
+  runRecoveryProbes(nowIso?: string): Promise<RecoveryRunReport | undefined>;
+  /** 컴포넌트별 마지막 확인 시각. 배선이 없으면 `undefined`. */
+  recoveryLastRunAt(component: ComponentId): string | undefined;
 }
 
 function stubState(flowId: string, flowVersion: number, channel: ChannelKind, status: RunStatus): FlowState {
@@ -794,6 +839,44 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     warnings.push(...issues.filter((i) => i.severity === 'warning'));
     regs.set(reg.port.id, reg);
     declared.set(reg.port.id, new Set(reg.reportsComponents));
+  }
+
+  /** 등록된 채널들이 올리는 컴포넌트의 합집합. readiness·복구 프로브가 **같은 목록**을 본다(§2). */
+  const watched = new Set<ComponentId>([...declared.values()].flatMap((set) => [...set]));
+
+  // 복구 프로브 배선(§9.3). 레지스트리·정책·시계·감시 목록은 **Core 가 강제한다**(RecoveryBinding 주석).
+  let recovery: RecoveryProbeRunner | undefined;
+  if (opts.recovery !== undefined) {
+    const schedules = opts.recovery.schedules;
+    if (!Array.isArray(schedules) || schedules.length === 0) {
+      throw new Error('복구 프로브 배선 거부: 프로브가 없습니다 — 빈 배선은 "확인하고 있다"로 남습니다 (설계서 §13-3)');
+    }
+    for (const sched of schedules) {
+      const component = sched?.probe?.component;
+      // 등록된 채널이 올리지 않는 컴포넌트의 프로브는 **거부**한다. `reportHealth` 는 선언하지
+      // 않은 컴포넌트의 샘플을 버리는데(§9.3 — 아무 채널이나 전체 폴백을 유발할 수 없다),
+      // 프로브는 레지스트리에 **직접** 쓰므로 그 방어선을 우회한다. 그 상태에서 프로브 한 개가
+      // `down` 을 적으면 `CHANNEL_DEPENDENCIES` 를 통해 멀쩡한 채널까지 내려간다.
+      if (component !== undefined && !watched.has(component)) {
+        throw new Error(`복구 프로브 배선 거부: ${component} 는 등록된 채널이 올리지 않는 컴포넌트입니다 — 프로브는 레지스트리에 직접 써서 선언 검사를 우회합니다 (설계서 §9.3)`);
+      }
+    }
+    recovery = createRecoveryProbeRunner({
+      schedules,
+      registry: opts.health,
+      policy: opts.policy,
+      now,
+      watch: [...watched],
+      ...(opts.recovery.monotonic !== undefined ? { monotonic: opts.recovery.monotonic } : {}),
+      ...(opts.recovery.confirmSuccesses !== undefined ? { confirmSuccesses: opts.recovery.confirmSuccesses } : {}),
+      ...(opts.recovery.scheduler !== undefined ? { scheduler: opts.recovery.scheduler } : {}),
+    });
+  } else if (watched.size > 0) {
+    warnings.push({
+      code: 'W_RECOVERY_UNBOUND',
+      severity: 'warning',
+      messageKo: '복구 프로브가 배선되지 않았습니다 — 폴백이 걸리면 엔진 호출이 멈춰 새 샘플이 생기지 않으므로, 폴백에서 빠져나오는 길이 없습니다 (설계서 §9.3)',
+    });
   }
 
   // 인텐트 배선도 **배포 시점에** 거른다. 통화 중에 "카탈로그에 없는 인텐트"로 터지면 이미 늦고,
@@ -2112,6 +2195,12 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     observability: () => observer?.stats(),
     flushObservability: () => observer?.flush() ?? 0,
 
+    // 배선이 없으면 `undefined` — 빈 보고서는 "확인했고 0건"으로 읽힌다(§13-3).
+    runRecoveryProbes: (nowIso) => (recovery === undefined
+      ? Promise.resolve(undefined)
+      : recovery.runDue(nowIso)),
+    recoveryLastRunAt: (component) => recovery?.lastRunAt(component),
+
     readiness: (req) => runReadiness({
       timeoutMs: req.timeoutMs,
       ...(req.probes !== undefined ? { probes: req.probes } : {}),
@@ -2127,7 +2216,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
         // **목록을 만들지 않는다**(§13-3): 채널 등록에서 선언된 컴포넌트와 실제로 등록된
         // 채널만 싣는다. 전 컴포넌트를 실으면 쓰지도 않는 엔진이 영구 `unknown` 으로 남아
         // 대시보드가 상시 노랑이 되고, 그러면 진짜 저하를 아무도 보지 않는다.
-        components: [...new Set([...declared.values()].flatMap((set) => [...set]))],
+        components: [...watched],
         channels: [...new Set([...regs.values()].map((reg) => reg.port.capabilities.channel))],
         ...(req.approvalPending !== undefined ? { approvalPending: req.approvalPending } : {}),
       },
