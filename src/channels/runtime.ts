@@ -30,6 +30,9 @@ import { sessionStarted, sessionEnded, handoffRequested, turnCompleted } from '.
 import type { EventBus, PublishResult } from '../events/bus.ts';
 import type { ComponentId, FallbackDecision, FallbackPolicy, HealthRegistry, HealthSample } from '../ops/fallback.ts';
 import { decideFallbackMode } from '../ops/fallback.ts';
+import type { BuildInfo, DependencyProbe, Scheduler } from '../ops/health.ts';
+import type { CoreReadinessReport } from '../ops/executeHealth.ts';
+import { runReadiness } from '../ops/executeHealth.ts';
 import type { SummaryOptions } from '../core/handoffSummary.ts';
 import { buildHandoffSummary, requiredSlotsOf } from '../core/handoffSummary.ts';
 import type { AdmissionOptions, QueueSnapshot, RoutingConfig } from '../routing/agentQueue.ts';
@@ -479,6 +482,27 @@ export interface ConversationCoreOptions {
   onPublish?: (results: PublishResult[]) => void;
 }
 
+/**
+ * readiness 호출 옵션(§9.3·§13). 레지스트리·폴백 정책·선언된 컴포넌트·등록된 채널은 런타임이
+ * 이미 가지고 있으므로 **호스트가 다시 꿰지 않는다** — 다시 꿰게 두면 그 자리에서 `/health` 가
+ * 자기 레지스트리를 만들어 보고, 그러면 통화가 올린 샘플과 다른 레지스트리를 읽게 된다.
+ */
+export interface ReadinessRequest {
+  /** 호스트가 주입하는 실점검 프로브(DB·스토리지 등, §6.2). 실연결은 **[승인 필요]**. */
+  probes?: readonly DependencyProbe[];
+  /** 프로브별 지정이 없을 때 쓰는 제한 시간. 운영 합의값이며 Core 가 만들지 않는다(§13-3). */
+  timeoutMs: number;
+  clock?: () => number;
+  build?: BuildInfo;
+  scheduler?: Scheduler;
+  /**
+   * 아직 활성화하지 않은 컴포넌트. 그 컴포넌트는 샘플을 읽지 않고 "[승인 필요] 활성화 전"으로
+   * 적는다 — dry_run 어댑터가 올린 샘플을 실엔진 관측으로 읽으면 켜지지도 않은 엔진이
+   * 정상으로 보고된다(`ops/executeHealth.ts` 의 (라)).
+   */
+  approvalPending?: readonly ComponentId[];
+}
+
 export interface ConversationCore extends ConversationCorePort {
   /** 등록 시 남은 경고(§9.3 폴백 경로 없음 등). 운영이 반드시 보게 노출한다. */
   warnings(): ContractIssue[];
@@ -492,6 +516,16 @@ export interface ConversationCore extends ConversationCorePort {
   observability(): ObserverStats | undefined;
   /** 수집기에 남은 억제분 방출(프로세스 종료 직전). 배선이 없으면 0. */
   flushObservability(): number;
+  /**
+   * readiness(§9.3·§13). 호스트가 /health 를 직접 짜면 거기 들어가는 것은 DB·엔진 접속
+   * 프로브이고, **§9.3 폴백 상태는 응답에 닿지 않는다** — L2 가 죽어 모든 통화가 상담사
+   * 직결로 떨어진 순간에도 /health 는 `up`·200 이다. 이 메서드가 그 사이를 꿴다.
+   *
+   * **컴포넌트 저하는 503 을 만들지 않는다**(`critical: false` 고정) — 폴백 경로가 이
+   * 프로세스를 지나므로 인스턴스를 빼면 상담사 이관까지 같이 죽는다. 필수/부가 구분은
+   * 호스트 프로브에만 있다. 어떤 경우에도 던지지 않는다.
+   */
+  readiness(req: ReadinessRequest): Promise<CoreReadinessReport>;
 }
 
 function stubState(flowId: string, flowVersion: number, channel: ChannelKind, status: RunStatus): FlowState {
@@ -2077,6 +2111,27 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     capabilitiesOf: (adapter) => regs.get(adapter)?.port.capabilities,
     observability: () => observer?.stats(),
     flushObservability: () => observer?.flush() ?? 0,
+
+    readiness: (req) => runReadiness({
+      timeoutMs: req.timeoutMs,
+      ...(req.probes !== undefined ? { probes: req.probes } : {}),
+      ...(req.clock !== undefined ? { clock: req.clock } : {}),
+      ...(req.build !== undefined ? { build: req.build } : {}),
+      ...(req.scheduler !== undefined ? { scheduler: req.scheduler } : {}),
+      core: {
+        // 시각은 런타임의 시계 하나다 — readiness 가 자기 시계를 쓰면 통화가 올린 샘플의
+        // 낡음이 다른 기준으로 판정된다(§2·§13-3).
+        nowIso: now(),
+        registry: opts.health,
+        policy: opts.policy,
+        // **목록을 만들지 않는다**(§13-3): 채널 등록에서 선언된 컴포넌트와 실제로 등록된
+        // 채널만 싣는다. 전 컴포넌트를 실으면 쓰지도 않는 엔진이 영구 `unknown` 으로 남아
+        // 대시보드가 상시 노랑이 되고, 그러면 진짜 저하를 아무도 보지 않는다.
+        components: [...new Set([...declared.values()].flatMap((set) => [...set]))],
+        channels: [...new Set([...regs.values()].map((reg) => reg.port.capabilities.channel))],
+        ...(req.approvalPending !== undefined ? { approvalPending: req.approvalPending } : {}),
+      },
+    }),
 
     start: (req) => observe(
       'start',

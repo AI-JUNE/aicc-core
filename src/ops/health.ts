@@ -125,7 +125,12 @@ export function aggregateStatus(results: readonly DependencyResult[]): HealthSta
   return 'up';
 }
 
-function summarize(status: HealthStatus, results: readonly DependencyResult[]): string {
+/**
+ * 사람이 먼저 읽을 한 줄. **합성한 보고서도 이 문장을 다시 쓰지 않는다**(§2) —
+ * `ops/executeHealth.ts` 가 Core 관측을 덧붙인 뒤 요약을 자기 문장으로 적으면 같은 상태가
+ * 두 가지 말로 보고되고, 어느 쪽이 최신인지는 읽는 사람이 알 방법이 없다.
+ */
+export function summarizeDependencies(status: HealthStatus, results: readonly DependencyResult[]): string {
   if (results.length === 0) {
     return status === 'up' ? '점검할 의존성이 등록되지 않았다(프로세스 응답만 확인).' : '의존성 점검 결과 없음.';
   }
@@ -240,7 +245,7 @@ export async function checkHealth(
     ...(build ? { build } : {}),
     dependencies: results,
     httpStatus: httpStatusFor(status),
-    summaryKo: summarize(status, results),
+    summaryKo: summarizeDependencies(status, results),
   };
 }
 
