@@ -290,7 +290,8 @@ test('아무 것도 주지 않으면 완전한 no-op 이고 판정만 돌려준�
   assert.equal(observer.active, false);
   const d = observer.record({ op: 'send', scope: SCOPE, result: result() });
   assert.equal(d.level, 'info');
-  assert.deepEqual(observer.stats(), { recorded: 1, logged: 0, captured: 0, failed: 0, droppedIds: 0 });
+  assert.deepEqual(observer.stats(),
+    { recorded: 1, rejected: 0, warned: 0, logged: 0, captured: 0, failed: 0, droppedIds: 0 });
   assert.equal(observer.flush(), 0);
 });
 
@@ -426,4 +427,166 @@ test('수집기 보고 참조는 식별 정보만 돌려준다 — 원문을 다
   assert.equal(typeof ref.fingerprint, 'string');
   assert.deepEqual(Object.keys(ref).sort(), ['code', 'fingerprint']);
   assert.equal(O.reportRef(undefined), undefined);
+});
+
+// ── 9. 경계 거부(브리지) — Core 진입점에 닿지 않은 실패 ────────────────────────
+//
+// 여기서 고정하는 것은 "거부가 로그에 남는다"가 아니라 **같은 예외를 두 번 올리지 않는 것**과
+// **깨진 줄이 로그로 새지 않는 것**이다. 둘 다 증상이 조용하다 — 전자는 보고 건수가 부풀어
+// 창 상한에 진짜 예외가 밀려 버려지고, 후자는 발신번호가 수집기에 영구 보존된다.
+
+test('경계 거부는 warn 으로 남고 수집기로는 올리지 않는다 — 설계된 거부다', b, () => {
+  const w = wiring();
+  const d = w.observer.recordRejection({
+    scope: SCOPE, adapter: 'callbot', requestId: 'r1', op: 'send',
+    code: 'E_BAD_JSON', stage: 'request', lineBytes: 412, error: new Error('깨진 줄'),
+  });
+  assert.equal(d.level, 'warn');
+  assert.equal(d.event, O.REJECTION_EVENT);
+  assert.equal(d.capture, false, '호스트의 직렬화 버그 하나가 보고 수천 건이 되면 진짜 예외가 밀려 버려진다');
+  assert.equal(d.fields.outcome, 'rejected');
+  assert.equal(d.fields.stage, 'request');
+  assert.equal(d.fields.lineBytes, 412);
+  assert.equal(d.fields.adapter, 'callbot');
+  assert.equal(d.fields.op, 'send');
+  assert.equal(w.records.length, 1);
+  assert.equal(w.records[0].code, 'E_BAD_JSON');
+  assert.equal(w.records[0].requestId, 'r1');
+  assert.equal(w.sent.length, 0);
+  assert.equal(w.observer.stats().rejected, 1);
+  assert.equal(w.observer.stats().recorded, 0, '경계 거부를 진입점 관측 건수에 섞지 않는다');
+});
+
+test('Core 가 던진 예외는 경계에서 다시 올리지 않는다(§2) — 로그 한 줄만 남는다', b, () => {
+  const w = wiring();
+  const d = w.observer.recordRejection({
+    scope: SCOPE, adapter: 'callbot', requestId: 'r2', op: 'send',
+    code: 'E_INTERNAL', stage: 'core', error: new Error('세션 없음'),
+  });
+  assert.equal(d.level, 'error');
+  assert.equal(d.capture, false, '진입점 관측이 이미 올렸다 — 또 올리면 한 번의 예외가 보고 두 건이 된다');
+  assert.equal(w.sent.length, 0);
+  assert.equal(w.records[0].requestId, 'r2', '요청 id ↔ 오류 코드 상관은 Core 쪽 줄에 없다');
+});
+
+test('응답 투영 중 예외만 수집기로 올린다 — 아무도 보고하지 않는 유일한 자리다', b, () => {
+  const w = wiring();
+  const d = w.observer.recordRejection({
+    scope: SCOPE, code: 'E_INTERNAL', stage: 'response', error: new Error('투영 실패'),
+  });
+  assert.equal(d.level, 'error');
+  assert.equal(d.capture, true);
+  assert.equal(w.sent.length, 1);
+  assert.ok(d.reasonsKo.join(' ').includes('성공으로 기록'));
+});
+
+test('요청 id 가 개인정보 패턴이면 싣지 않고 걸렸다는 사실만 남긴다(§10.3)', b, () => {
+  const w = wiring();
+  const d = w.observer.recordRejection({
+    scope: SCOPE, requestId: '010-1234-5678', code: 'E_BAD_REQUEST', stage: 'request',
+  });
+  assert.deepEqual(d.droppedIds, ['requestId']);
+  assert.equal(d.fields.requestIdPiiKinds, 'phone');
+  const line = L.formatLine(w.records[0]);
+  assert.ok(!line.includes('1234'), `로그 줄에 번호 조각이 남았다: ${line}`);
+  assert.equal(w.observer.stats().droppedIds, 1);
+});
+
+test('모르는 op·모르는 어댑터는 값을 싣지 않는다 — 임의 문자열이다', b, () => {
+  const w = wiring();
+  const d = w.observer.recordRejection({
+    scope: SCOPE, op: '내 주민번호는 900101-1234567', adapter: '발신 010-0000-0000',
+    code: 'E_UNKNOWN_OP', stage: 'request',
+  });
+  assert.equal(d.fields.op, undefined);
+  assert.equal(d.fields.adapter, undefined);
+  const line = L.formatLine(w.records[0]);
+  assert.ok(!line.includes('900101'), line);
+});
+
+test('열거값 형태가 아닌 실패 코드는 고정 필드에 싣지 않는다', b, () => {
+  const w = wiring();
+  const d = w.observer.recordRejection({
+    scope: SCOPE, code: 'Core 처리 중 오류: 홍길동 010-1234-5678', stage: 'request',
+  });
+  assert.equal(d.code, undefined);
+  assert.equal(d.fields.codeDropped, true);
+  assert.ok(!L.formatLine(w.records[0]).includes('홍길동'));
+});
+
+test('한도 초과·테넌트 주장은 사유로 드러난다', b, () => {
+  const w = wiring();
+  const rl = w.observer.recordRejection({
+    scope: SCOPE, code: 'E_RATE_LIMITED', stage: 'request', retryAfterMs: 250,
+  });
+  assert.equal(rl.fields.retryAfterMs, 250);
+  assert.ok(rl.reasonsKo.join(' ').includes('한도'));
+  const ts = w.observer.recordRejection({ scope: SCOPE, code: 'E_TENANT_SCOPE', stage: 'request' });
+  assert.ok(ts.reasonsKo.join(' ').includes('§11.1'));
+});
+
+test('실측이 아닌 수치는 만들지 않는다(§13-3)', b, () => {
+  const w = wiring();
+  const d = w.observer.recordRejection({
+    scope: SCOPE, code: 'E_BAD_JSON', stage: 'request',
+    lineBytes: Number.NaN, retryAfterMs: -1,
+  });
+  assert.equal(d.fields.lineBytes, undefined);
+  assert.equal(d.fields.retryAfterMs, undefined);
+  assert.equal(w.records[0].durationMs, undefined);
+});
+
+test('경계·경고 관측은 어떤 경우에도 던지지 않는다(§9.3)', b, () => {
+  const boom = () => { throw new Error('sink 폭발'); };
+  const logger = {
+    minLevel: 'info', debug: boom, info: boom, warn: boom, error: boom,
+    child() { return logger; }, async time(_e, run) { return run(); },
+  };
+  const observer = O.createObserver({ logger });
+  assert.doesNotThrow(() => observer.recordRejection({ scope: SCOPE, code: 'E_BAD_JSON', stage: 'request' }));
+  assert.doesNotThrow(() => observer.recordWarning({ scope: SCOPE, code: 'W_QA_UNBOUND' }));
+  assert.equal(observer.stats().failed, 2, '실패는 삼키지 않고 센다');
+});
+
+// ── 10. 계약 경고 — 코드만, 한 번만 ───────────────────────────────────────────
+
+test('계약 경고는 warn 으로 남고 코드만 싣는다 — 문구는 받지 않는다', b, () => {
+  const w = wiring();
+  const d = w.observer.recordWarning({ scope: SCOPE, code: 'W_CONSENT_UNBOUND' });
+  assert.equal(d.level, 'warn');
+  assert.equal(d.event, O.WARNING_EVENT);
+  assert.equal(d.code, 'W_CONSENT_UNBOUND');
+  assert.equal(d.capture, false, '미배선은 모델링된 설정 상태다 — 장애로 올리면 알림이 잡음이 된다');
+  assert.equal(w.records[0].code, 'W_CONSENT_UNBOUND');
+  assert.equal(w.observer.stats().warned, 1);
+  assert.equal(w.observer.stats().recorded, 0);
+  assert.equal(w.sent.length, 0);
+  // 받는 자리가 코드뿐이라 보간된 문구가 들어올 자리 자체가 없다(§10.3).
+  assert.ok(!/messageKo/.test(SRC), '경고 문구를 받으면 자유 문장이 고정 필드로 들어간다');
+});
+
+test('열거값 형태가 아닌 경고 코드는 고정 필드에 싣지 않는다', b, () => {
+  const w = wiring();
+  const d = w.observer.recordWarning({ scope: SCOPE, code: '동의 배선이 없습니다: 홍길동' });
+  assert.equal(d.code, undefined);
+  assert.equal(d.fields.codeDropped, true);
+  assert.ok(!L.formatLine(w.records[0]).includes('홍길동'));
+});
+
+test('경계·경고 이벤트 이름도 고정값이다', b, () => {
+  assert.match(O.REJECTION_EVENT, /^core\.[a-z.]+$/);
+  assert.match(O.WARNING_EVENT, /^core\.[a-z.]+$/);
+  assert.notEqual(O.REJECTION_EVENT, O.OP_EVENT.send);
+});
+
+test('실측 요약이 진입점·경계·경고를 갈라 적는다(§13-3)', b, () => {
+  const w = wiring();
+  w.observer.record({ op: 'send', scope: SCOPE, result: result() });
+  w.observer.recordRejection({ scope: SCOPE, code: 'E_BAD_JSON', stage: 'request' });
+  w.observer.recordWarning({ scope: SCOPE, code: 'W_QA_UNBOUND' });
+  const line = O.formatObserverStats(w.observer.stats());
+  assert.ok(line.includes('관측 1건'));
+  assert.ok(line.includes('경계거부 1'));
+  assert.ok(line.includes('계약경고 1'));
+  assert.ok(!line.includes('%'));
 });

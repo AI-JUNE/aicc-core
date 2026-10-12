@@ -9,6 +9,9 @@
 // 모듈은 `{ core, scope }` 를 export 하거나, 그것을 돌려주는 함수(default/createCore)를 export 한다.
 // 선택적으로 `rateLimiter`(+`rateLimitCost`)를 함께 내놓을 수 있다 — 브리지는 진입점 제한을
 // 지원하지만 여기서 넘기지 않으면 비-Node 호스트에서는 끝내 닿지 않는다. 내놓지 않으면 제한 없음이다(§13-3).
+// `observability`(로거·수집기 배선)도 같다 — 내놓지 않으면 **경계 실패가 이 프로세스 밖에서
+// 보이지 않는다**(깨진 줄·모르는 op·한도 초과는 Core 를 부르기 전에 끝나므로 Core 로그는 조용하다).
+// 런타임(`createConversationCore`)에 넘긴 배선 객체를 **그대로** 함께 내놓으면 된다.
 //
 // 프로토콜(한 줄 = 한 요청):
 //   → {"id":"1","op":"hello"}
@@ -95,6 +98,12 @@ try {
     // 한도는 명령줄이 아니라 모듈에서 온다 — 숫자를 CLI 기본값으로 박으면 그 값이 곧 정책이 된다(§13-3).
     ...(built.rateLimiter !== undefined ? { rateLimiter: built.rateLimiter } : {}),
     ...(built.rateLimitCost !== undefined ? { rateLimitCost: built.rateLimitCost } : {}),
+    // 관측도 모듈에서 온다. 넘기지 않으면 **경계 실패가 이 프로세스 밖에서 보이지 않는다** —
+    // 제한기와 같은 실패를 되풀이하지 않기 위해 여기서 꿴다(지원한다고 적힌 기능이 아무도
+    // 지나가 보지 않은 길로 남는 상태). 내놓지 않으면 종전과 완전히 같다(§13-3).
+    // 로그 sink 를 **표준출력에 쓰면 프로토콜이 깨진다** — 응답 줄과 로그 줄이 섞여 호스트의
+    // 파서가 죽는다. 표준오류·파일·수집기로 보낸다(`fixtures/reference-core-observed.mjs`).
+    ...(built.observability !== undefined ? { observability: built.observability } : {}),
   });
 } catch (e) {
   console.error(`브리지 설정 오류: ${e instanceof Error ? e.message : String(e)}`);
@@ -106,3 +115,7 @@ for await (const line of rl) {
   if (line.trim() === '') continue; // 파이프 끝 개행이 오류 응답을 만들지 않게 한다
   process.stdout.write(`${encodeResponse(await bridge.handleLine(line))}\n`);
 }
+// 수집기에 억제돼 남은 보고를 내보낸다. 이걸 하지 않으면 **창에 묶여 있던 마지막 보고들이
+// 프로세스와 함께 사라진다** — 하필 종료 직전의 보고가 조사에서 가장 먼저 필요한 것이다.
+// 배선이 없으면 0 이고 아무 일도 하지 않는다.
+bridge.flushObservability();

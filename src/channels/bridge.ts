@@ -48,6 +48,8 @@ import { profileFor } from './profiles.ts';
 import type { ChannelActivation } from './basePort.ts';
 import type { RateLimiter } from '../api/rateLimit.ts';
 import { rateLimitKey } from '../api/rateLimit.ts';
+import type { BridgeStage, ObservabilityBinding, ObserverStats } from '../obs/executeObservability.ts';
+import { createObserver } from '../obs/executeObservability.ts';
 
 /** 프로토콜 버전. 호스트는 hello 응답에서 이 값을 보고 자기 구현과 맞는지 판단한다. */
 export const BRIDGE_PROTOCOL_VERSION = 1;
@@ -177,6 +179,21 @@ export interface BridgeOptions {
   rateLimiter?: RateLimiter;
   /** op 별 비용. 주지 않으면 전부 1. `send` 는 엔진 호출을 동반하므로 무겁게 셀 수 있다. */
   rateLimitCost?: Partial<Record<BridgeOp, number>>;
+  /**
+   * 관측(§13·§10.3). **주지 않으면 종전과 완전히 같다**(§13-3) — 경계 실패는 `records`·
+   * `onRecord` 에만 남고, 그것은 **이 프로세스 안에서만** 보인다.
+   *
+   * 이 배선이 없는 동안 브리지 경계의 실패는 수집기·로그에 **한 건도 닿지 않았다**:
+   * 깨진 JSONL 줄·모르는 op·다른 테넌트 주장·요청 한도 초과는 Core 를 부르기 **전에**
+   * 응답 줄로 끝나기 때문이다. 호스트의 직렬화 버그로 모든 줄이 깨져도 Core 로그는 조용하고,
+   * 증상은 "그 채널만 통화가 안 된다"인데 로그에는 그 통화가 아예 없다.
+   *
+   * 무엇을 싣고 무엇을 싣지 않을지는 `obs/executeObservability.ts` 가 정한다 —
+   * **줄 원문은 어떤 경로로도 나가지 않는다**(깨진 줄에 발신번호가 들어 있을 수 있다).
+   * 런타임(`channels/runtime.ts`)의 `observability` 와 **같은 배선 객체를 주면 된다**:
+   * 관측기는 둘이지만 로거·수집기가 하나라 중복 억제·창 상한이 같은 기준으로 돈다.
+   */
+  observability?: ObservabilityBinding;
 }
 
 export class BridgeConfigError extends Error {
@@ -192,6 +209,13 @@ export interface Bridge {
   readonly records: readonly BridgeRecord[];
   /** 한 줄을 받아 한 응답을 돌려준다. 절대 던지지 않는다. 호출은 도착 순서대로 직렬 처리된다. */
   handleLine(line: string): Promise<BridgeResponse>;
+  /**
+   * 관측 실측. 배선이 없으면 `undefined` — **0 건으로 적지 않는다**(§13-3:
+   * "거부 0건"과 "관측하지 않았다"는 다르다). `reset()` 은 이 수치를 되돌리지 않는다.
+   */
+  observability(): ObserverStats | undefined;
+  /** 수집기에 남은 억제분 방출(프로세스 종료 직전). 배선이 없으면 0. */
+  flushObservability(): number;
   reset(): void;
 }
 
@@ -558,6 +582,10 @@ export function createBridge(opts: BridgeOptions): Bridge {
     }
   }
 
+  // 배선을 선언하지 않으면 관측기를 만들지 않는다 — `recordRejection` 호출 자체가 없어
+  // 종전과 완전히 같다(§13-3).
+  const observer = opts.observability === undefined ? undefined : createObserver(opts.observability);
+
   const records: BridgeRecord[] = [];
   const maxRecords = opts.maxRecords ?? DEFAULT_MAX_RECORDS;
   // 도착 순서대로 직렬 처리한다. 같은 세션에 두 턴이 겹치면 상태가 갈라지기 때문이다.
@@ -571,7 +599,18 @@ export function createBridge(opts: BridgeOptions): Bridge {
     }
   }
 
-  async function dispatch(op: BridgeOp, body: Record<string, unknown>): Promise<unknown> {
+  /**
+   * Core 진입점을 **부르기 시작했는지 / 돌아왔는지**. 이 두 비트가 수집기 보고 여부를 가른다
+   * (`BridgeStage` 주석) — Core 가 던진 예외를 브리지가 또 올리면 한 번의 예외가 보고 두 건이 된다.
+   */
+  interface CoreSpan { entered: boolean; returned: boolean }
+
+  function stageOf(span: CoreSpan): BridgeStage {
+    if (!span.entered) return 'request';
+    return span.returned ? 'response' : 'core';
+  }
+
+  async function dispatch(op: BridgeOp, body: Record<string, unknown>, span: CoreSpan): Promise<unknown> {
     switch (op) {
       case 'hello':
         return {
@@ -584,11 +623,21 @@ export function createBridge(opts: BridgeOptions): Bridge {
           includesHandoffSummary: opts.includeHandoffSummary === true,
           includesSlots: opts.includeSlots === true,
         };
-      case 'start':
-        return projectTurn(await opts.core.start(toSessionRequest(body, opts)), opts);
+      case 'start': {
+        // 요청 해석은 **부르기 전에** 끝낸다 — 해석 실패는 Core 가 본 적 없는 줄이다(stage=request).
+        const req = toSessionRequest(body, opts);
+        span.entered = true;
+        const r = await opts.core.start(req);
+        span.returned = true;
+        return projectTurn(r, opts);
+      }
       case 'send': {
         if (!nonEmptyString(body.interactionId)) bad('interactionId 가 없습니다.');
-        return projectTurn(await opts.core.send(body.interactionId, toTurnInput(body)), opts);
+        const turn = toTurnInput(body);
+        span.entered = true;
+        const r = await opts.core.send(body.interactionId, turn);
+        span.returned = true;
+        return projectTurn(r, opts);
       }
       case 'end': {
         if (!nonEmptyString(body.interactionId)) bad('interactionId 가 없습니다.');
@@ -600,11 +649,16 @@ export function createBridge(opts: BridgeOptions): Bridge {
         const endInput = body.billableMs === undefined
           ? undefined
           : { billableMs: body.billableMs as number };
-        return projectTurn(await opts.core.end(body.interactionId, body.reasonKo, endInput), opts);
+        span.entered = true;
+        const r = await opts.core.end(body.interactionId, body.reasonKo, endInput);
+        span.returned = true;
+        return projectTurn(r, opts);
       }
       case 'health': {
         const { samples, observedAt } = toHealthSamples(body);
+        span.entered = true;
         opts.core.reportHealth({ adapter: opts.adapter, samples, observedAt });
+        span.returned = true;
         return { accepted: samples.length };
       }
     }
@@ -615,12 +669,16 @@ export function createBridge(opts: BridgeOptions): Bridge {
     const finish = (): number | undefined => (started === undefined || !opts.clock ? undefined : opts.clock() - started);
     let id: string | null = null;
     let op: BridgeOp | null = null;
+    const span: CoreSpan = { entered: false, returned: false };
     try {
       const parsed = parseBridgeLine(line, opts.maxLineBytes);
       id = parsed.id;
       op = parsed.op;
       enforceLimit(parsed.op);
-      const result = await dispatch(parsed.op, parsed.body);
+      const result = await dispatch(parsed.op, parsed.body, span);
+      // **성공한 줄은 관측에 올리지 않는다.** Core 호출의 성공은 런타임 관측이 이미 적고
+      // (`observe`), 브리지가 한 번 더 적으면 같은 턴이 로그에 두 줄로 남아 집계가 두 배가 된다.
+      // 경계에서만 일어나는 성공(`hello`)은 실패가 아니므로 적을 근거가 없다(§13-3).
       push({ id, op, ok: true, durationMs: finish() });
       return { id, ok: true, result };
     } catch (e) {
@@ -631,7 +689,23 @@ export function createBridge(opts: BridgeOptions): Bridge {
       const messageKo = e instanceof RequestError
         ? e.message
         : `Core 처리 중 오류가 발생했습니다: ${safeText(e)}`;
-      push({ id, op, ok: false, errorCode: code, durationMs: finish() });
+      const durationMs = finish();
+      push({ id, op, ok: false, errorCode: code, durationMs });
+      // 경계 실패를 관측에 남긴다. 지금까지 이 실패들은 **이 프로세스 바깥에서 보이지 않았다** —
+      // 깨진 줄·모르는 op·한도 초과는 Core 를 부르기 전에 끝나므로 Core 로그는 완전히 조용하다.
+      // 줄 원문·오류 문구는 넘기지 않는다(바이트 수만, §10.3).
+      observer?.recordRejection({
+        scope: opts.scope,
+        adapter: opts.adapter,
+        stage: stageOf(span),
+        code,
+        ...(id !== null ? { requestId: id } : {}),
+        ...(op !== null ? { op } : {}),
+        ...(durationMs !== undefined ? { durationMs } : {}),
+        ...(typeof line === 'string' ? { lineBytes: Buffer.byteLength(line, 'utf8') } : {}),
+        ...(e instanceof RequestError && e.retryAfterMs !== undefined ? { retryAfterMs: e.retryAfterMs } : {}),
+        error: e,
+      });
       const error: BridgeError = { code, messageKo };
       if (e instanceof RequestError && e.retryAfterMs !== undefined) error.retryAfterMs = e.retryAfterMs;
       return { id, ok: false, error };
@@ -648,6 +722,8 @@ export function createBridge(opts: BridgeOptions): Bridge {
       queue = next.catch(() => undefined);
       return next;
     },
+    observability: () => observer?.stats(),
+    flushObservability: () => observer?.flush() ?? 0,
     reset() {
       records.length = 0;
       queue = Promise.resolve();

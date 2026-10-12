@@ -2364,10 +2364,15 @@ try {
 const bo = { skip: (R && OBS && LG && EM) ? false : '타입 스트리핑 미지원 런타임' };
 
 function obsWiring(over = {}) {
-  const sink = LG.createMemorySink();
+  const records = [];
+  // 계약 경고 줄은 따로 받는다 — 진입점 관측 검사가 미배선 경고 건수에 흔들리지 않게
+  // 하기 위해서다(경고 줄 자체는 아래 '계약 경고' 절에서 본다).
+  const warnings = [];
   const sent = [];
+  const sink = (rec) => { (rec.event === OBS.WARNING_EVENT ? warnings : records).push(rec); };
   return {
-    records: sink.records,
+    records,
+    warnings,
     sent,
     binding: {
       logger: LG.createLogger({ minLevel: 'debug', sink }),
@@ -2526,7 +2531,9 @@ test('로거가 던져도 통화는 끊기지 않고 실패가 집계된다(§9.
   const { core } = build({ observability: { logger } });
   const r = await core.start(req());
   assert.equal(r.status, 'running');
-  assert.equal(core.observability().failed, 1);
+  // 턴 한 줄과 등록 시점 계약 경고 줄이 모두 던진다 — 건수는 배선에 따라 달라지지만
+  // **삼키지 않고 센다**는 것이 요점이다.
+  assert.ok(core.observability().failed >= 1, '로깅 실패를 삼키지 않고 센다');
   assert.equal(core.observability().logged, 0);
 });
 
@@ -2549,6 +2556,69 @@ test('과금 근거를 못 실은 종료는 warn 으로 드러난다(§11.2)', b
   const last = w.records[w.records.length - 1];
   assert.equal(last.level, 'warn');
   assert.equal(last.fields.billableMsRecorded, false);
+});
+
+// ── 계약 경고가 로그로 나간다(§13) ───────────────────────────────────────────
+//
+// 배선 전에는 `W_CONSENT_UNBOUND`·`W_QA_UNBOUND`·`W_KNOWLEDGE_UNBOUND` 같은 미배선 경고가
+// 호스트가 `warnings()` 를 **읽어야만** 보였다. 읽지 않으면 동의·점검·지식 응대가 배선되지
+// 않은 채로 도는데, 그 상태는 예외도 장애도 아니라 **아무 일도 일어나지 않는 것**이라
+// 통화·이벤트·적합성 검사가 전부 정상이다. 여기서 고정하는 것은 그 경고가 **한 번만**
+// 나가고 **문구는 나가지 않는다**는 것이다.
+
+test('미배선 계약 경고는 첫 통화 전에 — 등록 시점에 — 로그로 나간다', bo, async () => {
+  const w = obsWiring();
+  const { core } = build({ observability: w.binding });
+  assert.ok(w.warnings.length > 0, '한 통도 받지 않는 인스턴스도 미배선 사실을 알려야 한다');
+  assert.equal(w.records.length, 0, '통화가 없었으므로 진입점 줄은 없다');
+  for (const rec of w.warnings) {
+    assert.equal(rec.level, 'warn');
+    assert.match(rec.code, /^W_[A-Z_]+$/);
+    assert.equal(rec.fields.outcome, 'warned');
+  }
+  assert.ok(w.warnings.some((r) => r.code === 'W_QA_UNBOUND'));
+  assert.equal(core.observability().warned, w.warnings.length);
+});
+
+test('경고 문구는 로그로 나가지 않는다 — 보간된 자유 문장이다(§10.3)', bo, async () => {
+  const w = obsWiring();
+  const { core } = build({ observability: w.binding });
+  const dump = w.warnings.map((r) => LG.formatLine(r)).join('\n');
+  for (const issue of core.warnings()) {
+    // 문구 전체가 로그에 실리지 않는다 — 전문은 warnings() 로만 읽는다.
+    assert.ok(!dump.includes(issue.messageKo), `경고 문구가 로그로 샜다: ${issue.messageKo}`);
+  }
+  assert.ok(dump.includes('W_QA_UNBOUND'), '코드는 남는다');
+});
+
+test('같은 경고를 턴마다 되풀이하지 않는다 — 잡음이 진짜 신호를 묻는다', bo, async () => {
+  const w = obsWiring();
+  const { core } = build({ observability: w.binding });
+  const atStart = w.warnings.length;
+  const r = await core.start(req());
+  await core.send(r.interactionId, { input: { kind: 'utterance', text: '홍길동' } });
+  await core.end(r.interactionId, '고객 종료');
+  assert.equal(w.warnings.length, atStart, '등록 시점 경고는 이미 나갔다');
+  assert.equal(core.observability().warned, atStart);
+});
+
+test('통화 중 처음 드러난 경고는 그 턴 뒤에 한 번만 나간다', bo, async () => {
+  const w = obsWiring();
+  const { core } = build({ flows: INTENT_FLOWS, observability: w.binding });
+  assert.equal(w.warnings.filter((r) => r.code === 'W_INTENT_UNBOUND').length, 0);
+  const r = await core.start(triageReq());
+  await core.send(r.interactionId, { input: { kind: 'utterance', text: '잔액 알려줘' } });
+  await core.send(r.interactionId, { input: { kind: 'utterance', text: '다시 잔액' } });
+  const lines = w.warnings.filter((rec) => rec.code === 'W_INTENT_UNBOUND');
+  assert.equal(lines.length, 1, '두 턴 모두 미배선이지만 줄은 하나다');
+  // 인과 순서가 보이게 턴 줄 뒤에 나간다 — 경고만 먼저 보면 어느 턴이 드러냈는지 알 수 없다.
+  assert.ok(w.records.length > 0);
+});
+
+test('배선이 없으면 경고도 나가지 않는다 — 종전과 완전히 같다(§13-3)', bo, async () => {
+  const { core } = build();
+  assert.ok(core.warnings().length > 0);
+  assert.equal(core.observability(), undefined);
 });
 
 // ── readiness 배선(§9.3·§13) ────────────────────────────────────────────────

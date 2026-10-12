@@ -18,6 +18,19 @@
    - Next.js: API 라우트 try/catch + `app/global-error.tsx`
    - 이음: ErrorBoundary + window.onerror
    - Callbot: 각 API 핸들러 except 블록
+   - AICC-Core: **전역 훅만으로는 통화가 안 보인다.** 배선할 자리가 셋이고 전부
+     `obs/executeObservability.ts` 의 판정을 지난다 —
+     (1) `createConversationCore({ observability })` → 진입점 네 곳(`start`·`send`·`end`·
+     `reportHealth`)의 턴 줄 + 등록 시점 계약 경고(`warnings()`)가 **경고당 한 번** 나간다,
+     (2) `createBridge({ observability })` → 비-Node 호스트가 보낸 **경계 실패**(깨진 JSONL 줄·
+     모르는 op·다른 테넌트 주장·요청 한도 초과)가 남는다. 이 줄들은 Core 를 부르기 **전에**
+     끝나므로 (1) 만 하면 로그가 조용하다 — 증상은 "그 채널만 통화가 안 된다"인데 로그에는
+     그 통화가 아예 없다. **같은 배선 객체를 둘에 주고**(중복 억제·창 상한이 같은 기준으로
+     돈다) 로그 sink 는 **표준출력에 쓰지 않는다**(브리지 응답 줄과 섞여 호스트 파서가 죽는다 —
+     `fixtures/reference-core-observed.mjs` 참조),
+     (3) `installGlobalCapture` → uncaught·unhandledRejection. Core 는 `process` 를 직접
+     참조하지 않으므로 호스트가 소스를 주입한다(§6.2).
+     최소 수준·중복 억제 창·창당 상한은 **운영이 정한다**(Core 는 기본값을 만들지 않는다, §13-3).
 3. 테스트 동반 — no-op 동작, 마스킹, DSN 미하드코딩을 불변식으로 검증
 4. `COMMERCIAL_READINESS.md` 의 "에러 모니터링" 항목을 `[x]` 로 변경
 

@@ -599,6 +599,31 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     ? undefined
     : createObserver(opts.observability);
 
+  /**
+   * 쌓인 계약 경고를 로그로 내보낸다 — **경고 하나당 딱 한 줄**이다(§13).
+   *
+   * 지금까지 `W_CONSENT_UNBOUND`·`W_QA_UNBOUND`·`W_KNOWLEDGE_UNBOUND` 같은 미배선 경고는
+   * 호스트가 `warnings()` 를 **읽어야** 보였다. 읽지 않으면 동의·점검·지식 응대가 배선되지
+   * 않은 채로 돌고, 그 상태는 예외도 장애도 아니라 **아무 일도 일어나지 않는 것**이라
+   * 통화·이벤트·적합성 검사가 전부 정상이다.
+   *
+   * 커서(`warnedUpto`)가 **한 번만**을 보장한다 — 턴마다 전체를 찍으면 미배선 경고 하나가
+   * 로그를 덮어 진짜 신호가 묻힌다. 커서를 먼저 올리는 이유는 관측이 던져도(호스트 로거가
+   * 던지는 경우) 같은 경고를 영원히 되풀이하지 않기 위해서다.
+   * **문구는 나가지 않는다** — 경고 문구에는 시나리오 id·인텐트·호스트 사유가 보간돼 있어
+   * 고정 허용 목록을 지날 수 없다(§10.3). 로그에 가는 것은 코드뿐이고 전문은 `warnings()` 다.
+   */
+  let warnedUpto = 0;
+  function drainWarnings(): void {
+    if (observer === undefined) return;
+    while (warnedUpto < warnings.length) {
+      const w = warnings[warnedUpto];
+      warnedUpto += 1;
+      if (w === undefined) continue;
+      observer.recordWarning({ scope: opts.scope, code: w.code });
+    }
+  }
+
   /** 실측 소요. 시계가 없으면 **필드를 만들지 않는다**(§13-3). */
   function durationOf(started: number | undefined): { durationMs?: number } {
     const d = observer?.elapsed(started);
@@ -639,9 +664,12 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     try {
       const result = await run();
       observer.record({ ...facts(result), result, ...durationOf(started) });
+      // 이 턴이 처음 드러낸 계약 경고를 턴 줄 **뒤에** 내보낸다(인과 순서가 보이게).
+      drainWarnings();
       return result;
     } catch (e) {
       observer.record({ ...facts(), error: e, ...durationOf(started) });
+      drainWarnings();
       throw e;
     }
   }
@@ -2265,5 +2293,8 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     },
   };
 
+  // 등록 시점 경고는 **여기서** 나간다 — 첫 통화를 기다리면, 한 통도 받지 않는 인스턴스
+  // (대기 중인 예비 인스턴스·배포 직후)는 미배선 사실을 끝까지 알리지 못한다.
+  drainWarnings();
   return core;
 }

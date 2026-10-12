@@ -376,6 +376,167 @@ export function classifyCall(call: ObservedCall): ObservationDecision {
   };
 }
 
+// ── 경계·배선 관측 ───────────────────────────────────────────────────────────
+//
+// 위 `classifyCall` 은 `ConversationCorePort` 의 네 진입점만 본다. 그런데 **그 진입점에
+// 닿지도 못한 실패**가 두 종류 있고, 둘 다 지금까지 관측에 전혀 닿지 않았다.
+//
+//  - **브리지 경계**(`channels/bridge.ts`): 깨진 JSONL 줄·모르는 op·다른 테넌트 주장·요청
+//    한도 초과는 Core 를 부르기 **전에** 응답 줄로 끝난다. 즉 비-Node 호스트(Callbot 파이썬
+//    에이전트)가 프로토콜을 틀리게 쓰면 — 직렬화 버그로 모든 줄이 깨지거나, 한도에 계속
+//    걸리거나, 스코프를 주장하다 거부되거나 — **Core 쪽 로그는 완전히 조용하다.** 증상은
+//    "그 채널만 통화가 안 된다"인데 Core 로그에는 그 통화가 아예 없어서, 조사는 멀쩡한 Core
+//    를 뒤진다. 브리지가 `records`·`onRecord` 로 남기던 것은 **그 프로세스 안에서만** 보이고
+//    테넌트·수집기로 가지 않았다.
+//  - **등록 시점 계약 경고**(`channels/runtime.ts` 의 `warnings()`): `W_CONSENT_UNBOUND`·
+//    `W_QA_UNBOUND`·`W_KNOWLEDGE_UNBOUND` 같은 미배선 경고는 호스트가 `warnings()` 를
+//    **읽어야** 보인다. 읽지 않으면 동의·점검·지식 응대가 배선되지 않은 채로 돈다 — 전부
+//    예외 없이 조용히 "아무 일도 일어나지 않는" 상태이고, 통화·이벤트·적합성 검사는 모두 정상이다.
+//
+// 세 가지를 지킨다:
+//  - **턴마다 찍지 않는다.** 계약 경고는 **처음 쌓인 그 순간 한 번만** 나간다(런타임의 커서가
+//    그것을 보장한다) — 턴마다 찍으면 미배선 경고 하나가 로그를 덮어 진짜 신호를 묻는다.
+//  - **경고 문구를 싣지 않는다.** 문구는 시나리오 id·인텐트·호스트 사유가 보간된 자유 문장이라
+//    위 (가)의 고정 허용 목록을 지날 수 없다. 로그에 가는 것은 **코드**뿐이고 전문은
+//    `warnings()` 로 호스트가 읽는다.
+//  - **같은 예외를 두 번 올리지 않는다.** 아래 `BridgeStage` 가 수집기 보고 여부를 정한다.
+
+/** 브리지 경계 거부 이벤트. 진입점 이벤트(`OP_EVENT`)와 **이름을 겹치지 않게** 둔다 — 같은 이름으로 적으면 집계의 "Core 호출 N건"이 경계 실패까지 섞은 수가 된다. */
+export const REJECTION_EVENT = 'core.bridge.rejected';
+
+/** 계약 경고 이벤트. */
+export const WARNING_EVENT = 'core.contract.warning';
+
+/** 관측에 실어도 되는 브리지 op. 모르는 op 는 **임의 문자열**이라 값을 싣지 않는다(발화가 들어올 수 있다). */
+const KNOWN_BRIDGE_OPS: readonly string[] = ['hello', 'start', 'send', 'end', 'health'];
+
+/**
+ * 고정 필드(`code`)에 실어도 되는 열거값 형태.
+ * 코드는 `fields` 가 아니라 **고정 필드**라 로거의 마스킹을 지나지 않는다(위 (다)와 같은 이유) —
+ * 타입을 우회해 자유 문장이 들어오면 그 문장이 모든 줄에 그대로 남는다.
+ */
+const CODE_RE = /^[A-Z][A-Z0-9_]{1,46}$/;
+
+/** 실측 건수·수치만 통과시킨다. 없는 값을 0 으로 채우지 않는다(§13-3). */
+function isMeasured(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0;
+}
+
+/**
+ * 실패가 경계의 어느 쪽에서 났는가. **수집기 보고 여부를 이 값이 정한다.**
+ *  - `request` — 줄 해석·검증·한도. Core 는 이 줄을 본 적이 없다. 설계된 거부이므로 **올리지
+ *    않는다**: 호스트의 직렬화 버그 하나가 보고 수천 건이 되면 창 상한(`maxPerWindow`)에
+ *    **진짜 예외가 밀려 버려진다**(위 (나)).
+ *  - `core` — Core 진입점이 던졌다. **올리지 않는다** — 그 예외는 `classifyCall` 이 이미
+ *    올렸고, 여기서 또 올리면 한 번의 예외가 보고 두 건이 된다(§2). 로그 한 줄은 남긴다:
+ *    그 줄에는 Core 쪽 줄에 없는 **요청 id ↔ 오류 코드** 상관이 있고, 그것이 비-Node 호스트가
+ *    자기 통화를 Core 로그와 잇는 유일한 끈이다.
+ *  - `response` — Core 가 돌려준 결과를 응답 줄로 바꾸는 중에 던졌다. **이 경우만 올린다** —
+ *    Core 는 그 턴을 성공으로 기록하고 호스트는 실패를 받는 상태이고, 아무도 보고하지 않는
+ *    유일한 자리다(그 비대칭이 바로 "로그에는 성공인데 통화는 안 된다"로 나타난다).
+ */
+export type BridgeStage = 'request' | 'core' | 'response';
+
+/** 브리지 경계에서 거부된 한 줄의 사실. **줄 원문은 어떤 필드로도 받지 않는다**(§10.3). */
+export interface ObservedRejection {
+  /** **Core 가 강제하는 스코프**(§11.1). 호스트가 주장한 테넌트를 적으면 그 로그로 격리 사고를 조사할 수 없다. */
+  scope: TenantScope;
+  adapter?: string;
+  /** 호스트가 보낸 요청 id. `loggableId` 관문을 지나야 실린다 — 그 자리에 호 ID·발신번호를 넣는 호스트가 있다. */
+  requestId?: string;
+  /** 읽어낸 op. 허용 목록 밖이면 싣지 않는다. */
+  op?: string;
+  /** 브리지가 정한 실패 코드. **여기서 코드를 만들지 않는다**(§2). */
+  code: string;
+  stage: BridgeStage;
+  durationMs?: number;
+  /** 줄 바이트 수(실측). 원문은 싣지 않는다 — 깨진 줄에 발신번호가 들어 있을 수 있다(§10.3). */
+  lineBytes?: number;
+  /** 계산된 재시도 대기(ms). 추정치가 아니다(§13-3). */
+  retryAfterMs?: number;
+  /** 던져진 값. `stage: 'response'` 에서만 수집기로 가고, **로그 필드로는 복사하지 않는다**. */
+  error?: unknown;
+}
+
+/** 등록 시점 계약 경고 한 건. **문구를 받지 않는다** — 자유 문장은 허용 목록을 지날 수 없다. */
+export interface ObservedWarning {
+  scope: TenantScope;
+  /** `ContractIssueCode`. 전문은 `warnings()` 로 호스트가 읽는다. */
+  code: string;
+}
+
+/** 사실 → 판정. 순수 함수다. */
+export function classifyRejection(r: ObservedRejection): ObservationDecision {
+  const fields: Record<string, string | number | boolean> = { outcome: 'rejected', stage: r.stage };
+  const reasonsKo: string[] = [];
+  const droppedIds: string[] = [];
+  const ids: { requestId?: string; interactionId?: string } = {};
+
+  if (r.adapter !== undefined && KNOWN_ADAPTERS.includes(r.adapter)) fields.adapter = r.adapter;
+  if (r.op !== undefined && KNOWN_BRIDGE_OPS.includes(r.op)) fields.op = r.op;
+
+  if (r.requestId !== undefined) {
+    const chk = loggableId(r.requestId);
+    if (chk.ok) ids.requestId = chk.value;
+    else {
+      droppedIds.push('requestId');
+      if (chk.piiKinds !== undefined && chk.piiKinds.length > 0) fields.requestIdPiiKinds = chk.piiKinds.join(',');
+      reasonsKo.push('요청 id 를 로그에 싣지 않았습니다 — 개인정보·형식 위반입니다(§10.3).');
+    }
+  }
+  if (isMeasured(r.lineBytes)) fields.lineBytes = r.lineBytes;
+  if (isMeasured(r.retryAfterMs)) fields.retryAfterMs = r.retryAfterMs;
+
+  const code = CODE_RE.test(r.code) ? r.code : undefined;
+  if (code === undefined) {
+    fields.codeDropped = true;
+    reasonsKo.push('실패 코드가 열거값 형태가 아닙니다 — 고정 필드에 싣지 않았습니다(§10.3).');
+  }
+
+  if (r.stage === 'request') {
+    reasonsKo.push('브리지 경계에서 거부된 요청입니다 — 이 줄은 Core 진입점에 닿지 않았습니다.');
+  } else if (r.stage === 'core') {
+    reasonsKo.push('Core 진입점이 예외로 끝나 호스트에 오류 줄로 응답했습니다 — 수집기 보고는 진입점 관측이 올립니다(§2).');
+  } else {
+    reasonsKo.push('Core 가 돌려준 결과를 응답 줄로 바꾸는 중 예외가 발생했습니다 — 그 턴은 Core 에 성공으로 기록되고 호스트는 실패를 받습니다.');
+  }
+  if (r.code === 'E_RATE_LIMITED') {
+    reasonsKo.push('요청 한도로 거부했습니다 — 한도가 통화를 끊고 있지 않은지 확인이 필요합니다(§9.3·§11.2).');
+  }
+  if (r.code === 'E_TENANT_SCOPE') {
+    reasonsKo.push('호스트가 브리지 설정과 다른 테넌트를 주장했습니다(§11.1).');
+  }
+
+  return {
+    // 거부는 **설계된 응답**이다 — error 로 적으면 호스트의 오타 하나가 대시보드를 덮고
+    // 진짜 예외가 그 속에 묻힌다. 설명되지 않은 예외(`core`·`response`)만 error 다.
+    level: r.stage === 'request' ? 'warn' : 'error',
+    event: REJECTION_EVENT,
+    ...(code !== undefined ? { code } : {}),
+    fields,
+    capture: r.stage === 'response',
+    ids,
+    ...(droppedIds.length > 0 ? { droppedIds } : {}),
+    reasonsKo,
+  };
+}
+
+/** 사실 → 판정. 순수 함수다. 경고는 **올리지 않는다**(위 (나)) — 모델링된 설정 상태다. */
+export function classifyWarning(w: ObservedWarning): ObservationDecision {
+  const ok = CODE_RE.test(w.code);
+  return {
+    level: 'warn',
+    event: WARNING_EVENT,
+    ...(ok ? { code: w.code } : {}),
+    fields: { outcome: 'warned', ...(ok ? {} : { codeDropped: true }) },
+    capture: false,
+    ids: {},
+    reasonsKo: [ok
+      ? '등록 시점 계약 경고입니다 — 문구는 싣지 않습니다(보간된 자유 문장이라 허용 목록을 지날 수 없습니다). 전문은 warnings() 로 읽습니다.'
+      : '경고 코드가 열거값 형태가 아닙니다 — 고정 필드에 싣지 않았습니다(§10.3).'],
+  };
+}
+
 export interface ObservabilityBinding {
   /** 구조화 로거. 주지 않으면 로그를 남기지 않는다(완전한 no-op). */
   logger?: Logger;
@@ -386,8 +547,12 @@ export interface ObservabilityBinding {
 }
 
 export interface ObserverStats {
-  /** `record` 호출 수. */
+  /** `record` 호출 수 — **진입점 관측만** 센다(경계 거부·계약 경고를 섞으면 "통화 N건"이 아니게 된다). */
   recorded: number;
+  /** `recordRejection` 호출 수. 0 이 아니면 호스트가 프로토콜을 틀리게 쓰고 있다는 뜻이다. */
+  rejected: number;
+  /** `recordWarning` 호출 수. 배선 경고는 **처음 쌓인 그 순간 한 번만** 올라오므로 누적 건수가 그대로 배선 결함 수다. */
+  warned: number;
   /** 로거에 넘긴 수. */
   logged: number;
   /** 수집기에 올린 수. */
@@ -413,15 +578,31 @@ export interface Observer {
    * 나가면 오류 원문이 화면에 뜬다(§10.3).
    */
   record(call: ObservedCall): ObservationDecision | undefined;
+  /**
+   * 브리지 경계에서 거부된 한 줄 관측. **어떤 경우에도 던지지 않는다** —
+   * 관측 때문에 줄 처리가 죽으면 그 다음 줄들까지 응답을 못 받는다(§9.3).
+   */
+  recordRejection(rejection: ObservedRejection): ObservationDecision | undefined;
+  /** 등록 시점 계약 경고 한 건 관측. 던지지 않는다. */
+  recordWarning(warning: ObservedWarning): ObservationDecision | undefined;
   /** 수집기에 남은 억제분을 내보낸다(프로세스 종료 직전). 수집기가 없으면 0. */
   flush(): number;
   stats(): ObserverStats;
 }
 
-export function createObserver(binding: ObservabilityBinding = {}): Observer {
-  const stats: ObserverStats = { recorded: 0, logged: 0, captured: 0, failed: 0, droppedIds: 0 };
+/** `emit` 이 판정 외에 읽는 것 — 스코프·소요·던져진 값뿐이다(본문은 어떤 경로로도 읽지 않는다). */
+interface EmitSource {
+  scope: TenantScope;
+  durationMs?: number;
+  error?: unknown;
+}
 
-  function emit(decision: ObservationDecision, call: ObservedCall): void {
+export function createObserver(binding: ObservabilityBinding = {}): Observer {
+  const stats: ObserverStats = {
+    recorded: 0, rejected: 0, warned: 0, logged: 0, captured: 0, failed: 0, droppedIds: 0,
+  };
+
+  function emit(decision: ObservationDecision, call: EmitSource): void {
     const ctx: LogContext = {
       scope: call.scope,
       ...(decision.ids.requestId !== undefined ? { requestId: decision.ids.requestId } : {}),
@@ -499,6 +680,31 @@ export function createObserver(binding: ObservabilityBinding = {}): Observer {
       emit(decision, call);
       return decision;
     },
+    recordRejection: (rejection) => {
+      stats.rejected += 1;
+      let decision: ObservationDecision;
+      try {
+        decision = classifyRejection(rejection);
+      } catch {
+        stats.failed += 1;
+        return undefined;
+      }
+      if (decision.droppedIds !== undefined) stats.droppedIds += decision.droppedIds.length;
+      emit(decision, rejection);
+      return decision;
+    },
+    recordWarning: (warning) => {
+      stats.warned += 1;
+      let decision: ObservationDecision;
+      try {
+        decision = classifyWarning(warning);
+      } catch {
+        stats.failed += 1;
+        return undefined;
+      }
+      emit(decision, warning);
+      return decision;
+    },
     flush: () => {
       const monitor = binding.monitor;
       if (monitor === undefined) return 0;
@@ -515,7 +721,8 @@ export function createObserver(binding: ObservabilityBinding = {}): Observer {
 
 /** 보고용 한 줄 요약. 수치는 전부 실측이다 — 비율·점수를 만들지 않는다(§13-3). */
 export function formatObserverStats(s: ObserverStats): string {
-  return `관측 ${s.recorded}건 · 로그 ${s.logged} · 보고 ${s.captured} · 실패 ${s.failed} · 식별자 제외 ${s.droppedIds}`;
+  return `관측 ${s.recorded}건 · 경계거부 ${s.rejected} · 계약경고 ${s.warned}`
+    + ` · 로그 ${s.logged} · 보고 ${s.captured} · 실패 ${s.failed} · 식별자 제외 ${s.droppedIds}`;
 }
 
 /** 수집기 보고의 식별 정보만 뽑는다(호스트가 사용자에게 오류 id 를 보여줄 때 쓴다). */
