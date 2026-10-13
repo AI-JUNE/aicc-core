@@ -77,8 +77,12 @@ export function stripSecrets(input: string): string {
     );
 }
 
-/** 절대경로는 마지막 두 조각만 남긴다 — 배포 환경의 디렉터리 구조가 오류 리포트로 새 나가지 않게. */
-function shortenPaths(line: string): string {
+/**
+ * 절대경로는 마지막 두 조각만 남긴다 — 배포 환경의 디렉터리 구조가 오류 리포트로 새 나가지 않게.
+ * CI 실행기들(`channels/harness.ts`·`adapters/enginePlan.ts`)이 모듈 로드 실패 문장을 로그에
+ * 올릴 때 같은 규칙을 쓴다 — 규칙을 각자 적으면 한쪽만 고쳐지고, 고쳐지지 않은 쪽이 곧 유출이다(§2).
+ */
+export function shortenPaths(line: string): string {
   return line.replace(/(?:file:\/\/)?(?:[A-Za-z]:)?[\\/](?:[^\s()\\/:]+[\\/]){2,}([^\s()\\/:]+)/g, '…/$1');
 }
 

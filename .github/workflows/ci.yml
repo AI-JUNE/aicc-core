@@ -101,6 +101,19 @@ jobs:
           set -e
           test "$code" -eq 2 || { echo "대상 미존재가 판정보류(2)가 아니라 $code 로 끝났다"; exit 1; }
 
+      # 엔진 기동 계획 실행기가 게이트 규약을 지키는지 확인한다. **엔진을 부르지 않는다** —
+      # 참조 선언은 dry_run 이고 조립·검증까지만 돈다. 두 가지를 본다:
+      # (1) dry_run 기대와 맞으면 0, (2) 활성화 기대값을 빼면 **판정보류(2)**.
+      # (2)가 0 으로 새면 `live` 로 바뀐 선언이 초록으로 지나간다 — 그 순간 이 검사는 없는 것과 같다(§13-3).
+      - name: engine plan runner (self-check)
+        run: |
+          node scripts/engine-plan.mjs --declaration ./fixtures/reference-engines.mjs --expect-activation dry_run
+          set +e
+          node scripts/engine-plan.mjs --declaration ./fixtures/reference-engines.mjs
+          code=$?
+          set -e
+          test "$code" -eq 2 || { echo "활성화 기대값 누락이 판정보류(2)가 아니라 $code 로 끝났다"; exit 1; }
+
       # 관리 포털 IA ↔ 화면 매핑 문서는 자료(src/portal/screenMap.ts)에서 생성된다.
       # 손으로 고친 표는 반드시 썩으므로, 생성 결과와 다르면 여기서 멈춘다.
       - name: portal screen map (doc freshness)

@@ -1,8 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-let R = null, F = null, B = null, P = null, EV = null, DF = null, LC = null, CO = null, CN = null;
+let R = null, F = null, B = null, P = null, EV = null, DF = null, LC = null, CO = null, CN = null, HT = null;
 try {
+  HT = await import('../src/adapters/http.ts');
   CO = await import('../src/consent/executeConsent.ts');
   CN = await import('../src/consent/consent.ts');
   R = await import('../src/channels/runtime.ts');
@@ -53,7 +54,7 @@ function fakePort(id = 'callbot', capsOver = {}, over = {}) {
   };
 }
 
-function build({ flows = [flowBilling], registry, port = fakePort(), ports, samples = [], policy = {}, components, reprompt, timing, routing, connectors, channelSwitch, disclosure, intent, knowledge, consent, qa, observability, recovery } = {}) {
+function build({ flows = [flowBilling], registry, port = fakePort(), ports, samples = [], policy = {}, components, reprompt, timing, routing, connectors, channelSwitch, disclosure, intent, knowledge, consent, qa, observability, recovery, engines } = {}) {
   const collector = B.createCollectorSink('t');
   const bus = B.createEventBus({
     scope: SCOPE, sinks: [collector],
@@ -84,6 +85,7 @@ function build({ flows = [flowBilling], registry, port = fakePort(), ports, samp
     ...(qa !== undefined ? { qa } : {}),
     ...(observability !== undefined ? { observability } : {}),
     ...(recovery !== undefined ? { recovery } : {}),
+    ...(engines !== undefined ? { engines } : {}),
   });
   return { core, port, collector, health };
 }
@@ -2811,4 +2813,157 @@ test('복구 프로브는 던지지 않는다 — 프로브가 터져도 보고�
   const r = await core.runRecoveryProbes();
   assert.deepEqual(r.recovered, []);
   assert.ok(r.attempts.some((a) => a.component === 'llm' && a.ran === true));
+});
+
+// ── 엔진 기동 배선(§6.2·§9.3) ────────────────────────────────────────────────
+// 이 배선이 없는 동안 인텐트·지식 배선 주석이 약속한 "엔진 상태는 resilience.ts 가 이미
+// 적는다"는 **참이 아니었다** — 헬스 레지스트리에 들어오는 샘플은 채널이 올리는 것뿐이었고,
+// 채널이 올리는 것은 대개 자기 매체다. 그래서 LLM 이 전부 죽어도 폴백 판정은 normal 이다.
+
+const engSttAd = { name: 'stt-x', residency: 'onprem', stream: async function* () { yield { text: '여보세요', isFinal: true }; } };
+const engTtsAd = { name: 'tts-x', residency: 'onprem', synthesize: async function* () { yield { data: new Uint8Array([1]), mime: 'audio/wav' }; } };
+const engLlmOk = (text) => ({ name: 'llm-x', residency: 'onprem', complete: async function* () { yield text; } });
+/** 엔진이 알려 준 실패(타임아웃)다 — 이것만 엔진 상태로 집계된다. */
+const engLlmDown = {
+  name: 'llm-dead',
+  residency: 'onprem',
+  complete: async function* () { throw new HT.EngineError('E_TIMEOUT', 'llm', '응답 시간 초과'); },
+};
+/** 정체불명 예외. 엔진 탓으로 돌리지 않는다 — 우리 쪽 결함으로 전 채널을 내릴 수 없다. */
+const engLlmBoom = {
+  name: 'llm-boom',
+  residency: 'onprem',
+  complete: async function* () { throw new Error('우리 코드가 터졌다'); },
+};
+
+/** 미리 만들어진 조각으로만 기동한다 — 네트워크에 닿지 않는다. */
+function engineDecl({ llm = engLlmOk('{"candidates":[]}'), activation = 'live', over = {} } = {}) {
+  return {
+    scope: SCOPE,
+    allowOverseas: false,
+    sets: [{
+      name: 'primary',
+      parts: [{ kind: 'preassembled', source: 'fake', engines: { activation, stt: engSttAd, tts: engTtsAd, llm } }],
+    }],
+    resilience: { attemptsPerCandidate: 1 },
+    ...over,
+  };
+}
+
+test('엔진 미배선: 종전과 완전히 같고(§13-3) 그 사실이 경고로 남는다', b, () => {
+  const { core } = build();
+  assert.equal(core.engines(), undefined, '배선이 없는데 빈 객체를 돌려줬다');
+  assert.equal(core.warnings().some((i) => i.code === 'W_ENGINES_UNBOUND'), true);
+});
+
+test('배선하면 엔진이 서고 경고가 사라진다 — 후보·활성화·컴포넌트가 그대로 보인다', b, () => {
+  const { core } = build({ engines: engineDecl() });
+  const eng = core.engines();
+  assert.equal(eng.activation, 'live');
+  assert.deepEqual(eng.candidates, ['primary']);
+  assert.deepEqual(eng.components, ['stt', 'tts', 'llm']);
+  assert.equal(eng.healthRecorded, true);
+  assert.equal(core.warnings().some((i) => i.code === 'W_ENGINES_UNBOUND'), false);
+});
+
+test('엔진 실패가 런타임의 레지스트리에 들어와 §9.3 폴백을 실제로 걸게 한다', b, async () => {
+  const { core, port, health } = build({
+    engines: engineDecl({ llm: engLlmDown }),
+    policy: { legacyIvrAvailable: true },
+  });
+  // 배선 전에는 이 상태가 어디에도 기록되지 않았다 — 통화만 턴마다 개별적으로 실패했다.
+  const first = await core.start(req());
+  assert.equal(first.status, 'running', '엔진을 부르기 전부터 폴백이 걸렸다');
+
+  await assert.rejects(async () => {
+    for await (const _ of core.engines().engines.llm.complete([{ role: 'user', content: '안녕' }])) { /* 소비만 */ }
+  });
+  assert.equal(health.latest('llm').state, 'down', '엔진 실패가 통화가 올린 샘플과 같은 레지스트리에 닿지 않았다');
+
+  const second = await core.start(req());
+  assert.equal(second.fallback.mode, 'legacy_ivr');
+  assert.equal(second.status, 'transferred');
+  assert.ok(port.log.some((l) => l[0] === 'ivr'));
+});
+
+test('정체불명 예외는 엔진 장애로 집계하지 않는다 — 우리 쪽 결함으로 전 채널을 내릴 수 없다', b, async () => {
+  const { core, health } = build({ engines: engineDecl({ llm: engLlmBoom }) });
+  await assert.rejects(async () => {
+    for await (const _ of core.engines().engines.llm.complete([{ role: 'user', content: '안녕' }])) { /* 소비만 */ }
+  });
+  assert.equal(health.latest('llm'), undefined, '정체불명 예외가 엔진 상태로 적혔다');
+});
+
+test('dry_run 엔진은 샘플을 남기지 않고 승인 대기로 적힌다 — readiness 가 실관측으로 읽지 않는다', b, async () => {
+  const { core, health } = build({ engines: engineDecl({ activation: 'dry_run' }) });
+  assert.equal(core.engines().healthRecorded, false);
+  for await (const _ of core.engines().engines.llm.complete([{ role: 'user', content: '안녕' }])) { /* 가짜는 성공한다 */ }
+  assert.equal(health.latest('llm'), undefined, 'dry_run 성공이 실엔진 관측으로 기록됐다');
+  const r = await core.readiness({ timeoutMs: 1000 });
+  const llm = r.core.components.find((c) => c.component === 'llm');
+  assert.equal(llm.approvalPending, true);
+});
+
+test('호스트가 선언한 승인 대기 목록을 지우지 않고 합친다', b, async () => {
+  const { core } = build({ engines: engineDecl({ activation: 'dry_run' }) });
+  const r = await core.readiness({ timeoutMs: 1000, approvalPending: ['telephony'] });
+  const pending = r.core.components.filter((c) => c.approvalPending === true).map((c) => c.component);
+  assert.ok(pending.includes('telephony'), '호스트 선언이 사라졌다');
+  assert.ok(pending.includes('llm'), 'Core 가 아는 활성화 전 컴포넌트가 빠졌다');
+});
+
+test('다른 테넌트의 엔진 선언은 조용히 덮어쓰지 않고 거부한다(§11.1)', b, () => {
+  assert.throws(
+    () => build({ engines: engineDecl({ over: { scope: { tenantId: 'other' } } }) }),
+    /선언의 테넌트가 런타임과 다릅니다/,
+  );
+});
+
+test('엔진 기동이 분류기를 만들어 꿴다 — 발화가 시나리오를 고른다(§5.1)', b, async () => {
+  const { core } = build({
+    flows: INTENT_FLOWS,
+    engines: engineDecl({
+      llm: engLlmOk('{"candidates":[{"intent":"balance","confidence":0.95}]}'),
+      over: { intent: { systemKo: '너는 상담 분류기다.' } },
+    }),
+    intent: {
+      catalog: INTENT_CATALOG, policy: INTENT_POLICY, table: INTENT_TABLE,
+      clarifyPrompt: '어떤 업무를 도와드릴까요?',
+    },
+  });
+  const r = await core.start(triageReq());
+  const after = await core.send(r.interactionId, { input: { kind: 'utterance', text: '잔액 알려줘' } });
+  assert.equal(after.state.flowId, 'f_balance');
+  assert.equal(after.state.slots[INTENT_SLOT], 'balance');
+});
+
+test('분류기가 두 곳에서 오면 거부한다 — 한쪽은 §9.3 에 닿지 않는다(§2)', b, () => {
+  assert.throws(
+    () => build({
+      flows: INTENT_FLOWS,
+      engines: engineDecl({ over: { intent: { systemKo: '너는 상담 분류기다.' } } }),
+      intent: intentBinding(classifierOf({ candidates: [] })),
+    }),
+    /분류기가 두 곳에서 옵니다/,
+  );
+});
+
+test('엔진 기동도 분류기 주입도 없으면 인텐트 배선을 거부한다(§6.2)', b, () => {
+  assert.throws(
+    () => build({
+      flows: INTENT_FLOWS,
+      intent: {
+        catalog: INTENT_CATALOG, policy: INTENT_POLICY, table: INTENT_TABLE,
+        clarifyPrompt: '어떤 업무를 도와드릴까요?',
+      },
+    }),
+    /분류기\(classifier\)가 없습니다/,
+  );
+});
+
+test('엔진 기동 선언이 성립하지 않으면 런타임 생성 자체가 막힌다 — 통화 중이 아니다', b, () => {
+  assert.throws(
+    () => build({ engines: engineDecl({ over: { allowOverseas: undefined } }) }),
+    /allowOverseas/,
+  );
 });

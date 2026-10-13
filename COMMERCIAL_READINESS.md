@@ -279,6 +279,86 @@
         근거: `src/channels/runtime.ts`(`recovery`·`runRecoveryProbes`·`recoveryLastRunAt`·
         `RecoveryBinding`) · `src/channels/contract.ts`(`W_RECOVERY_UNBOUND`) ·
         `tests/channels.runtime.test.mjs`(10건 추가, 총 191건) · `API.md` 반영
+      · Core 측 완료(2026-10-13): **설정에서 엔진까지 가는 길이 없었다**(`src/adapters/executeEngines.ts`).
+        조각은 이 항목에서 다 만들었다 — 규격 어댑터(위)·조립기(위)·복원력(위)·복구 프로브(위).
+        그런데 `createOpenAiCompatEngines`·`assembleEngineSet`·`createResilientCaller`·
+        `withResilientEngines` 를 부르는 곳이 저장소 전체에서 **자기 테스트뿐**이었다. 그래서
+        `channels/runtime.ts` 의 인텐트·지식 배선 주석이 약속한 **"엔진 헬스 샘플은 여기서 만들지
+        않는다 — 엔진 상태는 `adapters/resilience.ts` 가 이미 적는다"가 참이 아니었다**: 그 적는
+        자리를 만드는 코드가 0줄이므로, 헬스 레지스트리에 들어오는 샘플은 채널이 `reportHealth` 로
+        올리는 것뿐이고 채널이 올리는 것은 대개 자기 매체다. **LLM 이 전부 타임아웃인 상태에서도
+        §9.3 판정은 `normal`** 이고, 증상은 장애가 아니라 **턴마다 개별적으로 실패하는 통화**다
+        (고객은 "말을 못 알아듣는다"로 겪고, 폴백은 걸리지 않으며 대시보드는 초록이다. 그리고
+        폴백이 걸리지 않았으므로 복구 프로브도 돌 일이 없다 — 위 두 작업이 함께 비어 있던 셈이다).
+        손으로 꿰면 빠지는 것은 정해져 있고 **열 개 중 하나도 예외를 던지지 않는다**:
+        (가) 기록 미배선(위 문단) · (나) **시계 없이 기록만 배선** — `healthFromOutcome` 은 `now`
+        가 없으면 샘플을 **만들지 않으므로**(§13-3) 한 건도 남지 않는데 배선도에는 "엔진 상태를
+        보고 있다"로 남는다. 그래서 둘을 따로 받지 않고 **한 벌로** 받는다 · (다) **세트 간 활성화
+        혼재** — 주 세트 `dry_run` + 대체 `live` 면 주 세트의 실패는 `E_APPROVAL_REQUIRED` 이고
+        그 판정은 `failover: false`·`attributable: false` 다: 대체는 **영원히 호출되지 않고 샘플도
+        남지 않는다**(장애 그래프에 점 하나 찍히지 않는다) · (라) **dry_run 샘플을 실관측으로
+        기록** — 미리 만들어진 조각(sim 등)은 `dry_run` 에서도 **성공**하므로 켜지지도 않은 엔진이
+        `up` 으로 보고된다. 그래서 `dry_run` 에서는 기록을 배선하지 않고 대신 `approvalPending` 을
+        돌려준다(런타임이 readiness 에 그대로 싣는다 — 호스트가 빠뜨리면 영구 `unknown` 으로 남아
+        대시보드가 상시 노랑이 되고, 그러면 진짜 저하를 아무도 보지 않는다) · (마) **`allowOverseas`
+        를 네 곳에서 선언** — 조립기·호출기·인텐트 분류기·임베딩이 각자 받는다. 한 곳만 `true` 면
+        §10.3 가드가 **그 경로만** 비껴가고, 비껴간 경로로 나가는 것이 하필 고객 발화와 지식
+        원문이다. 한 값을 넷에 같이 주입한다(§2) · (바) **대체 세트에만 있는 임베딩** —
+        `withResilientEngines` 는 슬롯별로 후보를 고르므로 그 임베딩이 **주 경로**가 된다. 모델이
+        다르면 차원이 다르고, 차원이 섞인 색인은 거부되지 않고 **유사도만 무의미해진다**(사고가
+        예외가 아니라 그럴듯한 검색 결과로 온다) · (사) **사용량 경로 단절** — 복원력 래퍼의
+        `EngineSet` 에는 `lastUsage` 가 없다(§6.2 인터페이스에 없는 것이 맞다). 조각을 들고 있는
+        것은 이 실행기뿐이므로 §11.2 근거를 여기서 유지하되 **합산하지 않는다**(같은 키를 둘이 내면
+        빼고 `conflicts` 에 적는다 — 이중 계상은 대사에서 과다청구로 나타난다) · (아) 복원력 없이
+        기록만(기록은 호출기 하나를 지난다) · (자) 대체를 선언했는데 호출기가 없다(첫 세트만
+        쓰인다) · (차) **경로 없는 슬롯** — 중립 HTTP 조각은 `paths` 를 주지 않은 슬롯의 어댑터도
+        만든다(경로 확인이 호출 시점이다). 그 슬롯은 기동 시점에 멀쩡하고 **첫 통화에서**
+        `E_CONFIG` 로 터지는데, `E_CONFIG` 는 우리 설정 오류이므로 대체로도 가려지지 않는다.
+        **런타임 배선**(`channels/runtime.ts` 의 `engines`): 레지스트리·시계를 **호스트에게서 받지
+        않는다** — 런타임이 자기 것을 넘긴다(받으면 엔진 샘플이 통화가 올린 샘플과 다른 레지스트리에
+        쌓이고 폴백 판정은 끝까지 그것을 보지 못한다 — 복구 프로브에서 이미 겪은 실패다). 선언의
+        테넌트가 다르면 **조용히 덮어쓰지 않고 거부**한다(§11.1). `intent` 를 함께 선언하면 분류기가
+        **복원력·헬스가 붙은 LLM** 으로 만들어져 꿰이고, `intent.classifier` 를 같이 주면 거부한다 —
+        호스트가 조각에서 직접 만든 분류기는 재시도·대체·§9.3 어디에도 닿지 않으므로 **분류가 전부
+        타임아웃인데 폴백은 걸리지 않고 대시보드는 다른 엔진을 보고 있는** 상태가 된다(§2). 미배선
+        시 종전과 완전히 같고 `W_ENGINES_UNBOUND` 로 드러낸다.
+        **계획 확인 실행기**(`src/adapters/enginePlan.ts` + `scripts/engine-plan.mjs`): 기동 시점이
+        곧 **첫 고객이 회선에 들어온 직후**였다. 그 전에 확인하려면 Core 를 TS 로 import 해 직접
+        불러 보는 수밖에 없었고 그건 운영·CI 가 할 일이 아니다. 그리고 활성화를 켜는 변경은
+        **한 글자**(`dry_run`→`live`)이면서 결과는 실고객 발화가 외부로 나가는 것인데, 리뷰에서
+        가장 눈에 띄지 않는 종류의 변경이다. CLI 한 줄로 줄였다 — **엔진을 부르지 않고** 조립·검증
+        결과만 적는다. `--expect-activation` 을 빼면 **판정보류(2)** 다(기대값 없이 통과시키면
+        실수로 `live` 가 된 선언이 초록으로 지나간다, §13-3) · 모듈·선언을 못 찾으면 판정보류
+        (빈 모듈을 "선언이 비었다"로 읽지 않는다) · 활성화가 기대와 다르면 실패(1) ·
+        **설정 원문·비밀값 참조 이름을 출력하지 않는다**(출력은 기동 결과에서 나온 사실뿐이고,
+        오류 문장은 개인정보·자격증명·배포 경로를 지운 뒤 남는다, §10.3 — 세 규칙 모두 기존 것을
+        그대로 쓴다: 경로 축약을 `obs/errorMonitor.ts` 에서 export 해 `channels/harness.ts` 의
+        복사본을 없앴다, §2). 한계(`limitsKo`)는 실패가 아니라 **그 선언으로 확인되지 않는 범위**라
+        게이트를 막지 않고 적는다.
+        **2026-10-13 실측(도구 출력 그대로)**: `엔진 기동 계획: 통과` ·
+        `활성화 dry_run(실호출 없음) · residency onprem` · `후보 onprem` ·
+        `stt=whisper-onprem-stt@audio(onprem)` · `llm=sllm-onprem-llm@text(onprem)` ·
+        `§9.3 컴포넌트: stt, tts, llm, rag` · `승인 전(샘플을 읽지 않음): stt, tts, llm, rag [승인 필요]`.
+        **변이 검증(도구 출력 그대로)**: dry_run 샘플을 기록하면 2건 실패 · 세트 간 활성화 혼재를
+        허용하면 1건 실패 · 대체 전용 슬롯을 허용하면 1건 실패 · 복원력 없이 기록을 배선하면
+        1건 실패 · 선언 테넌트를 조용히 덮어쓰면 1건 실패 · 분류기 이중 출처를 허용하면 1건 실패 ·
+        활성화 기대값 누락을 통과로 보면 2건 실패 · 모듈 로드 실패를 통과로 보면 1건 실패 —
+        전부 원본에서는 통과한다.
+        실호출 없음(가짜 어댑터·`dry_run` 규격 어댑터·실제 실행기 프로세스로만 검증).
+        실엔진 연결과 `live` 전환은 여전히 **[승인 필요]**.
+        **남은 것은 사람이 정하는 값이다**: 엔진 주소·모델 id·타임아웃·재시도 횟수·대기 곡선은
+        계약·운영 합의값이라 Core 가 기본값을 만들지 않고(§13-3), **국외이전 허용 여부
+        (`allowOverseas`)는 테넌트 계약 사항**이며, 실키(`apiKeyEnv` 가 가리키는 값)와
+        `approvalRef` 는 **[승인 필요]** 다. 대체 엔진을 둘 것인가(그리고 복구된 호출을 `up` 으로
+        적을 것인가 `degraded` 로 적을 것인가)도 테넌트 판단이다 — `degraded` 하나가 음성 채널의
+        `speech_recognition` 을 끈다.
+        근거: `src/adapters/executeEngines.ts` · `tests/adapters.executeEngines.test.mjs`(41건) ·
+        `src/adapters/enginePlan.ts` · `scripts/engine-plan.mjs` · `fixtures/reference-engines.mjs` ·
+        `tests/adapters.enginePlan.test.mjs`(16건) · `src/channels/runtime.ts`(`engines`·`engines()`·
+        readiness `approvalPending` 합침) · `src/channels/contract.ts`(`W_ENGINES_UNBOUND`) ·
+        `tests/channels.runtime.test.mjs`(11건 추가, 총 207건) ·
+        `src/obs/errorMonitor.ts`(`shortenPaths` export) · CI `engine plan runner (self-check)` 단계 ·
+        `API.md` 반영
 - [ ] 채널 어댑터 계약 실적용 — Callbot·챗봇·D-ARS가 Core를 실제로 소비하도록 연결
       · Core 측 완료(13): **엔진과 판정 사이의 빈 자리(2026-09-18)** — 어댑터(§6.2)는 네 종류 다 만들었고
         조립기·복원력·복구 프로브까지 붙였는데, 정작 **어댑터의 출력을 판정 모듈의 입력으로 바꾸는 자리가
@@ -1949,6 +2029,16 @@
         `tests/channels.runtime.test.mjs`(5건 추가, 총 196건) ·
         `scripts/channel-bridge.mjs` · `fixtures/reference-core-observed.mjs` ·
         `API.md`·`MONITORING_GUIDE.md` 반영
+      · Core 측 완료(40): **엔진은 아직 한 번도 기동된 적이 없다(2026-10-13)** — (13)이 엔진과
+        판정 사이를 메웠다면 이번은 **설정과 엔진 사이**다. 규격 어댑터·조립기·복원력·복구 프로브를
+        다 만들어 놓고도 그것들을 부르는 코드가 테스트뿐이라, 위 인텐트·지식 배선 주석이 약속한
+        "엔진 상태는 `adapters/resilience.ts` 가 이미 적는다"가 **참이 아니었다**. 결과는 (37)(38)과
+        같은 계열의 침묵이다 — 엔진이 전부 죽어도 §9.3 판정은 `normal` 이고 통화만 턴마다
+        개별적으로 실패한다. 채널 저장소 3곳이 이 조립을 각자 꿰면 **각자 다르게 틀린다**(§2).
+        자세한 내용과 변이 검증은 위 **실엔진 어댑터** 항목의 엔진 기동 실행기(2026-10-13) 참조.
+        근거: `src/adapters/executeEngines.ts` · `src/adapters/enginePlan.ts` ·
+        `scripts/engine-plan.mjs` · `src/channels/runtime.ts`(`engines`) ·
+        `src/channels/contract.ts`(`W_ENGINES_UNBOUND`) · `API.md` 반영
       · 남은 것: **Callbot 저장소 쪽 배선** — 코드는 훅마다 한 줄(README 참조)이며 더 쓸 것이 없다.
         남은 것은 저장소 결정 사항이다: 현행 LLM 툴(welfare_apply 등)과 Core 시나리오의 역할 분담
         (어느 쪽이 화면 노드를 밀 것인가)·실운영 Core 모듈·Flow id 를 **사람이 정해야 한다**,

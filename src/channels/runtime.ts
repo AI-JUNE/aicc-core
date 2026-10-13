@@ -53,6 +53,8 @@ import { validateIntentCatalog, validateIntentPolicy } from '../nlu/intent.ts';
 import type { FlowLookup, IntentRoutingTable } from '../nlu/intentRouting.ts';
 import { intentRoutingOk, validateIntentRouting } from '../nlu/intentRouting.ts';
 import type { ClassifyStatus, IntentClassifier } from '../nlu/llmClassifier.ts';
+import type { EngineRuntime, EngineStartupDeclaration } from '../adapters/executeEngines.ts';
+import { startEngines } from '../adapters/executeEngines.ts';
 import type { PendingClarify } from '../nlu/executeIntentEntry.ts';
 import { resolveIntentEntry } from '../nlu/executeIntentEntry.ts';
 import type { RetrievalPolicy } from '../knowledge/rag.ts';
@@ -250,8 +252,15 @@ export interface IntentBinding {
   catalog: IntentCatalog;
   policy: IntentPolicy;
   table: IntentRoutingTable;
-  /** 발화 → 후보(§6.2). 주입이다 — Core 는 엔진을 모르고, 실호출 승인도 호스트 쪽에 있다 **[승인 필요]**. */
-  classifier: IntentClassifier;
+  /**
+   * 발화 → 후보(§6.2). 주입이다 — Core 는 엔진을 모르고, 실호출 승인도 호스트 쪽에 있다 **[승인 필요]**.
+   *
+   * `engines`(엔진 기동 선언)에 `intent` 를 선언했으면 **여기를 비운다** — 그러면 Core 가
+   * 복원력·헬스 기록이 붙은 LLM 으로 분류기를 만들어 꿴다. 둘 다 주면 **거부한다**: 호스트가
+   * 조각에서 직접 만든 분류기는 재시도·대체·§9.3 샘플 어디에도 닿지 않으므로, 분류가 전부
+   * 타임아웃인데 폴백은 걸리지 않고 대시보드는 다른 엔진을 보고 있는 상태가 된다(§2·§9.3).
+   */
+  classifier?: IntentClassifier;
   /** 명확화 질문 문구. Core 는 문안을 만들지 않는다(§13-3) — 없으면 배선 자체를 거부한다. */
   clarifyPrompt: string;
   /**
@@ -490,6 +499,25 @@ export interface ConversationCoreOptions {
    * 영구 상담사 직결이고 그렇지 않은 테넌트는 **증거 없이** AI 를 재개한다.
    */
   recovery?: RecoveryBinding;
+  /**
+   * 엔진 기동(§6.2·§9.3·§10.3). **주지 않으면 종전과 완전히 같다**(§13-3) — Core 는 엔진을
+   * 모르고, 헬스 레지스트리에는 채널이 `reportHealth` 로 올리는 샘플만 들어온다.
+   *
+   * 이 배선이 없는 동안 `adapters/engineSet.ts`·`adapters/resilience.ts` 는 저장소에 있으나
+   * **아무도 부르지 않는** 상태였고, 그래서 위 인텐트·지식 배선 주석이 약속한
+   * "엔진 상태는 `adapters/resilience.ts` 가 이미 적는다"가 **참이 아니었다**. 증상은 장애로
+   * 보이지 않는다: LLM 이 전부 타임아웃이어도 §9.3 판정은 `normal` 이고, 통화는 턴마다
+   * 개별적으로 실패하며(고객은 "말을 못 알아듣는다"로 겪는다) 폴백은 걸리지 않는다.
+   *
+   * **레지스트리·시계를 선언에 담지 않는다** — 런타임이 자기 것을 넘긴다. 호스트가 주장하면
+   * 엔진 샘플이 통화가 올린 샘플과 다른 레지스트리에 쌓이고, 그러면 폴백 판정은 끝까지 그
+   * 샘플을 보지 못한다(복구 프로브에서 이미 겪은 실패다). 테넌트가 어긋나면 **조용히 덮어쓰지
+   * 않고 거부**한다(§11.1).
+   *
+   * 실엔진 연결·live 전환은 **[승인 필요]** — 기본 `dry_run` 이며 그 상태에서는 헬스 샘플도
+   * 남기지 않는다(dry_run 성공은 실엔진 관측이 아니다).
+   */
+  engines?: EngineStartupDeclaration;
   now?: () => string;
   newInteractionId?: (req: ChannelSessionRequest) => string;
   onPublish?: (results: PublishResult[]) => void;
@@ -571,6 +599,15 @@ export interface ConversationCore extends ConversationCorePort {
   runRecoveryProbes(nowIso?: string): Promise<RecoveryRunReport | undefined>;
   /** 컴포넌트별 마지막 확인 시각. 배선이 없으면 `undefined`. */
   recoveryLastRunAt(component: ComponentId): string | undefined;
+  /**
+   * 기동된 엔진(§6.2). 배선이 없으면 `undefined` — **빈 객체를 돌려주지 않는다**("엔진이
+   * 없다"와 "조립했는데 비었다"는 다르다, §13-3).
+   *
+   * 호스트는 이것으로 지식 인제스트(`embedder`)·검토용 서술(`describeKo`)·사용량 근거
+   * (`lastUsage`)를 **같은 엔진 인스턴스에서** 얻는다. 따로 기동하면 같은 테넌트에 엔진이
+   * 두 벌 서고, 그 둘은 헬스·사용량을 각자 적는다(§2·§11.2).
+   */
+  engines(): EngineRuntime | undefined;
 }
 
 function stubState(flowId: string, flowVersion: number, channel: ChannelKind, status: RunStatus): FlowState {
@@ -872,6 +909,35 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
   /** 등록된 채널들이 올리는 컴포넌트의 합집합. readiness·복구 프로브가 **같은 목록**을 본다(§2). */
   const watched = new Set<ComponentId>([...declared.values()].flatMap((set) => [...set]));
 
+  // 엔진 기동(§6.2·§9.3). **레지스트리와 시계를 호스트에게서 받지 않는다** — 런타임의 것을
+  // 그대로 넘긴다(ConversationCoreOptions.engines 주석). 테넌트가 어긋나면 거부한다(§11.1).
+  let engineRuntime: EngineRuntime | undefined;
+  if (opts.engines !== undefined) {
+    const decl = opts.engines;
+    const declScope = decl.scope;
+    if (declScope === undefined || declScope.tenantId !== opts.scope.tenantId
+        || (declScope.workspaceId ?? undefined) !== (opts.scope.workspaceId ?? undefined)) {
+      // 조용히 덮어쓰지 않는다: 다른 테넌트의 엔진 선언으로 기동되면 그 테넌트의 계약(국외이전·
+      // 모델·요율)이 이 테넌트의 통화에 적용되고, 그 사실은 어디에도 예외로 나타나지 않는다.
+      throw new Error('엔진 기동 거부: 선언의 테넌트가 런타임과 다릅니다 — 다른 테넌트의 엔진 계약으로 통화를 처리할 수 없습니다 (설계서 §11.1)');
+    }
+    engineRuntime = startEngines(decl, {
+      // 통화가 올린 샘플과 **같은 레지스트리**다. 엔진 실패가 여기 들어와야 §9.3 판정이 본다.
+      record: (sample) => { opts.health.record(sample); },
+      // 낡음 판정이 폴백과 같은 기준이어야 하므로 런타임의 시계 하나다(§2).
+      now,
+    });
+  } else {
+    // 종전 동작이므로 막지 않는다. 다만 이 상태에서 엔진이 죽으면 §9.3 가 그 사실을 영영 모른다 —
+    // 채널이 매체(telephony·messaging)만 올리고 있으면 인지 계층은 관측되지 않는 셈이다.
+    warnings.push({
+      code: 'W_ENGINES_UNBOUND',
+      severity: 'warning',
+      messageKo: '엔진이 기동 선언으로 배선되지 않았습니다 — 엔진 실패가 §9.3 헬스 레지스트리에 닿지 않아 '
+        + '엔진이 전부 죽은 상태에서도 폴백 판정은 normal 입니다 (설계서 §9.3·§6.2)',
+    });
+  }
+
   // 복구 프로브 배선(§9.3). 레지스트리·정책·시계·감시 목록은 **Core 가 강제한다**(RecoveryBinding 주석).
   let recovery: RecoveryProbeRunner | undefined;
   if (opts.recovery !== undefined) {
@@ -910,9 +976,18 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
   // 인텐트 배선도 **배포 시점에** 거른다. 통화 중에 "카탈로그에 없는 인텐트"로 터지면 이미 늦고,
   // 형태 오류를 통과로 두면 오타 하나로 인텐트 진입이 조용히 꺼진 채 "적용했다"로 남는다
   // (라우팅·전환·요청 제한기와 같은 규칙). 라우팅 표 검증은 `validateIntentRouting` 하나만 쓴다(§2).
+  /**
+   * 인텐트 분류기 출처는 **하나**다(§2). 엔진 기동이 분류기를 만들었으면 그것을 쓰고,
+   * 호스트가 직접 주입했으면 그것을 쓴다 — 둘 다면 거부한다(IntentBinding.classifier 주석).
+   */
+  let intentClassifier: IntentClassifier | undefined;
   if (opts.intent !== undefined) {
     const it = opts.intent;
-    if (!it.classifier || typeof it.classifier.classify !== 'function') {
+    if (it.classifier !== undefined && engineRuntime?.classifier !== undefined) {
+      throw new Error('인텐트 배선 거부: 분류기가 두 곳에서 옵니다(engines.intent + intent.classifier) — 호스트가 만든 분류기는 재시도·대체·§9.3 샘플에 닿지 않습니다 (설계서 §2·§9.3)');
+    }
+    intentClassifier = it.classifier ?? engineRuntime?.classifier;
+    if (!intentClassifier || typeof intentClassifier.classify !== 'function') {
       throw new Error('인텐트 배선 거부: 분류기(classifier)가 없습니다 — Core 는 엔진을 직접 부르지 않습니다 (설계서 §6.2)');
     }
     if (typeof it.clarifyPrompt !== 'string' || it.clarifyPrompt.trim() === '') {
@@ -1529,7 +1604,8 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
         catalog: binding.catalog, policy: binding.policy, table: binding.table,
         // 인텐트로 갈아타는 시나리오도 세션 시작과 **같은 경로**로 고른다 — 여기만 빠뜨리면
         // 시작은 배포본인데 인텐트가 고른 시나리오는 미배포 편집본이 된다.
-        flows: channelFlows(rec.state.channel), classifier: binding.classifier, clarifyPrompt: binding.clarifyPrompt,
+        // 분류기는 배선 시점에 출처가 하나로 정해졌다(위 `intentClassifier`) — 여기서 다시 고르지 않는다.
+        flows: channelFlows(rec.state.channel), classifier: intentClassifier as IntentClassifier, clarifyPrompt: binding.clarifyPrompt,
       },
       {
         scope: rec.scope, channel: rec.state.channel, text,
@@ -2229,6 +2305,9 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       : recovery.runDue(nowIso)),
     recoveryLastRunAt: (component) => recovery?.lastRunAt(component),
 
+    // 배선이 없으면 `undefined` — 빈 객체는 "조립했는데 비었다"로 읽힌다(§13-3).
+    engines: () => engineRuntime,
+
     readiness: (req) => runReadiness({
       timeoutMs: req.timeoutMs,
       ...(req.probes !== undefined ? { probes: req.probes } : {}),
@@ -2246,7 +2325,17 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
         // 대시보드가 상시 노랑이 되고, 그러면 진짜 저하를 아무도 보지 않는다.
         components: [...watched],
         channels: [...new Set([...regs.values()].map((reg) => reg.port.capabilities.channel))],
-        ...(req.approvalPending !== undefined ? { approvalPending: req.approvalPending } : {}),
+        // 활성화 전 컴포넌트는 **Core 가 아는 것부터** 싣는다(§13-3). 호스트가 빠뜨리면
+        // dry_run 엔진이 영구 `unknown` 으로 남아 대시보드가 상시 노랑이 되고, 그러면
+        // 진짜 저하를 아무도 보지 않는다. 호스트 선언은 지우지 않고 합친다.
+        ...(req.approvalPending !== undefined || engineRuntime !== undefined
+          ? {
+            approvalPending: [...new Set([
+              ...(req.approvalPending ?? []),
+              ...(engineRuntime?.approvalPending ?? []),
+            ])],
+          }
+          : {}),
       },
     }),
 

@@ -18,7 +18,7 @@
 //  - 임계값·예산 기본값을 만들어 넣지 않는다(§13-3). timeoutMs 는 준 경우에만 검사한다.
 import type { Flow } from '../flow/types.ts';
 import { maskPii } from '../core/policyGuard.ts';
-import { stripSecrets } from '../obs/errorMonitor.ts';
+import { shortenPaths, stripSecrets } from '../obs/errorMonitor.ts';
 import type { ChannelAdapterId, ChannelPort, ChannelRegistration } from './contract.ts';
 import { ADAPTER_CHANNEL } from './contract.ts';
 import type { ConformanceReport } from './conformance.ts';
@@ -74,11 +74,8 @@ const KNOWN_ADAPTERS: readonly ChannelAdapterId[] = ['callbot', 'chatbot', 'dars
  */
 export function safeReasonText(e: unknown): string {
   const raw = e instanceof Error ? e.message : String(e);
-  const shortened = raw.replace(
-    /(?:file:\/\/)?(?:[A-Za-z]:)?[\\/](?:[^\s()\\/:]+[\\/]){2,}([^\s()\\/:]+)/g,
-    '…/$1',
-  );
-  return maskPii(stripSecrets(shortened)).text;
+  // 경로 축약 규칙은 `obs/errorMonitor.ts` 하나다(§2) — 두 곳에 적으면 한쪽만 고쳐진다.
+  return maskPii(stripSecrets(shortenPaths(raw))).text;
 }
 
 function isAdapterId(v: unknown): v is ChannelAdapterId {
