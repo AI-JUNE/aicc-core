@@ -49,6 +49,16 @@
 //  (차) **경로 없는 슬롯.** 중립 HTTP 조각은 `paths` 를 주지 않은 슬롯의 어댑터도 **만든다**
 //       (경로 확인이 호출 시점이다). 그러면 그 슬롯은 기동 시점에 멀쩡하고 **첫 통화에서**
 //       `E_CONFIG` 로 터지는데, `E_CONFIG` 는 "우리 설정이 틀렸다"이므로 대체로 가려지지도 않는다.
+//  (카) **복구 프로브를 복원력이 붙은 세트로 만든다.** 아래 `probes` 선언이 받는 것은 **조립만 된
+//       주 세트**다. 호스트가 `runtime.engines`(복원력 붙은 묶음)로 프로브를 만들면 대체 엔진이
+//       응답한 결과가 주 엔진의 `up` 으로 기록되고, 폴백이 풀린 뒤 전 통화가 대체 경로로 간다 —
+//       주 엔진이 죽은 사실은 **영구히 관측되지 않는다**. 고를 일이 없게 여기서 만든다
+//       (자세한 사고 목록은 `engineProbe.ts` 머리말).
+//  (타) **프로브 사용량이 과금 근거에 섞인다.** 어댑터의 `lastUsage()` 는 **마지막 호출**의 실측을
+//       들고 있고 프로브는 턴과 같은 인스턴스를 쓴다. 그래서 엔진을 부르지 않은 턴(DTMF·타임아웃)이
+//       `lastUsage()` 를 읽으면 **직전 프로브의 사용량이 그 통화의 과금 근거로 실린다** — 금액이
+//       그럴듯해 아무도 눈치채지 못하고 차이는 대사에서 '미설명'으로 돌아온다(§11.2). 프로브
+//       호출 **앞뒤**의 수집값을 비교해 그 구간에 생긴 값은 내보내지 않는다(0 이 아니라 모른다).
 //
 // 이 파일이 **하지 않는 것**:
 //  - 엔진을 부르지 않는다. 기동(조립·검증·배선)뿐이고, 실호출은 상위 계층이 한다.
@@ -71,6 +81,8 @@ import type { OpenAiAudioConfig } from './openaiAudio.ts';
 import { createOpenAiAudioEngines } from './openaiAudio.ts';
 import type { OpenAiCompatConfig } from './openaiCompat.ts';
 import { createOpenAiCompatEngines } from './openaiCompat.ts';
+import type { EngineProbeSamples, EngineProbeSet, ProbeCallPhase } from './engineProbe.ts';
+import { createEngineProbes } from './engineProbe.ts';
 import type { ComponentId, HealthSample } from '../ops/fallback.ts';
 import type { TenantScope } from '../core/tenancy.ts';
 import { assertTenantScope } from '../core/tenancy.ts';
@@ -153,6 +165,18 @@ export interface EngineStartupDeclaration {
     batchSize?: number;
     timeoutMs?: number;
   };
+  /**
+   * 복구 프로브(§9.3·(카)). 선언하면 **조립만 된 주 세트**로 `HealthProbe` 를 만든다 —
+   * 복원력이 붙은 묶음으로 만들면 대체의 응답이 주 엔진의 `up` 이 된다.
+   *
+   * 확인용 합성 입력은 **선언 사항**이다(§13-3·§10.3): 오디오·문장을 Core 가 만들면 포맷 차이가
+   * 영구 `down` 으로 보고되고, 고객 발화를 재사용하면 녹취가 확인 주기마다 엔진으로 나간다.
+   * 선언하지 않은 슬롯은 프로브를 만들지 않고 그 사실을 `probes.skipped` 에 적는다.
+   *
+   * 간격·제한 시간은 여기 두지 않는다 — 러너(`ops/recoveryProbe.ts`)의 `ProbeSchedule` 이
+   * 선언 사항이고, 그 값은 운영 합의값이다(§13-3).
+   */
+  probes?: { samples: EngineProbeSamples };
 }
 
 /**
@@ -190,7 +214,19 @@ export interface EngineRuntime {
   /** 선언했을 때만 만든다. 없으면 **필드 자체가 없다**(빈 객체는 "배선했다"로 읽힌다). */
   classifier?: IntentClassifier;
   embedder?: Embedder;
-  /** 조각들의 실측 사용량(§11.2). 아무 조각도 주지 않으면 `undefined`. */
+  /**
+   * 복구 프로브(§9.3). 선언했을 때만 만든다. `probes.probes` 가 **빈 배열일 수 있다** —
+   * 승인 전이거나 합성 입력이 없으면 만들지 않으며, 그 사유는 `probes.skipped` 에 있다
+   * (빈 배열은 "확인하지 않는다"는 사실이고 "확인했고 정상"이 아니다).
+   */
+  probes?: EngineProbeSet;
+  /**
+   * 조각들의 실측 사용량(§11.2). 아무 조각도 주지 않으면 `undefined`.
+   *
+   * **직전 프로브 호출이 남긴 값은 돌려주지 않는다**((타)) — 프로브가 어댑터의 `lastUsage()` 를
+   * 덮은 뒤 실제 호출이 아직 없었으면 `undefined` 다. 0 으로 적지 않는다: 누락과 0 을 같게
+   * 적는 것이 정산 분쟁의 출발점이다(§13-3).
+   */
   lastUsage(): UsageCollection | undefined;
   /** 사람이 먼저 읽을 한 줄. 지어낸 수치 없이 사실만 적는다(§13-3). */
   describeKo: string;
@@ -361,6 +397,11 @@ export function startEngines(decl: EngineStartupDeclaration, wiring?: EngineHeal
   if (wiring !== undefined && (typeof wiring.record !== 'function' || typeof wiring.now !== 'function')) {
     fail('헬스 배선에는 record 와 now 가 **둘 다** 있어야 한다 — 시계가 없으면 샘플 자체가 만들어지지 않는다(§13-3)');
   }
+  if (decl.probes !== undefined) {
+    if (!decl.probes.samples || typeof decl.probes.samples !== 'object') {
+      fail('복구 프로브를 선언하면서 확인용 합성 입력(samples)을 주지 않았다 — Core 는 오디오·문장을 만들지 않는다(§13-3·§10.3)');
+    }
+  }
 
   // 활성화 전에는 기록하지 않는다((라)). sim 같은 미리 만들어진 조각은 dry_run 에서도 성공하므로,
   // 그 성공을 적으면 켜지지도 않은 엔진이 up 으로 보고된다.
@@ -408,6 +449,28 @@ export function startEngines(decl: EngineStartupDeclaration, wiring?: EngineHeal
 
   const allParts = assembled.flatMap((a) => a.parts);
 
+  // (타) 프로브 사용량 격리. 프로브 호출 **앞뒤**의 수집값을 비교해, 그 구간에 생긴 값은
+  // 과금 근거로 내보내지 않는다. 비교로 판정하는 이유: 프로브가 사용량을 남기지 않는 어댑터까지
+  // 막으면 **직전 턴의 실측이 조용히 사라진다**(누락과 0 을 같게 적지 않는 것과 같은 규칙).
+  const usageSnapshot = (): string => JSON.stringify(collectPartUsage(allParts) ?? null);
+  let beforeProbe: string | undefined;
+  let probeTainted: string | undefined;
+  const onProbeCall = (phase: ProbeCallPhase): void => {
+    if (phase === 'before') { beforeProbe = usageSnapshot(); return; }
+    const after = usageSnapshot();
+    probeTainted = beforeProbe !== undefined && after !== beforeProbe ? after : undefined;
+    beforeProbe = undefined;
+  };
+  const lastUsage = (): UsageCollection | undefined => {
+    const cur = collectPartUsage(allParts);
+    if (probeTainted !== undefined) {
+      // 값이 그대로라면 **아직 프로브의 것**이다. 실제 호출이 덮은 뒤에는 그대로 돌려준다.
+      if (usageSnapshot() === probeTainted) return undefined;
+      probeTainted = undefined;
+    }
+    return cur;
+  };
+
   const runtime: EngineRuntime = {
     contractVersion: ENGINE_STARTUP_CONTRACT_VERSION,
     engines,
@@ -419,7 +482,7 @@ export function startEngines(decl: EngineStartupDeclaration, wiring?: EngineHeal
     candidates: assembled.map((a) => a.name),
     origins: primary.set.origins,
     healthRecorded: recording,
-    lastUsage: () => collectPartUsage(allParts),
+    lastUsage,
     describeKo: maskPii(
       `${describeEngineSet(primary.set)} · 후보 ${assembled.map((a) => a.name).join('>')}`
       + ` · 헬스기록 ${recording ? '배선' : '없음'}`,
@@ -452,6 +515,22 @@ export function startEngines(decl: EngineStartupDeclaration, wiring?: EngineHeal
       ...(decl.knowledge.batchSize !== undefined ? { batchSize: decl.knowledge.batchSize } : {}),
       ...(decl.knowledge.timeoutMs !== undefined ? { timeoutMs: decl.knowledge.timeoutMs } : {}),
     });
+  }
+  if (decl.probes !== undefined) {
+    // 프로브는 **조립만 된 주 세트**로 만든다((카)) — `engines` 는 복원력이 붙은 묶음이다.
+    const w = wiring;
+    runtime.probes = createEngineProbes({
+      engines: primary.set.engines,
+      activation,
+      // 시계는 **런타임 배선 하나**다(호스트가 주장하지 않는다). 없으면 프로브를 만들지 않는다 —
+      // 시각 없는 샘플은 러너의 규약 검사를 지나지 못해 한 건도 기록되지 않는데 배선도에는
+      // "프로브 있음"으로 남는다. 선언 검토 경로(`enginePlan`)가 바로 이 상태로 기동한다.
+      ...(w !== undefined ? { now: () => w.now() } : {}),
+      samples: decl.probes.samples,
+      candidate: primary.name,
+      onProbeCall,
+    });
+    for (const limit of runtime.probes.limitsKo) limitsKo.push(limit);
   }
 
   return runtime;

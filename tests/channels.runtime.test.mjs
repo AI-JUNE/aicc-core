@@ -2967,3 +2967,125 @@ test('엔진 기동 선언이 성립하지 않으면 런타임 생성 자체가 
     /allowOverseas/,
   );
 });
+
+// ── 엔진 복구 프로브 배선(§9.3) ──────────────────────────────────────────────
+//
+// (38)이 러너를, 위 절이 기동을 배선했는데 그 사이의 `HealthProbe` **구현이 0건**이었다.
+// 엔진 컴포넌트가 `down` 이 되면 통화가 내려가 엔진 호출이 멈추고, 새 샘플을 만들 주체는
+// 프로브뿐인데 그 프로브가 없다 — 폴백에서 빠져나오는 길이 다시 막힌다.
+
+const ENGINE_PROBE_SAMPLES = {
+  stt: { data: new Uint8Array([1, 2]), mime: 'audio/wav' },
+  tts: { text: '점검용 문장입니다', voice: 'v1' },
+  llm: [{ role: 'user', content: '점검' }],
+};
+
+const engineDeclWithProbes = (activation = 'live') => engineDecl({
+  activation,
+  over: { probes: { samples: ENGINE_PROBE_SAMPLES } },
+});
+
+test('엔진 프로브를 선언하면 러너가 그것을 돌려 같은 레지스트리에 복구를 기록한다', b, async () => {
+  const { core, health } = build({
+    samples: [{ component: 'llm', state: 'down', observedAt: NOW }],
+    engines: engineDeclWithProbes(),
+    recovery: { schedules: [], engineProbes: [{ component: 'llm', intervalMs: 1000, timeoutMs: 500 }] },
+  });
+  assert.equal(core.warnings().some((i) => i.code === 'W_ENGINE_PROBES'), false);
+  const r = await core.runRecoveryProbes();
+  assert.deepEqual(r.recovered, ['llm']);
+  assert.equal(health.latest('llm').state, 'up');
+});
+
+test('엔진은 기동됐는데 엔진 컴포넌트 프로브가 없으면 첫 고객의 턴보다 먼저 드러낸다', b, () => {
+  const { core } = build({ engines: engineDecl(), recovery: recoveryBinding('telephony') });
+  const w = core.warnings().filter((i) => i.code === 'W_ENGINE_PROBES_UNBOUND');
+  assert.equal(w.length, 1);
+  assert.match(w[0].messageKo, /stt, tts, llm/);
+});
+
+test('엔진 프로브를 전부 덮으면 그 경고가 사라진다', b, () => {
+  const { core } = build({
+    engines: engineDeclWithProbes(),
+    recovery: {
+      schedules: [],
+      engineProbes: [
+        { component: 'stt', intervalMs: 1000, timeoutMs: 500 },
+        { component: 'tts', intervalMs: 1000, timeoutMs: 500 },
+        { component: 'llm', intervalMs: 1000, timeoutMs: 500 },
+      ],
+    },
+  });
+  assert.equal(core.warnings().some((i) => i.code === 'W_ENGINE_PROBES_UNBOUND'), false);
+});
+
+test('만들어지지 않은 엔진 프로브는 가짜를 끼우지 않고 사유와 함께 드러낸다(dry_run)', b, async () => {
+  const { core } = build({
+    samples: [{ component: 'llm', state: 'down', observedAt: NOW }],
+    engines: engineDeclWithProbes('dry_run'),
+    recovery: { schedules: [], engineProbes: [{ component: 'llm', intervalMs: 1000, timeoutMs: 500 }] },
+  });
+  const w = core.warnings().filter((i) => i.code === 'W_ENGINE_PROBES');
+  assert.equal(w.length, 1);
+  assert.match(w[0].messageKo, /승인 전\(dry_run\)/);
+  // 승인 전이 기본 상태이므로 **등록을 막지 않는다**. 대신 "확인할 길이 없다"가 계속 보인다.
+  const r = await core.runRecoveryProbes();
+  assert.ok(r.unprobed.includes('llm'));
+  assert.deepEqual(r.recovered, []);
+});
+
+test('엔진 프로브를 선언했는데 엔진이 미배선이면 거부한다 — 찌를 대상이 없다', b, () => {
+  assert.throws(
+    () => build({ recovery: { schedules: [], engineProbes: [{ component: 'llm', intervalMs: 1, timeoutMs: 1 }] } }),
+    /엔진이 기동 선언으로 배선되지 않았습니다/,
+  );
+});
+
+test('엔진 기동에 probes 선언이 없으면 거부한다 — 합성 입력은 Core 가 만들지 않는다(§13-3)', b, () => {
+  assert.throws(
+    () => build({
+      engines: engineDecl(),
+      recovery: { schedules: [], engineProbes: [{ component: 'llm', intervalMs: 1, timeoutMs: 1 }] },
+    }),
+    /probes 선언이 없습니다/,
+  );
+});
+
+test('engineProbes 빈 목록은 "확인하고 있다"로 읽히므로 거부한다(§13-3)', b, () => {
+  assert.throws(
+    () => build({ engines: engineDeclWithProbes(), recovery: { schedules: [], engineProbes: [] } }),
+    /engineProbes 가 빈 목록/,
+  );
+});
+
+test('엔진 프로브도 등록된 채널이 올리지 않는 컴포넌트면 거부한다 — 레지스트리 직접 쓰기를 우회시킬 수 없다', b, () => {
+  assert.throws(
+    () => build({
+      port: fakePort('chatbot'),
+      engines: engineDeclWithProbes(),
+      recovery: { schedules: [], engineProbes: [{ component: 'stt', intervalMs: 1, timeoutMs: 1 }] },
+    }),
+    /등록된 채널이 올리지 않는 컴포넌트/,
+  );
+});
+
+test('호스트 프로브와 엔진 프로브가 같은 컴포넌트면 러너가 중복으로 거부한다 — 어느 쪽이 돌았는지 보고와 어긋난다', b, () => {
+  assert.throws(
+    () => build({
+      engines: engineDeclWithProbes(),
+      recovery: { ...recoveryBinding('llm'), engineProbes: [{ component: 'llm', intervalMs: 1, timeoutMs: 1 }] },
+    }),
+    /중복 선언/,
+  );
+});
+
+test('간격·제한 시간을 주지 않은 엔진 프로브는 돌지 않고 그 사실이 보고서에 남는다(§13-3)', b, async () => {
+  const { core, health } = build({
+    samples: [{ component: 'llm', state: 'down', observedAt: NOW }],
+    engines: engineDeclWithProbes(),
+    recovery: { schedules: [], engineProbes: [{ component: 'llm' }] },
+  });
+  const r = await core.runRecoveryProbes();
+  assert.equal(r.attempts.find((a) => a.component === 'llm').skipped, 'no_interval');
+  assert.equal(health.latest('llm').state, 'down');
+});

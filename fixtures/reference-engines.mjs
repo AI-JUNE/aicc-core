@@ -47,6 +47,20 @@ export function declaration() {
     }],
     // 재시도 횟수·대기는 운영 합의값이다 — Core 가 기본값을 만들지 않는다(§13-3).
     resilience: { attemptsPerCandidate: 2, backoffMs: (seq) => seq * 200 },
+    // 복구 프로브 확인용 **합성 입력**(§9.3·§10.3). Core 는 오디오·문장을 만들지 않으므로
+    // 저장소가 선언한다 — 고객 녹취·실제 발화를 넣지 않는다(확인 주기마다 엔진으로 나간다).
+    // 개인정보 흔적이 있으면 기동 시점에 거절된다.
+    // `dry_run` 인 동안은 **프로브가 만들어지지 않는다**(dry_run 은 언제나 성공하므로 up 을
+    // 적으면 폴백이 즉시 풀린다) — 계획 출력의 `미생성 ...: not_activated` 가 그 상태다 [승인 필요].
+    probes: {
+      samples: {
+        // 2바이트는 실제 오디오가 아니다 — 저장소는 고정된 짧은 합성 샘플을 넣는다.
+        stt: { data: new Uint8Array([0, 0]), mime: 'audio/wav' },
+        tts: { text: '점검용 문장입니다.', voice: 'ko-female-1' },
+        llm: [{ role: 'user', content: '점검' }],
+        embedding: ['점검'],
+      },
+    },
   };
 }
 

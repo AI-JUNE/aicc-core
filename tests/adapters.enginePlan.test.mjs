@@ -121,6 +121,29 @@ test('출력에는 슬롯 출처·컴포넌트·승인 대기가 보이고 설�
   assert.ok(text.includes('llm=sllm-7b@text(onprem)'));
   assert.ok(text.includes('승인 전'));
   assert.ok(text.includes('(한계)'));
+  // 프로브를 선언하지 않은 런타임에는 그 줄이 아예 없다 — 0건으로 적으면 "확인 안 되고 있다"가
+  // "확인하기로 했는데 안 된다"로 읽힌다.
+  assert.ok(!text.includes('복구 프로브'), text);
+});
+
+test('복구 프로브는 선언했을 때만 적고, 0건이면 사유까지 적는다(§9.3·§13-3)', b, () => {
+  const text = m.formatEnginePlan(m.judgeEnginePlan({
+    args: m.parseEnginePlanArgs(['--declaration', './x.mjs', '--expect-activation', 'dry_run']),
+    runtime: fakeRuntime({
+      probes: { probes: [], skipped: [{ component: 'llm', slot: 'llm', reason: 'not_activated', reasonKo: '승인 전' }], limitsKo: [], describeKo: '' },
+    }),
+  }));
+  assert.ok(text.includes('복구 프로브: 0건'), text);
+  assert.ok(text.includes('미생성 llm: not_activated'), text);
+
+  const made = m.judgeEnginePlan({
+    args: m.parseEnginePlanArgs(['--declaration', './x.mjs', '--expect-activation', 'dry_run']),
+    runtime: fakeRuntime({
+      probes: { probes: [{ component: 'llm', check: async () => ({}) }], skipped: [], limitsKo: [], describeKo: '' },
+    }),
+  });
+  assert.deepEqual(made.probes, ['llm']);
+  assert.deepEqual(made.probeSkipped, []);
 });
 
 // ── 실행기(실제 프로세스) ────────────────────────────────────────────────────
@@ -130,6 +153,9 @@ test('실행기: 참조 선언은 dry_run 기대로 통과한다(종료코드 0)
   assert.equal(r.status, 0, r.stdout + r.stderr);
   assert.ok(r.stdout.includes('엔진 기동 계획: 통과'), r.stdout);
   assert.ok(r.stdout.includes('§9.3 컴포넌트'), r.stdout);
+  // 참조 선언은 프로브 합성 입력을 선언하지만 dry_run 이라 하나도 만들어지지 않는다 [승인 필요].
+  assert.ok(r.stdout.includes('복구 프로브: 0건'), r.stdout);
+  assert.ok(r.stdout.includes('미생성 stt: not_activated'), r.stdout);
   // 비밀값 참조 이름·설정 원문은 출력하지 않는다(§10.3).
   assert.ok(!r.stdout.includes('AICC_LLM_API_KEY'), r.stdout);
   assert.ok(!r.stdout.includes('baseUrl'), r.stdout);

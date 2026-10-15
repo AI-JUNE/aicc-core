@@ -532,3 +532,142 @@ test('§9.3 컴포넌트 이름은 fallback.ts 의 목록 그대로다 — 임�
   }
   assert.equal(fb.COMPONENT_TIER[r.components[r.components.length - 1]], 'L3_knowledge');
 });
+
+// ── 복구 프로브 배선((카)(타)) ────────────────────────────────────────────────
+// (38)이 러너를, (40)이 기동을 배선했는데 그 사이의 `HealthProbe` 구현이 0건이었다 —
+// 찌를 것이 없으면 폴백에서 빠져나오는 길이 없다(§9.3).
+
+const PROBE_SAMPLES = {
+  stt: { data: new Uint8Array([1, 2]), mime: 'audio/wav' },
+  tts: { text: '점검용 문장입니다', voice: 'v1' },
+  llm: [{ role: 'user', content: '점검' }],
+};
+
+const PROBE_NOW = '2026-10-15T00:00:00.000Z';
+const wiringOf = (reg) => ({ record: (s) => reg.record(s), now: () => PROBE_NOW });
+const probeOf = (r, component) => r.probes.probes.find((p) => p.component === component);
+
+/** 호출마다 실측 사용량을 갱신하는 조각. 프로브도 **같은 인스턴스**를 쓴다((타)). */
+function usagePart(source = 'u') {
+  let usage;
+  let calls = 0;
+  const llm = {
+    name: 'llm-u',
+    residency: 'onprem',
+    complete: async function* () { calls += 1; usage = { llm_completion_tokens: calls }; yield 'ok'; },
+  };
+  return {
+    kind: 'preassembled',
+    source,
+    engines: { activation: 'live', stt: sttAd('s'), tts: ttsAd('t'), llm, lastUsage: () => usage },
+  };
+}
+
+test('프로브를 선언하지 않으면 필드 자체가 없다 — 빈 객체는 "배선했다"로 읽힌다', b, () => {
+  assert.equal(m.startEngines(decl()).probes, undefined);
+});
+
+test('(카) 프로브는 조립만 된 주 세트를 찌른다 — 대체의 응답이 주 엔진의 up 이 되지 않는다', b, async () => {
+  const r = m.startEngines(decl({
+    sets: [
+      { name: 'primary', parts: [fullPart({ llm: failingLlm('llm-dead') }, 'p', 'live')] },
+      { name: 'backup', parts: [fullPart({}, 'bk', 'live')] },
+    ],
+    resilience: { attemptsPerCandidate: 1 },
+    probes: { samples: PROBE_SAMPLES },
+  }), wiringOf(memRegistry()));
+
+  // 복원력 세트는 대체로 성공한다 — 통화는 살아 있다.
+  let out = '';
+  for await (const c of r.engines.llm.complete([{ role: 'user', content: '안녕' }])) out += c;
+  assert.equal(out, '{"candidates":[]}');
+
+  // 그런데 주 엔진은 죽어 있다. 프로브가 복원력 세트를 찌르면 이 사실이 영구히 관측되지 않는다.
+  await assert.rejects(() => probeOf(r, 'llm').check(), (e) => e.code === 'E_TIMEOUT');
+});
+
+test('(타) 프로브가 남긴 사용량은 과금 근거로 나가지 않는다 — 0 이 아니라 모른다(§11.2)', b, async () => {
+  const r = m.startEngines(decl({
+    sets: [{ name: 'primary', parts: [usagePart()] }],
+    resilience: { attemptsPerCandidate: 1 },
+    probes: { samples: PROBE_SAMPLES },
+  }), wiringOf(memRegistry()));
+  assert.equal(r.lastUsage(), undefined, '호출 전에 사용량이 생겼다');
+
+  for await (const _ of r.engines.llm.complete([{ role: 'user', content: 'x' }])) { /* 소비 */ }
+  assert.deepEqual(r.lastUsage().usage, { llm_completion_tokens: 1 });
+
+  // 프로브가 어댑터의 lastUsage() 를 덮었다. 엔진을 부르지 않은 턴이 이 값을 읽으면
+  // **직전 프로브의 합성 호출이 그 통화의 과금 근거로 실린다**.
+  await probeOf(r, 'llm').check();
+  assert.equal(r.lastUsage(), undefined, '프로브 사용량이 과금 근거로 실렸다');
+  assert.equal(r.lastUsage(), undefined, '두 번째 읽기에서 빗장이 풀렸다');
+
+  // 실제 호출이 덮은 뒤에는 그대로 읽는다 — 영구히 막으면 실측이 사라진다.
+  for await (const _ of r.engines.llm.complete([{ role: 'user', content: 'y' }])) { /* 소비 */ }
+  assert.deepEqual(r.lastUsage().usage, { llm_completion_tokens: 3 });
+});
+
+test('(타) 사용량을 남기지 않는 프로브는 아무것도 막지 않는다 — 막으면 직전 턴의 실측이 사라진다', b, async () => {
+  const r = m.startEngines(decl({
+    sets: [{ name: 'primary', parts: [usagePart()] }],
+    resilience: { attemptsPerCandidate: 1 },
+    probes: { samples: PROBE_SAMPLES },
+  }), wiringOf(memRegistry()));
+  for await (const _ of r.engines.llm.complete([{ role: 'user', content: 'x' }])) { /* 소비 */ }
+  // STT 프로브는 사용량을 바꾸지 않는다(이 조각의 실측은 llm 호출에서만 생긴다).
+  await probeOf(r, 'stt').check();
+  assert.deepEqual(r.lastUsage().usage, { llm_completion_tokens: 1 }, '프로브가 실측을 지웠다');
+});
+
+test('프로브 성공은 §9.3 샘플이 되고 러너를 지나 레지스트리에 들어갈 형태다', b, async () => {
+  const r = m.startEngines(decl({
+    sets: [{ name: 'primary', parts: [fullPart({}, 'p', 'live')] }],
+    resilience: { attemptsPerCandidate: 1 },
+    probes: { samples: PROBE_SAMPLES },
+  }), wiringOf(memRegistry()));
+  const s = await probeOf(r, 'tts').check();
+  assert.deepEqual(
+    { component: s.component, state: s.state, observedAt: s.observedAt },
+    { component: 'tts', state: 'up', observedAt: PROBE_NOW },
+  );
+  assert.ok(s.detail.includes('후보 primary'));
+});
+
+test('dry_run 에서는 프로브가 만들어지지 않고 그 사실이 한계로 남는다 [승인 필요]', b, () => {
+  const r = m.startEngines(decl({
+    resilience: { attemptsPerCandidate: 1 },
+    probes: { samples: PROBE_SAMPLES },
+  }), wiringOf(memRegistry()));
+  assert.deepEqual(r.probes.probes, []);
+  assert.ok(r.probes.skipped.length > 0);
+  assert.ok(r.limitsKo.some((x) => x.includes('프로브가 하나도 없다')));
+});
+
+test('프로브를 선언하면서 합성 입력을 주지 않으면 거절한다 — Core 는 오디오·문장을 만들지 않는다(§13-3)', b, () => {
+  assertConfigError(
+    () => m.startEngines(decl({ resilience: { attemptsPerCandidate: 1 }, probes: {} }), wiringOf(memRegistry())),
+    '합성 입력(samples)',
+  );
+});
+
+test('헬스 배선이 없으면 프로브를 만들지 않고 그 사실을 적는다 — 선언 검토 경로(enginePlan)가 이 상태다', b, () => {
+  const r = m.startEngines(decl({
+    sets: [{ name: 'primary', parts: [fullPart({}, 'p', 'live')] }],
+    probes: { samples: PROBE_SAMPLES },
+  }));
+  assert.deepEqual(r.probes.probes, [], '시각 없는 샘플을 만드는 프로브가 생겼다');
+  assert.ok(r.probes.skipped.some((s) => s.reason === 'no_clock'));
+  assert.ok(r.limitsKo.some((x) => x.includes('관측 시계가 배선되지 않아')));
+});
+
+test('프로브 입력의 개인정보는 기동 시점에 거절한다 — 확인 주기마다 반복해서 나간다(§10.3)', b, () => {
+  assertConfigError(
+    () => m.startEngines(decl({
+      sets: [{ name: 'primary', parts: [fullPart({}, 'p', 'live')] }],
+      resilience: { attemptsPerCandidate: 1 },
+      probes: { samples: { ...PROBE_SAMPLES, tts: { text: '010-1234-5678 확인' } } },
+    }), wiringOf(memRegistry())),
+    '합성 샘플이어야',
+  );
+});

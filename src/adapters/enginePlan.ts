@@ -25,6 +25,7 @@
 //    그 선언으로 돌렸을 때 확인되지 않는 범위다 — 숨기지 않고 적되 게이트를 막지는 않는다.
 import type { Activation } from './http.ts';
 import type { EngineRuntime } from './executeEngines.ts';
+import type { ComponentId } from '../ops/fallback.ts';
 import { maskPii } from '../core/policyGuard.ts';
 import { shortenPaths, stripSecrets } from '../obs/errorMonitor.ts';
 
@@ -66,6 +67,14 @@ export interface EnginePlanReport {
   slots?: string[];
   components?: EngineRuntime['components'];
   approvalPending?: EngineRuntime['approvalPending'];
+  /**
+   * 복구 프로브를 **선언했을 때만** 채운다(§9.3). 빈 배열은 "선언했는데 하나도 만들어지지
+   * 않았다"이고 필드 부재는 "선언하지 않았다"다 — 둘을 같게 적으면 승인 전 테넌트의
+   * "확인할 길이 없음"이 "확인 안 하기로 했음"과 구분되지 않는다.
+   */
+  probes?: ComponentId[];
+  /** 만들어지지 않은 컴포넌트와 사유(`stt: not_activated` 형태). */
+  probeSkipped?: string[];
   /** 그 선언으로 확인되지 않는 범위. 실패가 아니다. */
   limitsKo: string[];
   /** 판정 사유. 이미 마스킹·자격증명 제거를 지났다(§10.3). */
@@ -153,6 +162,12 @@ export function judgeEnginePlan(input: JudgeEnginePlanInput): EnginePlanReport {
     slots: rt.origins.map((o) => maskPii(`${o.slot}=${o.engineName}@${o.source}(${o.residency})`).text),
     components: [...rt.components],
     approvalPending: [...rt.approvalPending],
+    // 복구 프로브는 **선언하지 않은 것과 0건 만들어진 것이 다르다**. 미선언이면 필드 자체가 없고
+    // (빈 배열은 "확인하고 있다"로 읽힌다), 선언했는데 0건이면 그 사유가 `probeSkipped` 에 있다.
+    ...(rt.probes === undefined ? {} : {
+      probes: rt.probes.probes.map((p) => p.component),
+      probeSkipped: rt.probes.skipped.map((s) => `${s.component}: ${s.reason}`),
+    }),
     limitsKo: [...rt.limitsKo],
   };
 
@@ -203,6 +218,11 @@ export function formatEnginePlan(r: EnginePlanReport): string {
     lines.push(`§9.3 컴포넌트: ${(r.components ?? []).join(', ') || '없음'}`);
     if ((r.approvalPending ?? []).length > 0) {
       lines.push(`승인 전(샘플을 읽지 않음): ${(r.approvalPending ?? []).join(', ')} [승인 필요]`);
+    }
+    if (r.probes !== undefined) {
+      // 0건을 "없음"으로만 적지 않는다 — 사유가 같이 나와야 운영이 무엇을 고칠지 안다.
+      lines.push(`복구 프로브: ${r.probes.join(', ') || '0건'}`);
+      for (const s of r.probeSkipped ?? []) lines.push(`  미생성 ${s}`);
     }
   }
   for (const x of r.reasonsKo) lines.push(`- ${x}`);

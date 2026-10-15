@@ -535,6 +535,20 @@ export interface ConversationCoreOptions {
 export interface RecoveryBinding {
   /** 컴포넌트별 프로브·간격·제한 시간. 간격·제한 시간 기본값 없음(§13-3). */
   schedules: ProbeSchedule[];
+  /**
+   * 엔진 컴포넌트는 **프로브를 호스트가 쓰지 않는다**(§6.2·§9.3). 엔진 기동(`engines.probes`)이
+   * 만든 `HealthProbe` 를 여기 선언한 간격·제한 시간으로 돌린다 — 호스트가 직접 쓰면
+   * `startEngines` 가 돌려준 `engines`(복원력이 붙은 묶음)로 만들기 쉽고, 그러면 **대체 엔진의
+   * 응답이 주 엔진의 `up` 으로 기록된다**(`engineProbe.ts` 머리말 (가)).
+   *
+   * 간격·제한 시간은 여기서도 **기본값이 없다**(§13-3) — 주지 않으면 그 컴포넌트는 확인하지
+   * 않고, 러너가 그 사실을 `skipped` 로 적는다.
+   *
+   * 엔진 기동이 그 컴포넌트 프로브를 만들지 못했으면(승인 전·합성 입력 미선언·슬롯 없음)
+   * **가짜 프로브를 만들지 않고** 경고(`W_ENGINE_PROBES`)로 드러낸다 — 돌아가지 않는 프로브를
+   * 배선해 두면 보고서에는 "확인 중"으로 남는다.
+   */
+  engineProbes?: { component: ComponentId; intervalMs?: number; timeoutMs?: number }[];
   /** 소요 실측용 단조 시계(ms). 없으면 `latencyMs` 를 만들지 않는다(§13-3). */
   monotonic?: () => number;
   /**
@@ -941,10 +955,51 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
   // 복구 프로브 배선(§9.3). 레지스트리·정책·시계·감시 목록은 **Core 가 강제한다**(RecoveryBinding 주석).
   let recovery: RecoveryProbeRunner | undefined;
   if (opts.recovery !== undefined) {
-    const schedules = opts.recovery.schedules;
-    if (!Array.isArray(schedules) || schedules.length === 0) {
+    const hostSchedules = Array.isArray(opts.recovery.schedules) ? opts.recovery.schedules : [];
+    const engineDecls = opts.recovery.engineProbes;
+    if (engineDecls !== undefined && (!Array.isArray(engineDecls) || engineDecls.length === 0)) {
+      throw new Error('복구 프로브 배선 거부: engineProbes 가 빈 목록입니다 — 선언만 남은 배선은 "확인하고 있다"로 읽힙니다 (설계서 §13-3)');
+    }
+    if (engineDecls !== undefined && engineRuntime === undefined) {
+      throw new Error('복구 프로브 배선 거부: 엔진 프로브를 선언했는데 엔진이 기동 선언으로 배선되지 않았습니다 — 찌를 대상이 없습니다 (설계서 §6.2·§9.3)');
+    }
+    if (engineDecls !== undefined && engineRuntime?.probes === undefined) {
+      throw new Error('복구 프로브 배선 거부: 엔진 프로브를 선언했는데 엔진 기동에 probes 선언이 없습니다 — 확인용 합성 입력은 Core 가 만들지 않습니다 (설계서 §13-3·§10.3)');
+    }
+    // 엔진 프로브는 **기동이 만든 것만** 쓴다. 못 만든 컴포넌트는 가짜를 끼우지 않고 드러낸다.
+    const engineSchedules: ProbeSchedule[] = [];
+    if (engineDecls !== undefined) {
+      const made = new Map((engineRuntime?.probes?.probes ?? []).map((p) => [p.component, p]));
+      const missing: string[] = [];
+      for (const d of engineDecls) {
+        const probe = d === null || d === undefined ? undefined : made.get(d.component);
+        if (probe === undefined) {
+          const skip = (engineRuntime?.probes?.skipped ?? []).find((s) => s.component === d?.component);
+          missing.push(`${String(d?.component)}: ${skip?.reasonKo ?? '엔진 기동이 그 컴포넌트 프로브를 만들지 않았습니다'}`);
+          continue;
+        }
+        engineSchedules.push({
+          probe,
+          ...(d.intervalMs !== undefined ? { intervalMs: d.intervalMs } : {}),
+          ...(d.timeoutMs !== undefined ? { timeoutMs: d.timeoutMs } : {}),
+        });
+      }
+      if (missing.length > 0) {
+        warnings.push({
+          code: 'W_ENGINE_PROBES',
+          severity: 'warning',
+          messageKo: `엔진 복구 프로브를 선언했으나 만들어지지 않은 컴포넌트가 있습니다 — ${missing.join(' · ')}`
+            + ' (돌아가지 않는 프로브를 끼우지 않았습니다, 설계서 §9.3·§13-3)',
+        });
+      }
+    }
+    if (hostSchedules.length === 0 && engineDecls === undefined) {
       throw new Error('복구 프로브 배선 거부: 프로브가 없습니다 — 빈 배선은 "확인하고 있다"로 남습니다 (설계서 §13-3)');
     }
+    // **선언했는데 만들어지지 않은 상태로는 막지 않는다.** 승인 전(dry_run)이 기본 상태이므로
+    // 막으면 승인 전 테넌트는 채널 등록 자체가 실패한다 — 사유는 위 경고로 이미 드러났고,
+    // 러너는 돌면서 보고서의 `unprobed` 로 "확인할 길이 없다"를 계속 적는다(§9.3·§13-3).
+    const schedules = [...hostSchedules, ...engineSchedules];
     for (const sched of schedules) {
       const component = sched?.probe?.component;
       // 등록된 채널이 올리지 않는 컴포넌트의 프로브는 **거부**한다. `reportHealth` 는 선언하지
@@ -965,6 +1020,22 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       ...(opts.recovery.confirmSuccesses !== undefined ? { confirmSuccesses: opts.recovery.confirmSuccesses } : {}),
       ...(opts.recovery.scheduler !== undefined ? { scheduler: opts.recovery.scheduler } : {}),
     });
+    // 엔진은 기동됐고 러너도 돌지만 **엔진 컴포넌트 프로브가 하나도 없는** 상태는 조용하다.
+    // 그 컴포넌트가 `down` 이 되면 통화가 내려가 호출이 멈추고 — 새 샘플을 만들 주체가 없어
+    // 폴백이 풀리지 않는다. 러너 보고서의 `unprobed` 는 **이미 나빠진 뒤에야** 보이므로,
+    // 첫 고객의 턴보다 먼저 드러낸다(§9.3).
+    if (engineRuntime !== undefined) {
+      const covered = new Set(schedules.map((s) => s.probe.component));
+      const bare = engineRuntime.components.filter((c) => !covered.has(c));
+      if (bare.length > 0) {
+        warnings.push({
+          code: 'W_ENGINE_PROBES_UNBOUND',
+          severity: 'warning',
+          messageKo: `엔진 컴포넌트에 복구 프로브가 없습니다: ${bare.join(', ')} — 그 컴포넌트가 down 이 되면 `
+            + '엔진 호출이 멈춰 새 샘플이 생기지 않으므로 폴백에서 빠져나올 수 없습니다 (설계서 §9.3)',
+        });
+      }
+    }
   } else if (watched.size > 0) {
     warnings.push({
       code: 'W_RECOVERY_UNBOUND',
