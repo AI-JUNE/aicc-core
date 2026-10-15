@@ -75,6 +75,17 @@ export interface EnginePlanReport {
   probes?: ComponentId[];
   /** 만들어지지 않은 컴포넌트와 사유(`stt: not_activated` 형태). */
   probeSkipped?: string[];
+  /**
+   * 선언으로 **만들어진 파생 구성요소**(`classifier`·`embedder`·`answerer`). 기동 결과에서
+   * 읽은 사실이며 설정 원문이 아니다.
+   *
+   * 승인 전에 사람이 읽는 경로에 이것이 없으면, 선언 한 줄(`intent`·`answer`)이 늘어난 것과
+   * **고객 발화·지식 원문이 LLM 으로 나가게 된 것**을 구분할 방법이 리뷰에 없다 — 활성화
+   * 한 글자를 여기서 막아 놓고 정작 무엇이 그 엔진을 부르는지는 안 적는 셈이다.
+   * 빈 배열은 **파생을 하나도 선언하지 않았다**는 사실이다 — 선언했는데 안 만들어진 상태는
+   * 없다(만들지 못하면 기동 자체가 거절된다). 프로브와 달리 "0건 + 사유"가 없는 이유다.
+   */
+  derived?: string[];
   /** 그 선언으로 확인되지 않는 범위. 실패가 아니다. */
   limitsKo: string[];
   /** 판정 사유. 이미 마스킹·자격증명 제거를 지났다(§10.3). */
@@ -168,6 +179,13 @@ export function judgeEnginePlan(input: JudgeEnginePlanInput): EnginePlanReport {
       probes: rt.probes.probes.map((p) => p.component),
       probeSkipped: rt.probes.skipped.map((s) => `${s.component}: ${s.reason}`),
     }),
+    // 목록을 선언에서 만들지 않는다 — **기동 결과에 실제로 있는 것**만 적는다(§13-3).
+    // 선언을 읽으면 "선언했으니 있다"가 되고, 그건 확인이 아니라 선언의 되풀이다.
+    derived: [
+      ...(rt.classifier !== undefined ? ['classifier'] : []),
+      ...(rt.embedder !== undefined ? ['embedder'] : []),
+      ...(rt.answerer !== undefined ? ['answerer'] : []),
+    ],
     limitsKo: [...rt.limitsKo],
   };
 
@@ -218,6 +236,11 @@ export function formatEnginePlan(r: EnginePlanReport): string {
     lines.push(`§9.3 컴포넌트: ${(r.components ?? []).join(', ') || '없음'}`);
     if ((r.approvalPending ?? []).length > 0) {
       lines.push(`승인 전(샘플을 읽지 않음): ${(r.approvalPending ?? []).join(', ')} [승인 필요]`);
+    }
+    if (r.derived !== undefined) {
+      // "없음"을 적는 이유: 선언 파일에 `answer` 를 넣었는데 이 줄이 비어 있으면 그 자리에서
+      // 오타·조건부 선언을 발견한다. 줄 자체가 없으면 그냥 안 보고 지나간다.
+      lines.push(`파생 구성요소: ${r.derived.join(', ') || '없음'}`);
     }
     if (r.probes !== undefined) {
       // 0건을 "없음"으로만 적지 않는다 — 사유가 같이 나와야 운영이 무엇을 고칠지 안다.

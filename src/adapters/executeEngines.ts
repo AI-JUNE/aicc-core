@@ -54,6 +54,13 @@
 //       응답한 결과가 주 엔진의 `up` 으로 기록되고, 폴백이 풀린 뒤 전 통화가 대체 경로로 간다 —
 //       주 엔진이 죽은 사실은 **영구히 관측되지 않는다**. 고를 일이 없게 여기서 만든다
 //       (자세한 사고 목록은 `engineProbe.ts` 머리말).
+//  (파) **지식 응대 구성요소를 호스트가 조립한다.** 분류기(`intent`)는 여기서 만들어 주는데
+//       §5.2 답변기는 자리가 없었다. 그래서 호스트는 `createAnswerer` 를 직접 불러야 하고,
+//       그 LLM 은 **복원력도 헬스 기록도 붙지 않은 조각**이다(이 실행기만 조각을 들고 있으므로
+//       붙일 방법 자체가 없다 — 호스트는 복원력이 붙은 묶음을 기동 **전에** 손에 넣을 수 없다).
+//       결과는 (가)와 같은 침묵인데 더 비싸다: LLM 이 전부 타임아웃이면 고객은 **모든 질문에
+//       "안내드릴 내용이 없습니다"**를 듣고, 그 실패는 §9.3 샘플도 §11.2 사용량도 남기지 않는다.
+//       지식베이스가 통째로 멀쩡해도 그래프는 평온하다. 분류기와 **같은 자리에서** 만든다.
 //  (타) **프로브 사용량이 과금 근거에 섞인다.** 어댑터의 `lastUsage()` 는 **마지막 호출**의 실측을
 //       들고 있고 프로브는 턴과 같은 인스턴스를 쓴다. 그래서 엔진을 부르지 않은 턴(DTMF·타임아웃)이
 //       `lastUsage()` 를 읽으면 **직전 프로브의 사용량이 그 통화의 과금 근거로 실린다** — 금액이
@@ -91,6 +98,8 @@ import type { IntentClassifier } from '../nlu/llmClassifier.ts';
 import { createIntentClassifier } from '../nlu/llmClassifier.ts';
 import type { Embedder } from '../knowledge/embedding.ts';
 import { createEmbedder } from '../knowledge/embedding.ts';
+import type { Answerer } from '../knowledge/answer.ts';
+import { createAnswerer } from '../knowledge/answer.ts';
 
 export const ENGINE_STARTUP_CONTRACT_VERSION = 1;
 
@@ -166,6 +175,23 @@ export interface EngineStartupDeclaration {
     timeoutMs?: number;
   };
   /**
+   * 지식 응대 답변기(§5.2·(파)). 선언하면 **복원력이 붙은 LLM** 으로 만든다 —
+   * 호스트가 조각에서 직접 만들면 답변 실패가 재시도·대체·§9.3 샘플 어디에도 닿지 않고,
+   * 그 증상은 예외가 아니라 **모든 질문이 "안내드릴 내용이 없습니다"로 끝나는 것**이다.
+   *
+   * 지시문(`systemKo`)은 Core 가 만들지 않는다(§13-3) — 응대 화법은 고객사마다 다르다.
+   * 출력 형식·인용 표기는 파서와 짝이므로 `knowledge/answer.ts` 가 정한다.
+   *
+   * **검색기(`Retriever`)는 여기서 만들지 않는다.** 그쪽은 벡터 스토어가 필요하고 스토어는
+   * 엔진이 아니라 호스트 인프라다 — 임베더(`knowledge`)를 들고 `channels/runtime.ts` 의
+   * 지식 배선(`knowledge.search`)이 만든다.
+   */
+  answer?: {
+    systemKo: string;
+    timeoutMs?: number;
+    maxResponseChars?: number;
+  };
+  /**
    * 복구 프로브(§9.3·(카)). 선언하면 **조립만 된 주 세트**로 `HealthProbe` 를 만든다 —
    * 복원력이 붙은 묶음으로 만들면 대체의 응답이 주 엔진의 `up` 이 된다.
    *
@@ -214,6 +240,11 @@ export interface EngineRuntime {
   /** 선언했을 때만 만든다. 없으면 **필드 자체가 없다**(빈 객체는 "배선했다"로 읽힌다). */
   classifier?: IntentClassifier;
   embedder?: Embedder;
+  /**
+   * §5.2 답변기. 선언했을 때만 만든다((파)). 검색기는 여기 없다 — 스토어가 필요한 쪽은
+   * 지식 배선이 만든다(위 `answer` 주석).
+   */
+  answerer?: Answerer;
   /**
    * 복구 프로브(§9.3). 선언했을 때만 만든다. `probes.probes` 가 **빈 배열일 수 있다** —
    * 승인 전이거나 합성 입력이 없으면 만들지 않으며, 그 사유는 `probes.skipped` 에 있다
@@ -490,7 +521,7 @@ export function startEngines(decl: EngineStartupDeclaration, wiring?: EngineHeal
     limitsKo,
   };
 
-  // 분류기·임베딩은 **마지막에** 만든다. 어느 단계에서 걸려도 "돌아가는 포트"가 생기지 않는다.
+  // 분류기·임베딩·답변기는 **마지막에** 만든다. 어느 단계에서 걸려도 "돌아가는 포트"가 생기지 않는다.
   if (decl.intent !== undefined) {
     runtime.classifier = createIntentClassifier({
       scope: decl.scope,
@@ -515,6 +546,26 @@ export function startEngines(decl: EngineStartupDeclaration, wiring?: EngineHeal
       ...(decl.knowledge.batchSize !== undefined ? { batchSize: decl.knowledge.batchSize } : {}),
       ...(decl.knowledge.timeoutMs !== undefined ? { timeoutMs: decl.knowledge.timeoutMs } : {}),
     });
+  }
+  if (decl.answer !== undefined) {
+    // 지시문·상한 검증은 `createAnswerer` 가 한다(§2) — 여기서 복사하면 한쪽만 고쳐진다.
+    // 해외 LLM + 국외이전 불허도 그쪽이 **생성 시점에** 거부한다(§10.3).
+    runtime.answerer = createAnswerer({
+      scope: decl.scope,
+      llm: engines.llm,
+      systemKo: decl.answer.systemKo,
+      allowOverseas: decl.allowOverseas,
+      ...(decl.answer.timeoutMs !== undefined ? { timeoutMs: decl.answer.timeoutMs } : {}),
+      ...(decl.answer.maxResponseChars !== undefined ? { maxResponseChars: decl.answer.maxResponseChars } : {}),
+    });
+    if (decl.knowledge === undefined) {
+      // 답변기만 있으면 §5.2 턴은 꿸 수 없다(근거를 만드는 쪽이 없다). 막지 않는 이유는
+      // 호스트가 검색기를 직접 줄 수 있기 때문이고, 그 경로는 복원력이 붙지 않으므로 적는다.
+      limitsKo.push(
+        '답변기(answer)만 선언됐다 — 임베딩(knowledge) 선언이 없어 Core 가 검색기를 만들 수 없다.'
+        + ' 호스트가 검색기를 주면 그 임베딩 호출은 재시도·대체·§9.3 샘플에 닿지 않는다(§5.2)',
+      );
+    }
   }
   if (decl.probes !== undefined) {
     // 프로브는 **조립만 된 주 세트**로 만든다((카)) — `engines` 는 복원력이 붙은 묶음이다.

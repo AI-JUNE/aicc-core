@@ -443,6 +443,64 @@
         `src/channels/runtime.ts`(`recovery.engineProbes`) · `src/channels/contract.ts`
         (`W_ENGINE_PROBES`·`W_ENGINE_PROBES_UNBOUND`) · `tests/channels.runtime.test.mjs`(10건 추가, 총 217건) ·
         `fixtures/reference-engines.mjs`(복사용 합성 샘플 예시) · `API.md` 반영
+      · Core 측 완료(2026-10-15, 2): **분류기는 만들어 주고 답변기는 호스트에게 맡겼다 — §5.2 가
+        복원력 바깥에 있었다**. 위 기동 실행기는 `intent` 선언을 받아 **복원력·헬스 기록이 붙은**
+        LLM 으로 분류기를 만들어 꿰는데, 같은 파일에 §5.2 답변기(`createAnswerer`)와 검색기
+        (`createRetriever`)의 자리는 없었다. 그래서 그 둘은 호스트가 조각에서 직접 만들어야 했고 —
+        더 정확히 말하면 **제대로 만들 수가 없었다**: 복원력이 붙은 묶음은 `startEngines` 안에서
+        생기고 그 호출은 런타임 생성 **중**인데, 호스트는 답변기를 `createConversationCore` 의
+        **인자로** 넘겨야 한다. 즉 넘기는 시점에 엔진은 아직 서지 않았으므로 호스트가 손에 쥘 수
+        있는 것은 복원력도 헬스 기록도 붙지 않은 조각뿐이다. 구조적으로 비껴가는 경로였다.
+        결과는 (40)이 고친 침묵과 같은 계열이고 증상만 다르다: 임베딩·LLM 이 전부 타임아웃이면
+        고객은 **모든 질문에 "안내드릴 내용이 없습니다"**를 듣는데, 그 실패는 §9.3 샘플도 §11.2
+        사용량도 남기지 않는다 — 지식베이스·업무시스템은 멀쩡하고 대시보드도 초록이라 드러나는
+        경로가 고객 민원뿐이다. 그리고 채널 저장소 3곳이 각자 꿰면 **각자 다르게 틀린다**(§2).
+        - **답변기는 분류기와 같은 자리에서 만든다**(`adapters/executeEngines.ts` 의 `answer` 선언,
+          (파)). 지시문·상한·국외이전 판정은 `createAnswerer` 가 하고 여기서 복사하지 않는다(§2) —
+          해외 LLM + 국외이전 불허는 통화 중이 아니라 **기동 시점에** 거절된다(질문만이 아니라
+          지식 원문이 통째로 나가기 때문이다, §10.3). `allowOverseas`·테넌트는 선언 한 곳에서
+          주입되므로 (마)가 답변기에서도 구조적으로 불가능하다.
+        - **검색기는 여기서 만들지 않는다.** 검색기에는 벡터 스토어가 필요하고 스토어는 엔진이
+          아니라 호스트 인프라다. 대신 임베더를 들고 **지식 배선**(`channels/runtime.ts` 의
+          `knowledge.search`)이 만든다 — 받는 것은 테넌트에 묶인 스토어(`scopedVectorStore`)뿐이고
+          (저수준 스토어를 받으면 네임스페이스를 Core 가 만들 수 있게 되어 §11.1 방어선이 한 겹
+          사라진다), 지식베이스 id 에 기본값은 없다(빈 목록은 전체 검색이 아니라 설정 오류다, §13-3).
+          답변기만 선언하고 임베딩을 선언하지 않은 상태는 막지 않되 **그 사실을 `limitsKo` 에 적는다**
+          (호스트가 검색기를 주면 그 임베딩 호출은 복원력 바깥이다).
+        - **한 자리의 출처는 하나다**(§2 — 분류기와 같은 규칙): `retriever`+`search` 를 둘 다 주면
+          거부하고(어느 임베딩으로 검색하는지 설정에서 읽을 수 없게 된다), `engines.answer`+
+          `knowledge.answerer` 도 거부한다. `search` 를 주었는데 엔진에 임베딩 선언이 없으면 거부하며,
+          그때 **사유를 정확히 적는다** — "검색기가 없다"로 뭉개면 운영자는 호스트 코드를 찾으러
+          가고 원인은 엔진 선언 한 줄이다. 구성요소는 **배선에서 한 벌로 확정**해 턴마다 다시
+          고르지 않는다(호출 시점에 출처가 갈리면 같은 통화가 두 경로로 돈다).
+        - 호스트 조립 자체는 막지 않는다(종전 동작이고, 그것이 유일한 경로인 테넌트가 있다).
+          다만 **엔진이 기동된 상태에서** 섞으면 `W_KNOWLEDGE_PARTS` 로 드러낸다 — 엔진 미배선이면
+          `W_ENGINES_UNBOUND` 가 이미 그 사실을 적으므로 두 번 적지 않는다.
+        - **선언 검토 경로에 파생 구성요소를 적는다**(`adapters/enginePlan.ts` 의 `derived`).
+          승인 전에 사람이 읽는 출력에 그것이 없으면, 선언 한 줄이 늘어난 것과 **고객 발화·지식
+          원문이 LLM 으로 나가게 된 것**을 리뷰에서 구분할 방법이 없다 — 활성화 한 글자는 막아
+          놓고 정작 무엇이 그 엔진을 부르는지는 안 적는 셈이었다. 선언이 아니라 **기동 결과에
+          실제로 있는 것**만 적고(§13-3), 없으면 `없음`으로 적는다(줄 자체가 없으면 오타·조건부
+          선언을 그냥 지나친다).
+        **2026-10-15 실측(도구 출력 그대로)**: `엔진 기동 계획: 통과` ·
+        `파생 구성요소: classifier, embedder, answerer` · `§9.3 컴포넌트: stt, tts, llm, rag` ·
+        `승인 전(샘플을 읽지 않음): stt, tts, llm, rag [승인 필요]`.
+        **변이 검증(도구 출력 그대로)**: 답변기를 만들지 않으면 8건 실패 · 복원력이 붙지 않은
+        조각으로 답변기를 만들면 1건 실패 · 답변기 이중 출처를 통과시키면 1건 실패 · 검색기 이중
+        출처를 통과시키면 1건 실패 · 호스트 조립 경고를 빼면 1건 실패 · 임베딩 미선언 사유를
+        뭉개면 1건 실패 · 답변기만 선언한 한계를 빼면 1건 실패 · 파생 구성요소에서 분류기를
+        빠뜨리면 1건 실패 — 전부 원본에서는 통과한다.
+        실호출 없음(가짜 어댑터·가짜 스토어로만 검증). 실엔진·실 벡터 DB 연결은 **[승인 필요]**.
+        **남은 것은 사람이 정하는 값이다**: 응대 지시문(`answer.systemKo`)·검색 임계값·지식베이스
+        목록·조회 제한 시간은 테넌트 값이고(§13-3), 벡터 스토어 구현은 **벡터 DB 선정 후** 호스트가
+        붙인다 — 그때까지 `knowledge.search` 는 선언만 가능하다.
+        근거: `src/adapters/executeEngines.ts`(`answer` 선언·`answerer`) ·
+        `tests/adapters.executeEngines.test.mjs`(6건 추가, 총 56건) ·
+        `src/adapters/enginePlan.ts`(`derived` 출력) · `tests/adapters.enginePlan.test.mjs`(1건 추가, 총 18건) ·
+        `src/channels/runtime.ts`(`knowledge.search`·출처 단일화) ·
+        `src/channels/contract.ts`(`W_KNOWLEDGE_PARTS`) ·
+        `tests/channels.runtime.test.mjs`(7건 추가, 총 224건) ·
+        `fixtures/reference-engines.mjs`(지식 파생 선언 예시) · `API.md` 반영
 - [ ] 채널 어댑터 계약 실적용 — Callbot·챗봇·D-ARS가 Core를 실제로 소비하도록 연결
       · Core 측 완료(13): **엔진과 판정 사이의 빈 자리(2026-09-18)** — 어댑터(§6.2)는 네 종류 다 만들었고
         조립기·복원력·복구 프로브까지 붙였는데, 정작 **어댑터의 출력을 판정 모듈의 입력으로 바꾸는 자리가
@@ -2136,6 +2194,17 @@
         근거: `src/adapters/engineProbe.ts` · `src/adapters/executeEngines.ts`(`probes`) ·
         `src/adapters/enginePlan.ts` · `src/channels/runtime.ts`(`recovery.engineProbes`) ·
         `src/channels/contract.ts`(`W_ENGINE_PROBES`·`W_ENGINE_PROBES_UNBOUND`) ·
+        `fixtures/reference-engines.mjs` · `API.md` 반영
+      · Core 측 완료(42): **§5.2 지식 응대가 복원력 바깥에 있었다(2026-10-15, 2)** — (40)이 엔진을
+        기동시키고 (41)이 복구 프로브를 붙인 뒤에도, 기동이 만들어 주는 것은 **분류기뿐**이었다.
+        §5.2 검색기·답변기는 호스트가 조각에서 만들어 배선 인자로 넘기는 구조였고, 그 시점에
+        엔진은 아직 서지 않았으므로 **복원력·헬스 기록이 붙은 엔진을 넘길 방법이 구조적으로
+        없었다**. 그 상태의 증상은 (40)과 같은 침묵인데 더 비싸다: 임베딩·LLM 이 전부 타임아웃이면
+        고객은 모든 질문에 "안내드릴 내용이 없습니다"를 듣고, §9.3 판정은 `normal` 이며 지식베이스도
+        멀쩡하다. 채널 저장소 3곳이 각자 꿰면 **각자 다르게 틀린다**(§2).
+        자세한 내용과 변이 검증은 위 **실엔진 어댑터** 항목의 지식 응대 파생 구성요소(2026-10-15, 2) 참조.
+        근거: `src/adapters/executeEngines.ts`(`answer`) · `src/channels/runtime.ts`(`knowledge.search`) ·
+        `src/channels/contract.ts`(`W_KNOWLEDGE_PARTS`) · `src/adapters/enginePlan.ts`(`derived`) ·
         `fixtures/reference-engines.mjs` · `API.md` 반영
       · 남은 것: **Callbot 저장소 쪽 배선** — 코드는 훅마다 한 줄(README 참조)이며 더 쓸 것이 없다.
         남은 것은 저장소 결정 사항이다: 현행 LLM 툴(welfare_apply 등)과 Core 시나리오의 역할 분담

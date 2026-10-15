@@ -1883,6 +1883,169 @@ test('배선 거부: 검색기·답변기 부재와 성립하지 않는 정책�
   );
 });
 
+// ── 지식 구성요소를 엔진 기동에서 꿴다(§5.2·§6.2·§9.3) ────────────────────────
+//
+// 분류기는 `engines.intent` 로 Core 가 만들어 주는데 §5.2 검색기·답변기는 그 자리가 없었다.
+// 그래서 호스트는 `createRetriever`·`createAnswerer` 를 직접 불러야 했고, 그 조각에는
+// **복원력도 헬스 기록도 붙지 않는다** — 붙일 방법 자체가 없었다(복원력이 붙은 묶음은
+// `startEngines` 안에서 생기고, 그 호출은 런타임 생성 **중**이라 호스트 손에 들어오지 않는다).
+// 결과는 침묵이다: 임베딩·LLM 이 전부 타임아웃이면 고객은 모든 질문에 "안내할 내용이 없다"를
+// 듣는데 §9.3 판정은 normal 이고 지식베이스도 멀쩡하다.
+
+/** 질의당 고정 벡터를 돌려주는 가짜 임베딩 어댑터. 네트워크에 닿지 않는다. */
+const engEmbAd = { name: 'emb-x', residency: 'onprem', embed: async (texts) => texts.map(() => [0.1, 0.2]) };
+const engEmbDown = {
+  name: 'emb-dead',
+  residency: 'onprem',
+  embed: async () => { throw new HT.EngineError('E_TIMEOUT', 'embedding', '임베딩 응답 시간 초과'); },
+};
+const KB_NS = 't/goone/kb/kb_faq';
+const KB_HIT = {
+  id: 'd1#0', score: 0.9, namespace: KB_NS,
+  text: '수수료는 면제입니다.',
+  metadata: { docId: 'd1', title: '수수료 안내', sourceUri: 'kb://fee', approved: true },
+};
+/** `TenantVectorStore` 모양의 가짜 스토어. 스토어는 엔진이 아니라 호스트 인프라다. */
+function kbStore(impl = async () => [KB_HIT]) {
+  const calls = [];
+  return {
+    calls,
+    store: {
+      scope: SCOPE,
+      upsert: async () => {},
+      purge: async () => {},
+      query: async (kbId, embedding, topK) => { calls.push({ kbId, topK, dim: embedding.length }); return impl(kbId); },
+    },
+  };
+}
+/** 임베딩·LLM 조각까지 들어 있는 엔진 선언. 지식 파생을 선언한다. */
+function kbEngineDecl({ llm, embedding = engEmbAd, activation = 'live', over = {} } = {}) {
+  return {
+    scope: SCOPE,
+    allowOverseas: false,
+    sets: [{
+      name: 'primary',
+      parts: [{
+        kind: 'preassembled', source: 'fake',
+        engines: { activation, stt: engSttAd, tts: engTtsAd, llm: llm ?? engLlmOk('{"sufficient":true,"answerKo":"수수료는 면제입니다 [1]."}'), embedding },
+      }],
+    }],
+    resilience: { attemptsPerCandidate: 1 },
+    knowledge: { expectDim: 2 },
+    answer: { systemKo: '근거만으로 존댓말로 답한다.' },
+    ...over,
+  };
+}
+
+test('엔진 기동이 검색기·답변기를 만들어 꿴다 — 질문이 근거까지 가고 답이 채널로 나간다(§5.2)', b, async () => {
+  const f = kbStore();
+  const { core, port } = build({
+    flows: [flowFaq],
+    engines: kbEngineDecl(),
+    knowledge: { search: { store: f.store, knowledgeBaseIds: ['kb_faq'] }, policy: KB_POLICY },
+  });
+  const r = await core.start(faqReq());
+  const after = await core.send(r.interactionId, { input: { kind: 'utterance', text: RAW_Q } });
+  assert.deepEqual(after.steps.map((s) => s.nodeId), ['__answer', 'bye']);
+  assert.equal(after.steps[0].text, '수수료는 면제입니다 [1].');
+  assert.deepEqual(f.calls, [{ kbId: 'kb_faq', topK: 3, dim: 2 }]);
+  assert.deepEqual(port.log.at(-1), ['present', 'i_test1', ['__answer', 'bye']]);
+  // 질의는 마스킹을 지나 엔진으로 나가고 세션에도 마스킹된 것만 남는다(§10.3).
+  assert.equal(JSON.stringify(after.state.slots).includes('010-1234-5678'), false);
+  assert.equal(core.warnings().some((i) => i.code === 'W_KNOWLEDGE_UNBOUND'), false);
+  assert.equal(core.warnings().some((i) => i.code === 'W_KNOWLEDGE_PARTS'), false);
+});
+
+test('그 경로의 임베딩 실패는 §9.3 레지스트리에 닿고 근거 없음과 섞이지 않는다', b, async () => {
+  const reports = [];
+  const { core, health } = build({
+    flows: [flowFaq],
+    engines: kbEngineDecl({ embedding: engEmbDown }),
+    knowledge: {
+      search: { store: kbStore().store, knowledgeBaseIds: ['kb_faq'] },
+      policy: KB_POLICY,
+      onResult: (x) => reports.push(x),
+    },
+  });
+  const r = await core.start(faqReq());
+  const after = await core.send(r.interactionId, { input: { kind: 'utterance', text: RAW_Q } });
+  // 답하지 못한 것은 §5.1 사다리로 간다(문안을 만들지 않는다).
+  assert.equal(after.steps.some((s) => s.nodeId === '__answer'), false);
+  assert.equal(reports.at(-1).answered, false);
+  assert.equal(reports.at(-1).infraFailed, true, '엔진 장애가 "근거 없음"으로 적혔다');
+  // 호스트가 조각으로 만든 검색기였다면 이 샘플은 0건이고 폴백은 영원히 normal 이다.
+  assert.equal(health.latest('rag').state, 'down', '임베딩 실패가 통화와 같은 레지스트리에 닿지 않았다');
+});
+
+test('검색기가 두 곳에서 오면 거부한다 — 어느 임베딩으로 검색하는지 읽을 수 없다(§2)', b, () => {
+  assert.throws(
+    () => build({
+      flows: [flowFaq],
+      engines: kbEngineDecl(),
+      knowledge: { retriever: retrieverOf(), search: { store: kbStore().store, knowledgeBaseIds: ['kb_faq'] }, policy: KB_POLICY },
+    }),
+    /검색기가 두 곳에서 옵니다/,
+  );
+});
+
+test('답변기가 두 곳에서 오면 거부한다 — 한쪽은 §9.3 에 닿지 않는다(§2)', b, () => {
+  assert.throws(
+    () => build({
+      flows: [flowFaq],
+      engines: kbEngineDecl(),
+      knowledge: { search: { store: kbStore().store, knowledgeBaseIds: ['kb_faq'] }, answerer: answererOf(), policy: KB_POLICY },
+    }),
+    /답변기가 두 곳에서 옵니다/,
+  );
+});
+
+test('임베딩을 선언하지 않은 엔진으로 search 를 주면 거부한다 — Core 는 임베딩을 만들지 않는다(§6.2)', b, () => {
+  assert.throws(
+    () => build({
+      flows: [flowFaq],
+      engines: engineDecl({ over: { answer: { systemKo: '근거만으로 답한다.' } } }),
+      knowledge: { search: { store: kbStore().store, knowledgeBaseIds: ['kb_faq'] }, policy: KB_POLICY },
+    }),
+    /임베딩이 없습니다/,
+  );
+});
+
+test('지식베이스 목록이 비었거나 남의 테넌트 스토어면 통화 전에 막는다(§13-3·§11.1)', b, () => {
+  assert.throws(
+    () => build({
+      flows: [flowFaq],
+      engines: kbEngineDecl(),
+      knowledge: { search: { store: kbStore().store, knowledgeBaseIds: [] }, policy: KB_POLICY },
+    }),
+    /지식 응대 배선 거부/,
+  );
+  const other = kbStore();
+  other.store.scope = { tenantId: 'other' };
+  assert.throws(
+    () => build({
+      flows: [flowFaq],
+      engines: kbEngineDecl(),
+      knowledge: { search: { store: other.store, knowledgeBaseIds: ['kb_faq'] }, policy: KB_POLICY },
+    }),
+    /§11.1/,
+  );
+});
+
+test('엔진이 기동된 상태에서 호스트 조립을 섞으면 경고로 드러낸다 — 그 호출만 §9.3 을 비껴간다', b, () => {
+  const { core } = build({
+    flows: [flowFaq],
+    engines: engineDecl(),                     // 지식 파생을 선언하지 않은 엔진
+    knowledge: kbBinding(retrieverOf(), answererOf()),
+  });
+  const w = core.warnings().find((i) => i.code === 'W_KNOWLEDGE_PARTS');
+  assert.ok(w, `경고가 없다: ${JSON.stringify(core.warnings().map((i) => i.code))}`);
+  assert.match(w.messageKo, /검색기\(retriever\)·답변기\(answerer\)/);
+  // 엔진 미배선이면 호스트 조립이 유일한 경로다 — 같은 사실을 두 번 적지 않는다.
+  const noEngines = build({ flows: [flowFaq], knowledge: kbBinding(retrieverOf(), answererOf()) });
+  assert.equal(noEngines.core.warnings().some((i) => i.code === 'W_KNOWLEDGE_PARTS'), false);
+  assert.equal(noEngines.core.warnings().some((i) => i.code === 'W_ENGINES_UNBOUND'), true);
+});
+
 // ── 동의 배선 (§10.1·§6.1) ───────────────────────────────────────────────────
 //
 // 여기서 고정하는 것은 **동의 이력의 진실성**이다. 배선이 없던 동안 시나리오가 동의를 묻고

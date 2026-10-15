@@ -23,7 +23,7 @@ import type { RepromptPolicy } from '../flow/reprompt.ts';
 import { repromptPolicyOk, validateRepromptPolicy } from '../flow/reprompt.ts';
 import type { TurnTimingPolicy } from '../flow/timing.ts';
 import { turnTimingPolicyOk, validateTurnTimingPolicy } from '../flow/timing.ts';
-import type { TenantScope } from '../core/tenancy.ts';
+import type { TenantScope, TenantVectorStore } from '../core/tenancy.ts';
 import { assertTenantScope } from '../core/tenancy.ts';
 import type { EventMeta, InteractionEvent, LatencyMs, TurnCompletedEvent, HandoffRequestedEvent, UsageMetrics } from '../events/schema.ts';
 import { sessionStarted, sessionEnded, handoffRequested, turnCompleted } from '../events/schema.ts';
@@ -61,6 +61,7 @@ import type { RetrievalPolicy } from '../knowledge/rag.ts';
 import { assertRetrievalPolicy } from '../knowledge/rag.ts';
 import type { Answerer } from '../knowledge/answer.ts';
 import type { Retriever } from '../knowledge/retrieval.ts';
+import { createRetriever } from '../knowledge/retrieval.ts';
 import type { KnowledgeFailureCause, KnowledgeUsage } from '../knowledge/executeKnowledge.ts';
 import { resolveKnowledgeTurn } from '../knowledge/executeKnowledge.ts';
 import type { ConsentPolicy, ConsentPurpose, ConsentRecord } from '../consent/consent.ts';
@@ -291,10 +292,37 @@ export interface IntentBinding {
  * **아무도 부르지 않는** 상태로 남고, 채널 3곳이 각자 프롬프트와 실패 처리를 짜게 된다(§2).
  */
 export interface KnowledgeBinding {
-  /** 질의 → 근거(§6.2). 주입이다 — 실엔진·실 벡터 DB 연결은 호스트 쪽이다 **[승인 필요]**. */
-  retriever: Retriever;
-  /** 근거 → 답변(§6.2). 같은 이유로 주입이다 **[승인 필요]**. */
-  answerer: Answerer;
+  /**
+   * 질의 → 근거(§6.2). 주입이다 — 실엔진·실 벡터 DB 연결은 호스트 쪽이다 **[승인 필요]**.
+   *
+   * `engines`(엔진 기동 선언)에 `knowledge`(임베딩)를 선언하고 아래 `search` 를 주면
+   * **여기를 비운다** — 그러면 Core 가 복원력·헬스 기록이 붙은 임베딩으로 검색기를 만들어 꿴다.
+   * 둘 다 주면 **거부한다**(분류기와 같은 규칙, §2·§9.3).
+   */
+  retriever?: Retriever;
+  /**
+   * 근거 → 답변(§6.2). 같은 이유로 주입이다 **[승인 필요]**.
+   *
+   * `engines.answer` 를 선언했으면 **여기를 비운다**. 호스트가 조각에서 직접 만든 답변기는
+   * 재시도·대체·§9.3 샘플에 닿지 않고, 그 증상은 예외가 아니라 **모든 질문이 "안내드릴
+   * 내용이 없습니다"로 끝나는 것**이다 — 지식베이스는 멀쩡하므로 장애로 보이지 않는다.
+   */
+  answerer?: Answerer;
+  /**
+   * 검색기를 Core 가 만들게 하는 선언(§5.2·§11.1). `retriever` 를 주지 않을 때만 쓴다.
+   *
+   * 스토어는 **엔진이 아니라 호스트 인프라**라 엔진 기동 선언에 둘 수 없다. 대신 테넌트에
+   * 묶인 스토어(`scopedVectorStore`)만 받는다 — 저수준 스토어를 받으면 네임스페이스를 Core 가
+   * 만들 수 있게 되고 §11.1 방어선이 한 겹 사라진다.
+   *
+   * 지식베이스 id 에 **기본값은 없다**(§13-3) — 빈 목록은 "전체 검색"이 아니라 설정 오류다.
+   */
+  search?: {
+    store: TenantVectorStore;
+    knowledgeBaseIds: readonly string[];
+    /** 지식베이스 한 곳당 조회 대기 상한(ms). 주지 않으면 제한하지 않는다(§13-3). */
+    storeTimeoutMs?: number;
+  };
   /** 근거 판정 정책(§5.2). 기본값 없음 — 성립하지 않는 정책은 **생성 시점에** 거부한다(§13-3). */
   policy: RetrievalPolicy;
   /**
@@ -1147,12 +1175,48 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
   // 지식 응대 배선도 **배포 시점에** 거른다. 성립하지 않는 정책(minHits > topK 등)을 통과시키면
   // 통화 중에 `config_error` 로만 나타나고, 그 상태의 증상은 "모든 질문에 답을 못 한다"다 —
   // 장애로 보이지 않아서 더 오래 산다(라우팅·전환·인텐트 배선과 같은 규칙).
+  /**
+   * 검색기·답변기 출처도 **각각 하나**다(§2) — 분류기와 같은 규칙이다. 엔진 기동이 만들었으면
+   * 그것을 쓰고, 호스트가 직접 주입했으면 그것을 쓴다. 둘 다면 거부한다.
+   *
+   * 호스트 조립을 막지는 않는다(종전 동작이다). 다만 엔진이 기동된 상태에서 호스트 조립을
+   * 섞으면 그 경로만 재시도·대체·§9.3 샘플을 비껴가므로 **경고로 드러낸다** — 비껴간 경로로
+   * 나가는 것이 하필 고객 질문과 지식 원문이다(§10.3).
+   */
+  let knowledgeParts: { retriever: Retriever; answerer: Answerer } | undefined;
   if (opts.knowledge !== undefined) {
     const kb = opts.knowledge;
-    if (!kb.retriever || typeof kb.retriever.retrieve !== 'function') {
+    if (kb.retriever !== undefined && kb.search !== undefined) {
+      throw new Error('지식 응대 배선 거부: 검색기가 두 곳에서 옵니다(knowledge.retriever + knowledge.search) — 어느 임베딩으로 검색하는지 설정에서 읽을 수 없게 됩니다 (설계서 §2)');
+    }
+    if (kb.answerer !== undefined && engineRuntime?.answerer !== undefined) {
+      throw new Error('지식 응대 배선 거부: 답변기가 두 곳에서 옵니다(engines.answer + knowledge.answerer) — 호스트가 만든 답변기는 재시도·대체·§9.3 샘플에 닿지 않습니다 (설계서 §2·§9.3)');
+    }
+    let retriever = kb.retriever;
+    if (retriever === undefined && kb.search !== undefined) {
+      const embedder = engineRuntime?.embedder;
+      if (embedder === undefined) {
+        throw new Error('지식 응대 배선 거부: knowledge.search 를 주었으나 엔진 기동 선언(engines.knowledge)에 임베딩이 없습니다 — Core 는 임베딩 엔진을 직접 만들지 않습니다 (설계서 §6.2·§5.2)');
+      }
+      try {
+        // 지식베이스 id·스토어 테넌트·제한 시간 검증은 `createRetriever` 하나다(§2) —
+        // 여기서 복사하면 한쪽만 고쳐지고, 고쳐지지 않은 쪽이 곧 §11.1 구멍이다.
+        retriever = createRetriever({
+          scope: opts.scope,
+          embedder,
+          store: kb.search.store,
+          knowledgeBaseIds: kb.search.knowledgeBaseIds,
+          ...(kb.search.storeTimeoutMs !== undefined ? { storeTimeoutMs: kb.search.storeTimeoutMs } : {}),
+        });
+      } catch (e) {
+        throw new Error(`지식 응대 배선 거부: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    if (!retriever || typeof retriever.retrieve !== 'function') {
       throw new Error('지식 응대 배선 거부: 검색기(retriever)가 없습니다 — Core 는 벡터 스토어를 직접 부르지 않습니다 (설계서 §6.2)');
     }
-    if (!kb.answerer || typeof kb.answerer.answer !== 'function') {
+    const answerer = kb.answerer ?? engineRuntime?.answerer;
+    if (!answerer || typeof answerer.answer !== 'function') {
       throw new Error('지식 응대 배선 거부: 답변기(answerer)가 없습니다 — Core 는 엔진을 직접 부르지 않습니다 (설계서 §6.2)');
     }
     try {
@@ -1160,6 +1224,22 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       assertRetrievalPolicy(kb.policy);
     } catch (e) {
       throw new Error(`지식 응대 배선 거부: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    knowledgeParts = { retriever, answerer };
+    // 엔진이 기동된 상태에서만 경고한다 — 엔진 미배선이면 호스트 조립이 유일한 경로이고,
+    // 그 사실은 이미 `W_ENGINES_UNBOUND` 가 적는다(같은 사실을 두 번 적지 않는다).
+    if (engineRuntime !== undefined) {
+      const hostBuilt: string[] = [];
+      if (kb.retriever !== undefined) hostBuilt.push('검색기(retriever)');
+      if (kb.answerer !== undefined) hostBuilt.push('답변기(answerer)');
+      if (hostBuilt.length > 0) {
+        warnings.push({
+          code: 'W_KNOWLEDGE_PARTS',
+          severity: 'warning',
+          messageKo: `엔진은 기동됐는데 ${hostBuilt.join('·')}를 호스트가 조립했습니다 — 그 호출은 재시도·대체·§9.3 헬스 샘플에 닿지 않습니다. `
+            + '엔진 기동 선언(engines.knowledge·engines.answer)으로 옮기면 Core 가 복원력이 붙은 엔진으로 만듭니다(§6.2·§9.3).',
+        });
+      }
     }
   }
 
@@ -1611,8 +1691,11 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       });
       return runnerSend(rec.flow, rec.state, { kind: 'unrecognized', text, ...latency }, ctx);
     }
+    // 구성요소는 **배선에서 확정한 한 벌**을 쓴다(`knowledgeParts`) — 턴마다 배선을 다시
+    // 읽으면 엔진 기동이 만든 쪽과 호스트가 준 쪽이 호출 시점에 갈릴 수 있다(§2).
+    const parts = knowledgeParts as NonNullable<typeof knowledgeParts>;
     const outcome = await resolveKnowledgeTurn(
-      { retriever: binding.retriever, answerer: binding.answerer, policy: binding.policy },
+      { retriever: parts.retriever, answerer: parts.answerer, policy: binding.policy },
       { scope: rec.scope, channel: rec.state.channel, text },
     );
     binding.onResult?.({

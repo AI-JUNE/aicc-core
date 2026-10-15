@@ -146,6 +146,27 @@ test('복구 프로브는 선언했을 때만 적고, 0건이면 사유까지 �
   assert.deepEqual(made.probeSkipped, []);
 });
 
+test('파생 구성요소는 기동 결과에서 읽는다 — 선언 한 줄과 "LLM 으로 나가게 됐다"를 구분한다', b, () => {
+  const args = ['--declaration', './x.mjs', '--expect-activation', 'dry_run'];
+  const none = m.judgeEnginePlan({ args: m.parseEnginePlanArgs(args), runtime: fakeRuntime() });
+  assert.deepEqual(none.derived, [], '선언하지 않은 파생이 적혔다');
+  assert.ok(m.formatEnginePlan(none).includes('파생 구성요소: 없음'), m.formatEnginePlan(none));
+
+  const made = m.judgeEnginePlan({
+    args: m.parseEnginePlanArgs(args),
+    runtime: fakeRuntime({
+      // 선언을 읽지 않는다 — 실제로 만들어진 것만 적는다(§13-3).
+      classifier: { classify: async () => ({}) },
+      answerer: { answer: async () => ({}) },
+    }),
+  });
+  assert.deepEqual(made.derived, ['classifier', 'answerer']);
+  const text = m.formatEnginePlan(made);
+  assert.ok(text.includes('파생 구성요소: classifier, answerer'), text);
+  // 지시문(응대 문안)은 설정 원문이므로 출력에 실리지 않는다(§10.3).
+  assert.ok(!text.includes('systemKo'), text);
+});
+
 // ── 실행기(실제 프로세스) ────────────────────────────────────────────────────
 
 test('실행기: 참조 선언은 dry_run 기대로 통과한다(종료코드 0)', b, () => {

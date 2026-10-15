@@ -83,6 +83,7 @@ test('선언 하나로 §6.2 EngineSet 이 선다 — 컴포넌트·후보·활�
   assert.equal(r.healthRecorded, false);
   assert.equal(r.classifier, undefined, '선언하지 않은 분류기가 생겼다');
   assert.equal(r.embedder, undefined, '선언하지 않은 임베딩 포트가 생겼다');
+  assert.equal(r.answerer, undefined, '선언하지 않은 답변기가 생겼다');
 });
 
 test('실엔진 규격 조각(OpenAI 호환 텍스트 + 음성)이 한 세트로 조립된다 — dry_run', b, () => {
@@ -285,6 +286,85 @@ test('expectDim 을 주지 않으면 검사하지 못한 범위를 적는다(§1
     r.limitsKo.some((x) => x.includes('expectDim')),
     `검사하지 못한 범위가 적히지 않았다: ${JSON.stringify(r.limitsKo)}`,
   );
+});
+
+// ── §5.2 답변기((파)) ────────────────────────────────────────────────────────
+
+/** 인용 1건을 가진 최소 근거. `decideGrounding` 산출물과 같은 형태다. */
+const GROUNDED = {
+  grounded: true,
+  context: '[1] 영업시간은 평일 9시부터 6시까지입니다.',
+  citations: [{
+    marker: 1, chunkId: 'd1#0', docId: 'd1', title: '영업시간 안내', sourceUri: 'kb://d1', score: 0.9,
+  }],
+  droppedForLength: 0,
+};
+const ANSWER_JSON = '{"sufficient":true,"answerKo":"평일 9시부터 6시까지입니다 [1]."}';
+
+test('답변기는 복원력이 붙은 LLM 으로 만들어진다 — 답변 실패도 §9.3 에 닿는다', b, async () => {
+  const reg = memRegistry();
+  const r = m.startEngines(
+    decl({
+      sets: [
+        { name: 'primary', parts: [fullPart({ llm: failingLlm('llm-down') }, 'a', 'live')] },
+        { name: 'backup', parts: [fullPart({ llm: llmAd('llm-backup', 'onprem', ANSWER_JSON) }, 'bk', 'live')] },
+      ],
+      resilience: { attemptsPerCandidate: 1 },
+      answer: { systemKo: '고객센터 상담원으로서 존댓말로 답한다.' },
+    }),
+    { record: reg.record, now: () => '2026-10-15T00:00:00.000Z' },
+  );
+  assert.ok(r.answerer, '선언한 답변기가 만들어지지 않았다');
+  const out = await r.answerer.answer({ questionMasked: '영업시간이요', grounding: GROUNDED });
+  assert.equal(out.status, 'ok');
+  assert.deepEqual(out.usedMarkers, [1]);
+  // 호스트가 조각에서 직접 만들었다면 이 샘플은 0건이고, 모든 질문이 조용히 실패한다.
+  assert.equal(reg.samples.length, 1, '답변 경로의 엔진 실패가 레지스트리에 닿지 않았다');
+});
+
+test('답변기는 근거가 없으면 엔진을 부르지 않는다(§5.2·§11.2)', b, async () => {
+  const r = m.startEngines(decl({ answer: { systemKo: '존댓말로 답한다.' } }));
+  const out = await r.answerer.answer({
+    questionMasked: '질문',
+    grounding: { grounded: false, reason: 'no_hits', reasonKo: '히트 없음', filtered: { unapproved: 0, expired: 0, missingMetadata: 0, belowScore: 0 } },
+  });
+  assert.equal(out.status, 'not_grounded');
+  assert.equal(out.promptChars, 0);
+});
+
+test('답변기 지시문이 없으면 기동이 거절된다 — Core 는 응대 문안을 만들지 않는다(§13-3)', b, () => {
+  assertConfigError(() => m.startEngines(decl({ answer: { systemKo: '   ' } })), '지시문');
+});
+
+test('국외이전 불허 테넌트에 해외 LLM 답변기는 기동 시점에 거절된다(§10.3)', b, () => {
+  // 질문만이 아니라 **지식 원문**이 통째로 나간다 — 통화 중이 아니라 기동에서 막는다.
+  assertConfigError(
+    () => m.startEngines(decl({
+      sets: [{ name: 'primary', parts: [fullPart({ llm: llmAd('gpt-x', 'overseas', ANSWER_JSON) })] }],
+      answer: { systemKo: '존댓말로 답한다.' },
+    })),
+    '국외이전',
+  );
+});
+
+test('답변기만 선언하면 검색기를 만들 수 없다는 사실을 적는다(§5.2·§13-3)', b, () => {
+  const r = m.startEngines(decl({ answer: { systemKo: '존댓말로 답한다.' } }));
+  assert.ok(r.answerer, '답변기가 만들어지지 않았다');
+  assert.equal(r.embedder, undefined);
+  assert.ok(
+    r.limitsKo.some((x) => x.includes('검색기')),
+    `검색기를 만들 수 없다는 사실이 적히지 않았다: ${JSON.stringify(r.limitsKo)}`,
+  );
+});
+
+test('임베딩까지 선언하면 그 한계는 적지 않는다 — 두 파생이 다 선다', b, () => {
+  const r = m.startEngines(decl({
+    sets: [{ name: 'primary', parts: [fullPart({ embedding: embAd('emb-1') })] }],
+    knowledge: { expectDim: 2 },
+    answer: { systemKo: '존댓말로 답한다.' },
+  }));
+  assert.ok(r.embedder && r.answerer);
+  assert.equal(r.limitsKo.some((x) => x.includes('검색기')), false, `한계가 잘못 적혔다: ${JSON.stringify(r.limitsKo)}`);
 });
 
 test('조각의 실측 사용량이 §11.2 근거로 모인다 — 복원력을 지나도 끊기지 않는다', b, () => {
