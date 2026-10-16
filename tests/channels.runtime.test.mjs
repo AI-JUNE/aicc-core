@@ -54,7 +54,7 @@ function fakePort(id = 'callbot', capsOver = {}, over = {}) {
   };
 }
 
-function build({ flows = [flowBilling], registry, port = fakePort(), ports, samples = [], policy = {}, components, newId, reprompt, timing, routing, connectors, channelSwitch, disclosure, intent, knowledge, consent, qa, observability, recovery, engines } = {}) {
+function build({ flows = [flowBilling], registry, port = fakePort(), ports, samples = [], policy = {}, components, newId, reprompt, timing, routing, connectors, channelSwitch, disclosure, intent, knowledge, consent, qa, observability, recovery, engines, retention } = {}) {
   const collector = B.createCollectorSink('t');
   const bus = B.createEventBus({
     scope: SCOPE, sinks: [collector],
@@ -86,6 +86,7 @@ function build({ flows = [flowBilling], registry, port = fakePort(), ports, samp
     ...(observability !== undefined ? { observability } : {}),
     ...(recovery !== undefined ? { recovery } : {}),
     ...(engines !== undefined ? { engines } : {}),
+    ...(retention !== undefined ? { retention } : {}),
   });
   return { core, port, collector, health };
 }
@@ -3561,4 +3562,148 @@ test('간격·제한 시간을 주지 않은 엔진 프로브는 돌지 않고 �
   const r = await core.runRecoveryProbes();
   assert.equal(r.attempts.find((a) => a.component === 'llm').skipped, 'no_interval');
   assert.equal(health.latest('llm').state, 'down');
+});
+
+// ── 보존 게이트 배선(§8.2) ─────────────────────────────────────────────────────
+//
+// 여기서 고정하는 것은 "지워진다"가 아니라 **지울 수 없는 것을 먼저 쌓지 않는다**이다.
+// 미배선의 증상은 예외가 아니라 되돌릴 수 없음이라, 통화가 정상인 동안 조용히 진행된다.
+
+const retRule = (dataClass, over = {}) => ({
+  dataClass, retentionDays: 30, disposition: 'delete', basisKo: '계약 제8조', approved: true, ...over,
+});
+const retPolicy = (rules, over = {}) => ({ tenantId: 'goone', rules, ...over });
+/** Core 가 묻는 네 분류를 다 채운 정책(bus·consent 배선까지 켠 경우의 최소 집합). */
+const retFull = (over = {}) => retPolicy([
+  retRule('transcript_masked'), retRule('interaction_event'),
+  retRule('pii_field'), retRule('consent_record', { disposition: 'archive' }),
+], over);
+
+test('보존 배선이 없으면 종전과 완전히 같고, 그 사실이 경고로 남는다(§13-3)', b, async () => {
+  const { core, port } = build();
+  const w = core.warnings().filter((i) => i.code === 'W_RETENTION_UNBOUND');
+  assert.equal(w.length, 1);
+  assert.match(w[0].messageKo, /되돌릴 수 없|기산 시점/);
+  // 종전 동작: 통화는 그대로 돌아간다(막지 않는다).
+  const r = await core.start(req());
+  assert.equal(r.status, 'running');
+  assert.equal(port.log.length, 1);
+});
+
+test('개인정보 분류에 보존 규칙이 없으면 기동을 거절한다 — 기한 없이 먼저 쌓이면 되돌릴 수 없다(§8.2)', b, () => {
+  assert.throws(
+    () => build({ retention: { policy: retPolicy([retRule('transcript_masked'), retRule('interaction_event')]) } }),
+    /보존 배선 거부[\s\S]*E_NO_RULE/,
+  );
+});
+
+test('미승인 규칙도 기동을 거절한다 [승인 필요]', b, () => {
+  assert.throws(
+    () => build({
+      retention: { policy: retPolicy([
+        retRule('transcript_masked'), retRule('interaction_event'), retRule('pii_field', { approved: false }),
+      ]) },
+    }),
+    /E_NOT_APPROVED/,
+  );
+});
+
+test('거절 사유는 분류마다 한 번에 다 나온다 — 하나씩 고치며 재배포하지 않게 한다', b, () => {
+  const c = consentWiring();
+  try {
+    build({ flows: [flowConsent()], consent: c.binding, retention: { policy: retPolicy([]) } });
+    assert.fail('거절되어야 한다');
+  } catch (e) {
+    // 개인정보 분류 둘(동의 기록·수집 항목)이 같은 메시지에 함께 적힌다.
+    assert.match(e.message, /동의 이력/);
+    assert.match(e.message, /개인정보 수집 항목/);
+    // 거절 사유에는 Core 가 그 분류를 왜 쓰는지가 함께 적힌다.
+    assert.match(e.message, /collectsPii/);
+  }
+});
+
+test('동의 배선이 없으면 동의 기록 분류는 묻지 않는다 — 쓰지 않는 저장소를 대신 통과시키지도, 막지도 않는다', b, () => {
+  // consent_record 규칙이 없는 정책이지만 동의가 배선되지 않았으므로 기동된다.
+  const { core } = build({
+    retention: { policy: retPolicy([
+      retRule('transcript_masked'), retRule('interaction_event'), retRule('pii_field'),
+    ]) },
+  });
+  assert.equal(core.warnings().some((i) => /동의 이력/.test(i.messageKo)), false);
+  // 같은 정책에 동의를 배선하면 그때는 거절된다.
+  assert.throws(
+    () => build({
+      flows: [flowConsent()],
+      consent: consentWiring().binding,
+      retention: { policy: retPolicy([
+        retRule('transcript_masked'), retRule('interaction_event'), retRule('pii_field'),
+      ]) },
+    }),
+    /동의 이력/,
+  );
+});
+
+test('개인정보를 수집하지 않는 테넌트는 collectsPii:false 로 선언하면 기동된다', b, async () => {
+  const { core } = build({
+    retention: {
+      policy: retPolicy([retRule('transcript_masked'), retRule('interaction_event'), retRule('recording')]),
+      collectsPii: false,
+    },
+  });
+  assert.equal(core.warnings().some((i) => i.code === 'W_RETENTION_UNBOUND'), false);
+  assert.equal(core.warnings().some((i) => i.code === 'W_RETENTION_NO_RULE'), false);
+  const r = await core.start(req());
+  assert.equal(r.status, 'running');
+});
+
+test('개인정보를 담지 않는 분류의 규칙 없음은 막지 않고 경고로 드러낸다 — 자동 파기 대상이 되지 않는다', b, () => {
+  // 음성 채널이 아닌 포트로 녹취 경고를 떼어 놓고 본다.
+  const { core } = build({ port: fakePort('chatbot'), retention: { policy: retPolicy([retRule('pii_field')]) } });
+  const w = core.warnings().filter((i) => i.code === 'W_RETENTION_NO_RULE');
+  // 마스킹된 전문 + §8.1 이벤트(버스 배선이 있다) 둘 다 규칙이 없다.
+  assert.equal(w.length, 2);
+  assert.ok(w.every((i) => /자동 파기/.test(i.messageKo)));
+  assert.ok(w.some((i) => /이벤트/.test(i.messageKo)));
+});
+
+test('음성 채널에 녹취 규칙이 없으면 막지 않고 드러낸다 — 녹취는 Core 가 저장하지 않는다(§8.2)', b, () => {
+  const policy = retPolicy([retRule('transcript_masked'), retRule('interaction_event'), retRule('pii_field')]);
+  const { core } = build({ retention: { policy } });                       // callbot = voice
+  const w = core.warnings().filter((i) => i.code === 'W_RETENTION_NO_RULE' && /녹취/.test(i.messageKo));
+  assert.equal(w.length, 1);
+  assert.match(w[0].messageKo, /파기 목록에 한 번도 올라오지 않/);
+  // 음성이 아닌 채널만 붙은 테넌트에는 적지 않는다(해당 없는 경고는 진짜 신호를 묻는다).
+  const chat = build({ port: fakePort('chatbot'), retention: { policy } });
+  assert.equal(chat.core.warnings().some((i) => /녹취/.test(i.messageKo)), false);
+  // 규칙을 채우면 사라진다.
+  const ok = build({ retention: { policy: retPolicy([...policy.rules, retRule('recording')]) } });
+  assert.equal(ok.core.warnings().some((i) => i.code === 'W_RETENTION_NO_RULE'), false);
+});
+
+test('다른 테넌트·워크스페이스의 보존 정책은 거절한다(§11.1)', b, () => {
+  assert.throws(() => build({ retention: { policy: retFull({ tenantId: 'other' }) } }), /§11\.1/);
+  assert.throws(() => build({ retention: { policy: retFull({ workspaceId: 'ws_x' }) } }), /§11\.1/);
+});
+
+test('보존기간으로 기한을 산출할 수 없는 규칙은 저장을 막는다 — 파기 판정이 영구 보류된다', b, () => {
+  assert.throws(
+    () => build({
+      retention: { policy: retPolicy([
+        retRule('transcript_masked'), retRule('interaction_event'), retRule('pii_field', { retentionDays: 0 }),
+      ]) },
+    }),
+    /E_RULE_INVALID/,
+  );
+});
+
+test('판정을 복사하지 않는다 — 규칙 조건이 runtime.ts 에 없다(§2)', b, async () => {
+  const { readFileSync } = await import('node:fs');
+  const { fileURLToPath } = await import('node:url');
+  const { dirname, join } = await import('node:path');
+  const src = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), '..', 'src/channels/runtime.ts'), 'utf8',
+  );
+  const code = src.split('\n').filter((l) => !l.trim().startsWith('//') && !l.trim().startsWith('*')).join('\n');
+  assert.equal(/mayContainPii/.test(code), false);
+  assert.equal(/retentionDays/.test(code), false);
 });

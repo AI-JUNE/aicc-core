@@ -364,3 +364,56 @@ test('승인된 규칙이 있으면 저장이 허용되고 경고가 없다', b,
   assert.equal(v.allowed, true);
   assert.equal(v.warningKo, undefined);
 });
+
+test('기한을 산출할 수 없는 규칙은 저장을 막는다 — 파기 판정이 영구 보류되는 조합이었다(§8.2)', b, () => {
+  // 규칙이 있고 승인까지 됐지만 보존기간으로 기한을 산출할 수 없다. 종전 구현은 이것을 통과시켰고,
+  // 그렇게 저장된 건은 `decide` 에서 영원히 blocked 가 된다 — 지울 근거도 기한도 없는 개인정보다.
+  for (const retentionDays of [0, -1, 2.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const pol = {
+      tenantId: 't1',
+      rules: [{ dataClass: 'pii_field', retentionDays, disposition: 'delete', basisKo: '계약', approved: true }],
+    };
+    const v = ret.canStore(pol, 'pii_field');
+    assert.equal(v.allowed, false, `retentionDays=${String(retentionDays)} 는 저장을 막아야 한다`);
+    assert.equal(v.code, 'E_RULE_INVALID');
+    assert.throws(() => ret.assertStorable(pol, 'pii_field'), /§8\.2/);
+    // 파기 쪽 판정과 같은 조건이어야 한다(저장은 되는데 파기는 안 되는 조합 방지).
+    assert.equal(ret.decide(rec('x', 'pii_field', OLD), pol, NOW).status, 'blocked');
+  }
+});
+
+test('개인정보가 아닌 분류도 같은 조건으로 막는다 — 기한 없는 규칙은 규칙이 아니다', b, () => {
+  const pol = {
+    tenantId: 't1',
+    rules: [{ dataClass: 'interaction_event', retentionDays: 0, disposition: 'delete', basisKo: '계약', approved: true }],
+  };
+  const v = ret.canStore(pol, 'interaction_event');
+  assert.equal(v.allowed, false);
+  assert.equal(v.code, 'E_RULE_INVALID');
+});
+
+test('보존기간 판정은 저장·파기·기한 산출이 같은 함수를 쓴다(§2)', b, () => {
+  for (const d of [0, -1, 2.5, Number.NaN]) {
+    assert.equal(ret.retentionDaysUsable(d), false);
+    assert.throws(() => ret.expiresAt(OLD, d), /보존기간/);
+  }
+  assert.equal(ret.retentionDaysUsable(1), true);
+  assert.equal(typeof ret.expiresAt(OLD, 1), 'string');
+});
+
+test('규칙 목록이 배열이 아니어도 게이트가 던지지 않는다 — 게이트의 예외는 게이트가 꺼진 것과 같다', b, () => {
+  for (const rules of [undefined, null, 'rules', 7]) {
+    const pol = { tenantId: 't1', rules };
+    const v = ret.canStore(pol, 'pii_field');
+    assert.equal(v.allowed, false);
+    assert.equal(v.code, 'E_NO_RULE');
+    // 개인정보를 담지 않는 분류는 종전처럼 막지 않고 경고만 낸다.
+    const e = ret.canStore(pol, 'interaction_event');
+    assert.equal(e.allowed, true);
+    assert.ok(e.warningKo.includes('자동 파기'));
+    // 파기 쪽도 같은 이유로 던지지 않는다 — 정책 한 칸 때문에 그날 전건의 파기가 밀리면 안 된다.
+    const plan = ret.planDisposition([rec('x', 'pii_field', OLD)], pol, NOW);
+    assert.equal(plan.blocked.length, 1);
+    assert.equal(plan.due.length, 0);
+  }
+});

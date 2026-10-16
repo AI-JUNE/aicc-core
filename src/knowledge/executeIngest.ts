@@ -28,6 +28,16 @@
 //      미승인 문서도 메타데이터를 달고 저장되고, 답변 근거가 될지는 검색 정책이 정한다.
 //  (5) **마스킹 전 본문을 저장한다.** `prepareIngest` 가 이미 마스킹했고 그 결과만 저장된다 —
 //      여기서 원문을 다시 섞으면 지식베이스가 영구 개인정보 저장소가 된다(§10.3).
+//  (6) **색인한 것을 파기 목록에 넣을 선언을 아무도 만들지 않는다.** `vector_index` 는
+//      `LEDGER_BLIND_CLASSES` 다 — §8.1 원장에는 색인의 흔적이 없고, `retentionInventory.ts` 가
+//      적어 둔 대로 **선언(`declared`)만이 유일한 근거**다. 그런데 선언을 만들 수 있는 유일한
+//      자리가 여기(저장하는 자리)인데 그것을 만들지 않았으므로, 지금까지 색인은 **보존기간이
+//      지나도 파기 목록에 한 번도 올라오지 않았다**. 증상은 예외가 아니라 잔류다: 원본 문서를
+//      기한대로 파기한 뒤에도 그 본문이 청크로 남아 **계속 근거로 인용된다**((1)과 같은 결말이고
+//      이쪽은 문서 단위가 아니라 지식베이스 전체에서 영구히 일어난다). 그래서 저장한 건에 대해
+//      **그 선언을 만들어 결과에 싣는다** — 만들 수 없으면(색인 시각 미선언) 지어내지 않고
+//      **그 사실을 적는다**(§13-3). 받아들여질 선언인지는 `declaredRecordDefect` 하나가 보고,
+//      여기서 형식을 다시 검사하지 않는다(어긋나면 그 분류가 조용히 목록에서 빠진다, §2).
 //
 // 하지 않는 것: **실호출을 하지 않는다**(임베딩 엔진·벡터 스토어는 주입이며 §6.2 인터페이스 뒤다 —
 // 실엔진·실 DB 연결은 [승인 필요]) · **청크 크기·차원·배치 기본값을 만들지 않는다**(§13-3) ·
@@ -37,6 +47,8 @@ import type { EngineErrorCode } from '../adapters/http.ts';
 import type { TenantScope, TenantVectorStore, VectorDoc } from '../core/tenancy.ts';
 import { assertTenantScope } from '../core/tenancy.ts';
 import { maskPii } from '../core/policyGuard.ts';
+import type { DeclaredRetainedRecord } from '../core/retentionInventory.ts';
+import { declaredRecordDefect, retainedRecordId } from '../core/retentionInventory.ts';
 import type { ChunkOptions, KnowledgeDoc } from './rag.ts';
 import { assertChunkOptions, prepareIngest } from './rag.ts';
 import type { BatchFailure, Embedder } from './embedding.ts';
@@ -66,6 +78,14 @@ export interface IngestDocumentInput {
    * 모르면 검사하지 못했다는 사실을 결과에 적는다(`staleUnchecked`) — 추측하지 않는다(§13-3).
    */
   previousChunkCount?: number;
+  /**
+   * 색인 시각(ISO8601, **오프셋 명시**). §8.2 파기 선언의 기산 시점이다 —
+   * 주지 않으면 선언을 만들지 않고, 그 색인은 파기 목록에 잡히지 않는다는 사실을 결과에 적는다.
+   * Core 가 `new Date()` 로 지어내지 않는 이유는 색인이 운영 작업이라 **배치가 실제로 읽은
+   * 시각**이 기산 시점이어야 하고(재색인·백필에서 어긋난다), 시각을 Core 가 만들면 그 선언이
+   * 어느 시점의 것인지 호스트 장부와 맞출 수 없기 때문이다(§13-3).
+   */
+  at?: string;
 }
 
 export type IngestStatus =
@@ -105,6 +125,15 @@ export interface IngestReport {
   /** 실측만 싣는다(§11.2). 토큰은 어댑터가 주지 않으므로 만들지 않는다. */
   usage: { embedTexts: number; embedChars: number; embedBatches: number };
   engine: Embedder['engine'];
+  /**
+   * 이 색인 건의 §8.2 파기 선언. `projectRetainedRecords({ declared })` 에 그대로 넘긴다 —
+   * 색인 분류(`vector_index`)는 원장에 근거가 없어 **이 선언만이 근거**다.
+   * **없을 수 있다**: 색인 시각 미선언·형식 불일치·저장된 것이 없는 경우(§13-3) —
+   * 그때는 `retentionNoteKo` 가 왜 없는지 적는다. 빈 선언을 만들지 않는다.
+   */
+  retentionDeclaration?: DeclaredRetainedRecord;
+  /** 파기 선언을 만들지 못한 사유, 또는 만들었다는 사실. 숨기지 않는다. */
+  retentionNoteKo?: string;
 }
 
 /**
@@ -196,6 +225,40 @@ export async function ingestDocument(
     }
   }
 
+  /**
+   * §8.2 파기 선언. **저장된 것이 있을 수 있는 경우에만** 만든다 — `stored` 와, 저장 범위를
+   * 확정할 수 없는 `store_failed` 가 그렇다. 후자에서 만들지 않는 쪽을 고르면 들어간 청크가
+   * 영영 파기 목록에 잡히지 않고 그건 되돌릴 수 없는 쪽이다. 만드는 쪽의 비용은 없는 레코드를
+   * 지우려는 시도 한 번이고, 그건 되돌릴 수 없는 쪽이 아니다.
+   *
+   * 선언을 만들었다는 사실도 적는다 — **결과에 실린 선언을 호스트가 투영에 넘기지 않으면
+   * 아무 일도 일어나지 않기 때문이다**(이 모듈은 투영을 부르지 않는다, §6.2).
+   */
+  function declaration(): { retentionDeclaration?: DeclaredRetainedRecord; retentionNoteKo: string } {
+    const blindKo = '색인 분류는 §8.1 원장에 근거가 없어 선언만이 유일한 근거입니다 — '
+      + '선언이 없으면 보존기간이 지난 청크가 파기 목록에 잡히지 않고, 원본 문서를 기한대로 파기한 '
+      + '뒤에도 그 본문이 계속 근거로 인용됩니다 (설계서 §8.2)';
+    if (input.at === undefined) {
+      return { retentionNoteKo: `색인 시각(at)이 선언되지 않아 파기 선언을 만들지 않았습니다 — ${blindKo}` };
+    }
+    const d: DeclaredRetainedRecord = {
+      id: retainedRecordId('vector_index', `${input.knowledgeBaseId}/${base.docId}`),
+      dataClass: 'vector_index',
+      createdAt: input.at,
+    };
+    // 형식 판정은 투영과 **같은 함수**다(§2). 어긋난 선언을 그대로 내보내면 투영이 조용히
+    // 거절하고(`declaredRejected`), 그 분류가 목록에서 빠진 사실은 집계에만 남는다.
+    const defect = declaredRecordDefect(d);
+    if (defect !== undefined) {
+      return { retentionNoteKo: `파기 선언을 만들지 않았습니다(${defect}) — ${blindKo}` };
+    }
+    return {
+      retentionDeclaration: d,
+      retentionNoteKo: '파기 선언(retentionDeclaration)을 만들었습니다 — '
+        + 'projectRetainedRecords 의 declared 로 넘기지 않으면 이 색인은 파기 목록에 잡히지 않습니다',
+    };
+  }
+
   if (prepared.length === 0) {
     // **0건 저장을 성공으로 적지 않는다.** 본문이 비워진 개정은 "삭제"에 가깝고, 그대로 두면
     // 색인에는 옛 본문만 남는다. 직전 청크 수를 알면 그 전부가 고아다.
@@ -243,6 +306,7 @@ export async function ingestDocument(
     if (e instanceof Error && e.message.includes('§11.1')) throw e;
     return {
       ...withUsage,
+      ...declaration(),
       status: 'store_failed',
       // **chunksStored 를 적지 않는다** — 어디까지 들어갔는지 알 방법이 없다(위 (3)).
       reasonKo: `저장에 실패했습니다(${e instanceof Error ? e.name : '알 수 없는 예외'}) — `
@@ -256,6 +320,7 @@ export async function ingestDocument(
   const c = await cleanup(stale);
   return {
     ...withUsage,
+    ...declaration(),
     status: 'stored',
     chunksStored: docs.length,
     storedChunkIds: docs.map((d) => d.id),

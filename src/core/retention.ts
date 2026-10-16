@@ -134,7 +134,7 @@ export function validateRetentionPolicy(policy: RetentionPolicy): string[] {
 // 개인정보를 담지 않는 분류는 규칙이 없어도 **막지 않는다** — 막으면 설정을 다 채우기 전에는
 // 이벤트 한 건도 못 쌓아 도입 자체가 불가능해진다. 대신 경고로 드러낸다(조용히 넘기지 않는다).
 
-export type StorabilityCode = 'E_UNKNOWN_CLASS' | 'E_NO_RULE' | 'E_NOT_APPROVED';
+export type StorabilityCode = 'E_UNKNOWN_CLASS' | 'E_NO_RULE' | 'E_NOT_APPROVED' | 'E_RULE_INVALID';
 
 export type StorabilityVerdict =
   | { allowed: true; warningKo?: string }
@@ -143,6 +143,12 @@ export type StorabilityVerdict =
 /**
  * 이 분류를 지금 저장해도 되는가(§8.2). 판정만 하고 던지지 않는다 —
  * 호출자가 "거절"과 "경고"를 구분해 처리할 수 있어야 하기 때문이다.
+ *
+ * **던지지 않는다는 약속을 규칙 목록이 깨뜨리지 않게 한다.** `rules` 가 배열이 아닌 정책
+ * (타입이 없는 호스트가 `{ tenantId }` 만 넘긴 경우)에서 종전 구현은 `TypeError` 로 끝났다 —
+ * 게이트가 예외로 죽으면 호출자는 "거절"과 "게이트가 고장났다"를 구분할 수 없고, 저장 경로에서
+ * 그 예외를 삼키는 코드가 한 줄이라도 있으면 **게이트가 꺼진 채 개인정보가 쌓인다**.
+ * 규칙이 없는 것으로 보는 쪽이 안전한 방향이다(개인정보 분류는 그대로 거절된다).
  */
 export function canStore(policy: RetentionPolicy, dataClass: DataClass): StorabilityVerdict {
   let spec: DataClassSpec;
@@ -151,7 +157,8 @@ export function canStore(policy: RetentionPolicy, dataClass: DataClass): Storabi
   } catch {
     return { allowed: false, code: 'E_UNKNOWN_CLASS', reasonKo: `알 수 없는 데이터 분류: ${dataClass} (설계서 §8.2)` };
   }
-  const rule = policy.rules.find((r) => r.dataClass === dataClass);
+  const rules = Array.isArray(policy?.rules) ? policy.rules : [];
+  const rule = rules.find((r) => r?.dataClass === dataClass);
   if (!rule) {
     if (spec.mayContainPii) {
       return {
@@ -169,6 +176,20 @@ export function canStore(policy: RetentionPolicy, dataClass: DataClass): Storabi
       reasonKo: `${spec.titleKo}: 보존 규칙이 미승인 상태라 저장할 수 없습니다 [승인 필요]`,
     };
   }
+  // **규칙이 있다는 것과 그 규칙으로 기한을 산출할 수 있다는 것은 다르다.** 종전 구현은 규칙의
+  // 존재와 승인만 보고 통과시켰는데, `retentionDays` 가 0·음수·정수 아님이면 `decide` 는 기한을
+  // 산출하지 못해 그 레코드를 **영원히 `blocked`** 로 적는다 — 위 머리말이 막겠다고 적어 둔
+  // "지울 근거도 지울 기한도 없는 개인정보"가 **규칙이 있는 상태로** 생긴다. 저장 판정과 파기
+  // 판정이 갈리는 유일하게 남아 있던 자리였고, 둘을 `retentionDaysUsable` 하나로 묻게 해서 닫는다
+  // (숫자 조건을 여기 다시 쓰면 한쪽만 고쳐지는 날이 온다, §2).
+  if (!retentionDaysUsable(rule.retentionDays)) {
+    return {
+      allowed: false,
+      code: 'E_RULE_INVALID',
+      reasonKo: `${spec.titleKo}: 보존기간으로 파기 기한을 산출할 수 없어 저장할 수 없습니다 `
+        + `— 이 규칙으로 저장하면 파기 판정이 영구히 보류됩니다 (설계서 §8.2)`,
+    };
+  }
   return { allowed: true };
 }
 
@@ -178,17 +199,34 @@ export function assertStorable(policy: RetentionPolicy, dataClass: DataClass): v
   if (!v.allowed) throw new Error(v.reasonKo);
 }
 
+/**
+ * `canStore` 와 **같은 이유로** 규칙 목록을 방어한다(위 주석): `rules` 가 배열이 아니면 종전에는
+ * `decide` 가 `TypeError` 로 끝났고, 그러면 `planDisposition` 이 통째로 예외가 되어 **그날 만 건의
+ * 파기가 전부 밀린다** — 이 파일이 "손상된 한 건 때문에 전체를 멈추지 않는다"고 적어 둔 것과
+ * 같은 실패를 정책 한 칸이 일으키는 셈이다. 규칙이 없는 것으로 보면 그 건은 `blocked` 로
+ * **보고서에 남고** 운영이 해소할 수 있다.
+ */
 export function ruleFor(policy: RetentionPolicy, dataClass: DataClass): RetentionRule | undefined {
-  return policy.rules.find((r) => r.dataClass === dataClass);
+  if (!Array.isArray(policy?.rules)) return undefined;
+  return policy.rules.find((r) => r?.dataClass === dataClass);
 }
 
 // ── 만료 판정(순수 함수) ────────────────────────────────────────────────────────
+
+/**
+ * 이 보존기간으로 파기 기한을 산출할 수 있는가. **저장 판정(`canStore`)과 파기 판정(`decide`)이
+ * 같은 함수로 묻는다** — 숫자 조건을 두 곳에 쓰면 한쪽만 고쳐지는 날이 오고, 그 조합은
+ * "저장은 되는데 파기는 안 되는" 쪽으로만 틀린다(§2·§8.2).
+ */
+export function retentionDaysUsable(retentionDays: unknown): boolean {
+  return Number.isInteger(retentionDays) && (retentionDays as number) > 0;
+}
 
 /** 기산 시각 + 보존기간. 잘못된 날짜는 조용히 넘기지 않는다. */
 export function expiresAt(createdAt: string, retentionDays: number): string {
   const t = Date.parse(createdAt);
   if (Number.isNaN(t)) throw new Error(`기산 시각을 해석할 수 없다: ${JSON.stringify(createdAt)}`);
-  if (!Number.isInteger(retentionDays) || retentionDays <= 0) {
+  if (!retentionDaysUsable(retentionDays)) {
     throw new Error(`보존기간이 유효하지 않다: ${retentionDays}`);
   }
   return new Date(t + retentionDays * DAY_MS).toISOString();

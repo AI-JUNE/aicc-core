@@ -266,3 +266,73 @@ test('근거 판정 규칙이 이 파일에 없다(§2·§7)', b, async () => {
     assert.equal(new RegExp(`\\b${name}\\s*[(=.]`).test(src), false, `판정을 복사하고 있다: ${name}`);
   }
 });
+
+// ── §8.2 파기 선언 ───────────────────────────────────────────────────────────
+//
+// 색인 분류는 원장에 근거가 없어 선언만이 근거다. 선언이 없으면 예외도 장애도 없이
+// **원본을 파기한 뒤에도 청크가 남아 계속 인용되는** 상태가 영구히 유지된다.
+
+const AT = '2026-10-16T09:00:00+09:00';
+
+test('저장한 색인은 파기 선언을 만든다 — 선언이 없으면 파기 목록에 영영 잡히지 않는다(§8.2)', b, async () => {
+  const r = await run({}, { at: AT });
+  assert.equal(r.status, 'stored');
+  assert.deepEqual(r.retentionDeclaration, {
+    id: 'vector_index:kb_faq/d_fee', dataClass: 'vector_index', createdAt: AT,
+  });
+  assert.match(r.retentionNoteKo, /declared/);
+});
+
+test('색인 실행기가 만든 선언은 파기 투영이 그대로 받는다(경계)', b, async () => {
+  const RI = await import('../src/core/retentionInventory.ts');
+  const r = await run({}, { at: AT });
+  const inv = RI.projectRetainedRecords([], { scope: SCOPE, declared: [r.retentionDeclaration] });
+  assert.equal(inv.counters.declaredRejected, 0, `거절됨: ${inv.declaredRejectionsKo.join(' · ')}`);
+  assert.equal(inv.counters.declaredAccepted, 1);
+  assert.equal(inv.records[0].dataClass, 'vector_index');
+  assert.equal(inv.records[0].createdAt, AT);
+  // 선언이 들어왔으므로 색인은 "근거 없는 분류"에서 빠진다.
+  assert.equal(inv.classesWithoutEvidence.includes('vector_index'), false);
+});
+
+test('색인 시각을 주지 않으면 선언을 지어내지 않고 그 사실을 적는다(§13-3)', b, async () => {
+  const r = await run();
+  assert.equal(r.status, 'stored');
+  assert.equal(r.retentionDeclaration, undefined);
+  assert.match(r.retentionNoteKo, /색인 시각/);
+  assert.match(r.retentionNoteKo, /파기 목록에 잡히지 않/);
+});
+
+test('오프셋 없는 색인 시각은 선언이 되지 않는다 — 투영과 같은 판정이다(§2)', b, async () => {
+  const r = await run({}, { at: '2026-10-16T09:00:00' });
+  assert.equal(r.retentionDeclaration, undefined);
+  assert.match(r.retentionNoteKo, /오프셋/);
+});
+
+test('저장 범위를 확정할 수 없는 실패에도 선언은 만든다 — 들어간 청크를 영영 못 지우는 쪽이 되돌릴 수 없다', b, async () => {
+  const r = await run({ store: storeOf({ upsertThrows: new Error('timeout') }) }, { at: AT });
+  assert.equal(r.status, 'store_failed');
+  assert.equal(r.chunksStored, undefined);
+  assert.equal(r.retentionDeclaration.dataClass, 'vector_index');
+});
+
+test('저장한 것이 없으면 선언을 만들지 않는다 — 없는 레코드를 파기 목록에 올리지 않는다', b, async () => {
+  const empty = await run({}, { at: AT, doc: undefined });
+  assert.equal(empty.retentionDeclaration, undefined);
+  const noChunks = await I.ingestDocument(
+    { scope: SCOPE, store: storeOf(), embedder: embedderOf(), chunk: CHUNK },
+    { knowledgeBaseId: 'kb_faq', doc: { ...DOC, text: '   ' }, at: AT },
+  );
+  assert.equal(noChunks.status, 'empty_document');
+  assert.equal(noChunks.retentionDeclaration, undefined);
+});
+
+test('식별자에 개인정보가 섞인 문서는 선언이 되지 않고 사유가 남는다(§10.3)', b, async () => {
+  const r = await I.ingestDocument(
+    { scope: SCOPE, store: storeOf(), embedder: embedderOf(), chunk: CHUNK },
+    { knowledgeBaseId: 'kb_faq', doc: { ...DOC, docId: 'd_010-1234-5678' }, at: AT },
+  );
+  assert.equal(r.status, 'stored');
+  assert.equal(r.retentionDeclaration, undefined);
+  assert.match(r.retentionNoteKo, /개인정보/);
+});

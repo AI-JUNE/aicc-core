@@ -384,7 +384,7 @@ export function projectRetainedRecords(
 
   // 선언 레코드. 잘린 투영과 무관하므로(세션 묶음에 의존하지 않는다) 그대로 받는다.
   for (const d of opts.declared ?? []) {
-    const defect = declaredDefect(d);
+    const defect = declaredRecordDefect(d);
     if (defect !== undefined) {
       counters.declaredRejected += 1;
       if (!declaredRejectionsKo.includes(defect)) declaredRejectionsKo.push(defect);
@@ -463,8 +463,15 @@ function buildRecord(
   return rec;
 }
 
-/** 선언 레코드의 결함. 사유 문구는 호스트 값을 되싣지 않는다(§10.3). */
-function declaredDefect(d: DeclaredRetainedRecord): string | undefined {
+/**
+ * 선언 레코드의 결함. 사유 문구는 호스트 값을 되싣지 않는다(§10.3).
+ *
+ * **공개한 이유**: 선언을 만드는 쪽(색인 실행기 등)이 "이 선언이 받아들여질까"를 물을 데가
+ * 없으면 각자 형식을 검사하게 되고, 그 검사는 여기와 어긋난다 — 어긋난 선언은 예외가 아니라
+ * `declaredRejected` 로만 집계되므로 **그 분류가 파기 목록에 영영 들어오지 않는 상태**가
+ * 조용히 유지된다. 판정은 이 함수 하나다(§2).
+ */
+export function declaredRecordDefect(d: DeclaredRetainedRecord): string | undefined {
   if (!d || typeof d.id !== 'string' || d.id.trim() === '') return 'id 누락';
   if (maskPii(d.id).masked) return '식별자에 개인정보 패턴';
   if (!DATA_CLASSES.some((s) => s.id === d.dataClass)) return '알 수 없는 데이터 분류';

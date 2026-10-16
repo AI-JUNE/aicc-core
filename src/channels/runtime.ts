@@ -25,6 +25,8 @@ import type { TurnTimingPolicy } from '../flow/timing.ts';
 import { turnTimingPolicyOk, validateTurnTimingPolicy } from '../flow/timing.ts';
 import type { TenantScope, TenantVectorStore } from '../core/tenancy.ts';
 import { assertTenantScope } from '../core/tenancy.ts';
+import type { DataClass, RetentionPolicy } from '../core/retention.ts';
+import { canStore } from '../core/retention.ts';
 import type { EventMeta, InteractionEvent, LatencyMs, TurnCompletedEvent, HandoffRequestedEvent, UsageMetrics } from '../events/schema.ts';
 import { sessionStarted, sessionEnded, handoffRequested, turnCompleted } from '../events/schema.ts';
 import type { EventBus, PublishResult } from '../events/bus.ts';
@@ -201,6 +203,44 @@ export function createMemorySessionStore(): SessionStore {
     remove: (id) => { map.delete(id); },
     ids: () => [...map.keys()],
   };
+}
+
+/**
+ * 보존 정책 배선(§8.2). `core/retention.ts` 의 `canStore` 는 "저장해도 되는가"를 묻는 자리를
+ * 열어 두었지만, **그 자리를 부르는 코드가 저장소 어디에도 없었다** — 그래서 Core 는 보존기간이
+ * 정해지지 않은 테넌트에서도 세션(슬롯 원문·마스킹된 전문)과 이벤트·동의 기록을 그대로 쌓았다.
+ *
+ * 이 미배선의 증상은 예외가 아니라 **되돌릴 수 없음**이다. 한 번 쌓인 건의 기산 시점은 나중에
+ * 기한을 정해도 되돌릴 수 없고, 규칙이 없는 동안 `decide` 는 그 건을 영원히 `blocked` 로 적는다 —
+ * 파기 스윕(§8.2)은 매번 "지울 수 없는 건"만 세고, 그 사이 개인정보는 계속 남는다. 통화·이벤트·
+ * 적합성 검사·헬스는 전부 정상이라 드러나는 시점은 대개 감독기관 점검이고, 그때 대상은
+ * **지나간 통화 전부**다.
+ *
+ * **주지 않으면 종전과 완전히 같다**(§13-3) — 아무것도 묻지 않고, 그 사실이
+ * `W_RETENTION_UNBOUND` 경고로 남는다.
+ *
+ * 묻는 시점은 **생성 시점 한 번**이다. 통화 중에 물으면 거절이 곧 무음이 되고(고객은 아무 안내
+ * 없이 끊긴 회선을 붙잡는다), 분류 집합은 세션마다 달라지지 않으므로 턴마다 물을 이유도 없다.
+ * 설정 오류는 배포할 때 시끄럽게 드러나는 것이 맞다(라우팅·전환·동의 배선과 같은 규칙).
+ *
+ * **판정을 복사하지 않는다**(§2): 규칙 유무·승인·기한 산출 가능 여부는 `canStore` 하나가 본다 —
+ * 검사가 이 파일에 `mayContainPii`·`retentionDays` 가 없음을 고정한다.
+ */
+export interface RetentionBinding {
+  /** 테넌트 법적 검토로 확정된 보존 정책(§8.2). Core 는 기본값을 만들지 않는다(§13-3). */
+  policy: RetentionPolicy;
+  /**
+   * 이 조립이 세션 슬롯에 개인정보를 담는가(§8.2 `pii_field`).
+   *
+   * Core 는 슬롯 이름만 보고 개인정보 여부를 알 수 없다 — `CollectNode` 에 분류 선언이 없고,
+   * 추측해서 적으면 두 방향 모두 나쁘다(과하게 적으면 멀쩡한 테넌트의 기동이 막히고, 적게 적으면
+   * 기한 없는 개인정보가 쌓인다). 그래서 선언을 받되 **기본값은 "담는다"** 다 — 여기서는
+   * 빠뜨린 쪽이 안전한 방향으로 틀려야 한다(되돌릴 수 있는 쪽은 기동 거절이고, 되돌릴 수 없는
+   * 쪽은 이미 쌓인 개인정보다).
+   *
+   * 개인정보를 한 건도 수집하지 않는 시나리오만 운영하는 테넌트는 `false` 로 선언한다.
+   */
+  collectsPii?: boolean;
 }
 
 /**
@@ -652,6 +692,12 @@ export interface ConversationCoreOptions {
    * 남기지 않는다(dry_run 성공은 실엔진 관측이 아니다).
    */
   engines?: EngineStartupDeclaration;
+  /**
+   * 보존 정책(§8.2). **주지 않으면 종전과 완전히 같다**(§13-3) — Core 는 저장해도 되는지
+   * 묻지 않고, 그 사실이 `W_RETENTION_UNBOUND` 경고로 남는다. 자세한 내용은
+   * `RetentionBinding` 주석.
+   */
+  retention?: RetentionBinding;
   now?: () => string;
   newInteractionId?: (req: ChannelSessionRequest) => string;
   onPublish?: (results: PublishResult[]) => void;
@@ -1070,6 +1116,90 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
         + '같은 판정의 출처가 둘이면 어느 쪽이 적용됐는지 알 수 없다 (설계서 §10.1·§2)',
       );
     }
+  }
+
+  // 보존 게이트(§8.2)도 **배포 시점에** 묻는다. 통화 중에 물으면 거절이 곧 무음이고, 분류
+  // 집합은 세션마다 달라지지 않는다. **Core 가 실제로 쓰는 분류만** 기동 조건으로 삼는 것이
+  // 요점이다 — 녹취(`recording`)·RAG 색인(`vector_index`)·감사로그(`audit_log`)를 쓰는 것은
+  // 채널 저장소·벡터 DB·감사 저장소이고, 그쪽이 자기 저장 경로에서 같은 `canStore` 를 물어야
+  // 한다. 여기서 대신 물어 통과시키면 "확인했다"는 남지만 확인한 주체는 아무도 없다(§13-3).
+  // (녹취만은 음성 채널이 등록된 경우에 **경고로** 드러낸다 — 아래 주석 참조. 막지는 않는다.)
+  if (opts.retention !== undefined) {
+    const policy = opts.retention.policy;
+    if (policy === null || typeof policy !== 'object') {
+      throw new Error(
+        '보존 배선 거부: 보존 정책이 없다 — 보존기간·근거·승인은 테넌트 법적 검토 결과이며 '
+        + 'Core 가 만들지 않는다 (설계서 §8.2·§13-3)',
+      );
+    }
+    if (policy.tenantId !== opts.scope.tenantId
+      || (policy.workspaceId ?? undefined) !== (opts.scope.workspaceId ?? undefined)) {
+      // 조용히 덮어쓰지 않는다: 남의 기한으로 이 테넌트의 개인정보를 재면 두 방향 모두 틀린다 —
+      // 길면 기한이 지난 개인정보가 남고, 짧으면 분쟁 중인 건이 먼저 지워진다(되돌릴 수 없다).
+      throw new Error('보존 배선 거부: 다른 테넌트·워크스페이스의 보존 정책 (설계서 §11.1)');
+    }
+    // 분류마다 **Core 가 그것을 왜 쓰는지**를 같이 적는다 — 거절 메시지만 보고 "우리는 그걸
+    // 저장하지 않는데"로 막히면 운영은 규칙을 지어내거나 배선을 떼는 쪽으로 간다.
+    const written: { dataClass: DataClass; whyKo: string }[] = [
+      { dataClass: 'transcript_masked', whyKo: '세션에 마스킹된 턴을 쌓는다 — 이관 요약의 원천이다(§2·§10.3)' },
+    ];
+    if (opts.bus !== undefined) {
+      written.push({ dataClass: 'interaction_event', whyKo: '턴마다 §8.1 이벤트를 발행한다' });
+    }
+    if (opts.consent !== undefined) {
+      written.push({ dataClass: 'consent_record', whyKo: '동의 배선이 동의 기록을 이력 저장소에 남긴다(§10.1)' });
+    }
+    if (opts.retention.collectsPii !== false) {
+      written.push({
+        dataClass: 'pii_field',
+        whyKo: '세션 슬롯에 고객이 입력한 값이 원문으로 남는다 — 개인정보를 수집하지 않는 테넌트는 '
+          + 'retention.collectsPii: false 로 선언한다',
+      });
+    }
+    const refusals: string[] = [];
+    for (const w of written) {
+      const verdict = canStore(policy, w.dataClass);
+      if (verdict.allowed) {
+        if (verdict.warningKo !== undefined) {
+          warnings.push({
+            code: 'W_RETENTION_NO_RULE',
+            severity: 'warning',
+            messageKo: `${verdict.warningKo} — ${w.whyKo}`,
+          });
+        }
+        continue;
+      }
+      refusals.push(`${verdict.code}: ${verdict.reasonKo} (${w.whyKo})`);
+    }
+    // 녹취는 Core 가 저장하지 않으므로 **막지 않는다** — 막는 것은 그 저장소(채널)의 몫이고,
+    // 여기서 막으면 녹음을 끄고 운영하는 테넌트의 기동까지 같이 막힌다. 다만 음성 채널이 등록된
+    // 상태에서 녹취 규칙이 없다는 사실은 드러낸다: `recording` 은 §8.1 원장에 흔적이 없는 분류라
+    // (`LEDGER_BLIND_CLASSES`) 규칙·선언이 없으면 **기한이 지난 통화 녹음이 파기 목록에 한 번도
+    // 올라오지 않고**, 그 상태가 스윕 결과에서는 "오늘도 깨끗함"으로 보인다. 파기 투영이
+    // `voiceSessions` 로 적는 것과 같은 사실을 **첫 통화보다 먼저** 적는 것이다.
+    const recording = canStore(policy, 'recording');
+    if (!recording.allowed && opts.channels.some((r) => r.port.capabilities.channel === 'voice')) {
+      warnings.push({
+        code: 'W_RETENTION_NO_RULE',
+        severity: 'warning',
+        messageKo: `음성 채널이 등록됐으나 녹취 보존 규칙이 성립하지 않습니다(${recording.code}) — 녹취는 채널 `
+          + '저장소가 저장하므로 Core 는 기동을 막지 않습니다. 다만 §8.1 원장에는 녹취의 흔적이 없어, '
+          + '규칙과 파기 선언이 없으면 기한이 지난 통화 녹음이 파기 목록에 한 번도 올라오지 않습니다 (설계서 §8.2)',
+      });
+    }
+    // **전부 모아서** 거절한다 — 하나씩 드러내면 운영은 고치고 재배포하기를 분류 수만큼 되풀이한다.
+    if (refusals.length > 0) {
+      throw new Error(`보존 배선 거부: ${refusals.join(' / ')}`);
+    }
+  } else {
+    warnings.push({
+      code: 'W_RETENTION_UNBOUND',
+      severity: 'warning',
+      messageKo: '보존 정책이 배선되지 않았습니다(retention) — 저장해도 되는지 한 번도 묻지 않습니다(§8.2). '
+        + '이 상태에서 보존기간이 정해지지 않은 분류의 데이터가 쌓이면 기산 시점을 되돌릴 수 없고, '
+        + '파기 판정은 그 건을 영구히 보류(blocked)로 적습니다 — 지울 근거도 기한도 없는 개인정보가 남습니다. '
+        + '통화·이벤트·헬스는 전부 정상이라 드러나는 시점이 감독기관 점검이면 지나간 통화 전부가 대상입니다.',
+    });
   }
 
   /**
