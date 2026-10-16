@@ -1742,7 +1742,18 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     const steps: RenderedStep[] = [...run.steps];
     const events: InteractionEvent[] = [...run.events];
     let presented = 0;
-    if (!binding || rec.state.pendingConnectorId === undefined) return { steps, events, presented };
+    if (rec.state.pendingConnectorId === undefined) return { steps, events, presented };
+    if (!binding) {
+      // 배선이 없는데 Api 대기가 섰다. 이 상태는 **종전 동작**이므로 막지 않는다 — 호스트가
+      // 직접 커넥터를 불러 `connectorResult` 로 되돌려주는 경로가 있다. 다만 조용히 두지
+      // 않는다: 그 경로를 짜지 않은 호스트에서 증상은 예외가 아니라 **무음**이고, 고객이
+      // 무슨 말을 해도 steps 0건·events 0건이 나가 어떤 알림도 울리지 않는다. 적합성 검사·
+      // 이벤트·헬스가 전부 정상이라 "그 메뉴만 안 된다"로만 나타난다.
+      warnOnce('W_CONNECTOR_UNBOUND',
+        'Api 노드 대기가 섰는데 커넥터 이행 배선(connectors)이 없습니다 — 호스트가 직접 '
+        + '호출해 connectorResult 로 되돌려주지 않으면 그 통화는 무음으로 멈춥니다(§6.1).');
+      return { steps, events, presented };
+    }
     // 같은 대기 건에 두 번 들어왔다. 두 번 부르지 않고 조용히 물러난다 — 이행은 앞의 호출이 끝낸다.
     if (rec.connectorInFlight) return { steps, events, presented };
 

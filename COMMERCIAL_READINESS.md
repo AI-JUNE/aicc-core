@@ -2256,6 +2256,19 @@
         `agentOffers`·`createMemoryOfferLedger`) · `src/channels/contract.ts`(`W_ROUTING_UNBOUND`·
         `W_AGENT_OFFER_UNBOUND`·`W_AGENT_OFFER`) · `src/routing/executeOffer.ts`(`offerPolicyIssues`) ·
         `tests/channels.runtime.test.mjs`(22건 추가, 총 246건) · `API.md` 반영
+      · Core 측 완료(44): **Api 대기 미배선의 무음(2026-10-16, 2)** — (18)로 커넥터 이행 경로는
+        열렸지만, **배선하지 않은 상태**는 여전히 조용했다. `connectors` 가 없으면 Api 노드는
+        `pendingConnectorId` 만 세운 채 멈추고, 호스트가 직접 호출해 `connectorResult` 로
+        되돌려주는 것이 종전 경로다 — 그런데 그 경로를 짜지 않은 호스트에서는 고객이 무슨 말을
+        해도 `steps` 0건·`events` 0건이 나간다. 예외도 장애도 없고 적합성 검사·이벤트·헬스가
+        전부 정상이라 **"그 메뉴만 안 된다"로만 나타나** 가장 오래 사는 결함의 모양이다.
+        미배선 사실을 선언 시점이 아니라 **대기가 실제로 선 순간** 적는다(§13-3) — 등록 시점에
+        적으면 Api 노드가 없는 시나리오에도 경고가 쌓여 진짜 누락이 묻히고, 시나리오는
+        배포마다 달라지므로 Core 가 미리 알 수 없다. 턴마다 쌓지 않는다(`warnOnce`).
+        **변이 검증(도구 출력 그대로)**: 경고를 빼면 1건 실패 — 원본에서는 통과한다.
+        근거: `src/channels/runtime.ts`(`drainConnectors`) ·
+        `src/channels/contract.ts`(`W_CONNECTOR_UNBOUND`) ·
+        `tests/channels.runtime.test.mjs`(2건 추가 + 기존 1건 보강, 총 248건) · `API.md` 반영
       · 남은 것: **Callbot 저장소 쪽 배선** — 코드는 훅마다 한 줄(README 참조)이며 더 쓸 것이 없다.
         남은 것은 저장소 결정 사항이다: 현행 LLM 툴(welfare_apply 등)과 Core 시나리오의 역할 분담
         (어느 쪽이 화면 노드를 밀 것인가)·실운영 Core 모듈·Flow id 를 **사람이 정해야 한다**,

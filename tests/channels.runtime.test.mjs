@@ -791,6 +791,25 @@ test('배선이 없으면 종전과 완전히 같다 — Api 대기만 세우고
   assert.deepEqual(stuck.events, []);
   assert.equal(stuck.state.pendingConnectorId, 'c_balance');
   assert.equal(port.log.filter((l) => l[0] === 'present').length, 2);   // 첫 프롬프트 + 대기 안내
+  // 종전 동작이지만 조용히 두지 않는다 — 무음은 적합성 검사·이벤트·헬스를 모두 통과한다.
+  const w = core.warnings().filter((x) => x.code === 'W_CONNECTOR_UNBOUND');
+  assert.equal(w.length, 1, '턴마다 쌓이면 진짜 신호가 묻힌다');
+  assert.match(w[0].messageKo, /무음/);
+});
+
+test('Api 노드가 없는 시나리오에는 커넥터 미배선 경고를 적지 않는다', b, async () => {
+  const { core } = build();
+  await core.start(req());
+  await core.send('i_test1', { input: { kind: 'utterance', text: '홍길동' } });
+  assert.equal(core.warnings().some((x) => x.code === 'W_CONNECTOR_UNBOUND'), false,
+    '해당 없는 경고는 진짜 신호를 묻는다');
+});
+
+test('커넥터를 배선하면 미배선 경고가 남지 않는다', b, async () => {
+  const { core } = build({ flows: [flowApiOk()], connectors: wiring().binding });
+  await core.start(req({ flowId: 'api' }));
+  await core.send('i_test1', { input: { kind: 'utterance', text: '110-1234' } });
+  assert.equal(core.warnings().some((x) => x.code === 'W_CONNECTOR_UNBOUND'), false);
 });
 
 test('배선하면 Api 노드가 이행되어 다음 노드까지 진행한다 — 통화가 멈추지 않는다', b, async () => {
