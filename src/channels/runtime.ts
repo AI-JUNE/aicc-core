@@ -37,10 +37,14 @@ import type { ProbeSchedule, RecoveryProbeRunner, RecoveryRunReport } from '../o
 import { createRecoveryProbeRunner } from '../ops/recoveryProbe.ts';
 import type { SummaryOptions } from '../core/handoffSummary.ts';
 import { buildHandoffSummary, requiredSlotsOf } from '../core/handoffSummary.ts';
-import type { AdmissionOptions, QueueSnapshot, RoutingConfig } from '../routing/agentQueue.ts';
+import type { AdmissionOptions, AssignmentOffer, OfferEvent, QueueSnapshot, RoutingConfig } from '../routing/agentQueue.ts';
 import { validateRoutingConfig } from '../routing/agentQueue.ts';
 import type { HandoffPlacement } from '../routing/executeHandoff.ts';
 import { executeHandoff } from '../routing/executeHandoff.ts';
+import type { OfferLedger, OfferPolicy, OfferStep } from '../routing/executeOffer.ts';
+import {
+  emptyOfferLedger, expiredOffers, offerPolicyIssues, openOffer, openOfferOf, settleOffer,
+} from '../routing/executeOffer.ts';
 import type { InviteDeliveryKind, InviteRegistry, SlotCarryPolicy, SwitchReason, SwitchTargetChannel } from '../core/channelSwitch.ts';
 import { issueSwitch, redeemSwitch } from '../core/executeSwitch.ts';
 import type { AiDisclosureConfig } from '../portal/aiDisclosure.ts';
@@ -171,6 +175,14 @@ export interface SessionRecord {
    * 전부 마스킹을 통과한 값이다(§10.3).
    */
   qa?: ComplianceBuffer;
+  /**
+   * 이 세션의 이관 요약(§2·§10.3 — **이미 마스킹된 값**). 오퍼가 소진돼 §9.3 대안으로
+   * 수렴할 때 같이 넘긴다. 왜 남겨 두는가: 소진은 이관 턴이 아니라 **몇 분 뒤** 상담사의
+   * 거절·무응답으로 일어나고, 그 시점에는 턴 문맥이 없다. 여기에 없으면 콜백·음성사서함으로
+   * 간 건만 요약이 비어, §2 가 말한 "아까 다 말했는데요"가 **가장 오래 기다린 고객에게만**
+   * 재현된다. 다시 만들지 않고(두 번 만들면 두 요약이 갈린다) 다시 마스킹하지도 않는다.
+   */
+  handoffSummaryMasked?: string;
 }
 
 /** 세션 저장소. 인메모리는 단일 프로세스용 — 영속 구현은 이 인터페이스 뒤로 교체한다(§6.2). */
@@ -207,6 +219,100 @@ export interface RoutingBinding {
    */
   snapshots(): Promise<readonly QueueSnapshot[]> | readonly QueueSnapshot[];
   admission?: AdmissionOptions;
+  /**
+   * 상담사 배정 오퍼(§2·§9.3). **주지 않으면 종전과 완전히 같다**(§13-3) — 큐에 놓는 데까지만
+   * 하고 끝난다.
+   *
+   * 오퍼를 큐 배정 **안에** 둔 이유: 두 배선을 따로 두면 큐만 배선한 테넌트에서 고객이 큐에
+   * 들어간 채 아무에게도 제안되지 않고, 그 상태는 운영 화면에서 "대기 중"과 구분되지 않는다.
+   * 이 배선이 없는 동안 `routing/executeOffer.ts`(회차 계수·중복 오퍼 차단·소진 수렴)는
+   * 저장소에 있으나 **아무도 부르지 않는** 상태로 남는다.
+   *
+   * **범위 밖을 적어 둔다**: §9.3 장애 폴백 이관(`fallbackQueue`)은 라우팅 설정을 지나지
+   * 않으므로 — 폴백이 설정 결함과 함께 죽지 않게 한 결정이다 — 그 경로에서는 오퍼도 열리지
+   * 않는다. 엔진이 죽어 상담사로 내려간 콜은 상담사 데스크톱·큐 시스템이 직접 본다.
+   */
+  offers?: AgentOfferBinding;
+}
+
+/**
+ * 오퍼를 열기 직전에 호스트에게 묻는 것. **Core 가 상담사를 고르지 않는다**(§13-3) —
+ * 스킬·숙련도·최근 통화 수 같은 배분 정책은 상담사 데스크톱·근태 시스템이 가진 정보다.
+ */
+export interface OfferCandidateRequest {
+  interactionId: string;
+  /** `executeHandoff` 가 확정한 **실제 목적지**(오버플로면 오버플로 큐). */
+  queueId: string;
+  /**
+   * 세션을 찾을 수 있을 때만 싣는다 — **만들지 않는다**(§13-3). 재배정이 세션 종료·재기동
+   * 뒤에 들어오면 Core 는 그 통화가 어느 매체였는지 알 방법이 없고, 아무 값이나 적으면
+   * 호스트의 채널별 배분 정책이 **조용히 틀린 쪽으로** 고른다.
+   */
+  channel?: ChannelKind;
+  /** 같은 이유로 선택이다(§13-3). */
+  reason?: Handoff['reason'];
+  /** 이번에 열리는 오퍼가 이 상호작용의 몇 번째인가 — **원장에서 센 값**이다(호스트가 세지 않는다). */
+  attempt: number;
+}
+
+/**
+ * 오퍼 원장 저장소. 인메모리는 단일 프로세스용이며 **재기동으로 사라진다** —
+ * 그러면 열려 있던 오퍼가 전부 사라져 그 상담사들이 다시 후보가 되고, 같은 콜이 두 번
+ * 제안될 수 있다. 영속 구현은 이 인터페이스 뒤로 교체한다(§6.2).
+ */
+export interface OfferLedgerStore {
+  get(): OfferLedger;
+  put(ledger: OfferLedger): void;
+}
+
+export function createMemoryOfferLedger(): OfferLedgerStore {
+  let ledger = emptyOfferLedger();
+  return { get: () => ledger, put: (next) => { ledger = next; } };
+}
+
+/** 오퍼 전이가 일어난 경로. 같은 `refused` 가 어디서 났는지 모르면 원인을 못 가른다. */
+export type OfferStepVia = 'handoff' | 'settle' | 'expiry' | 'session_end';
+
+export interface AgentOfferStep extends OfferStep {
+  interactionId: string;
+  via: OfferStepVia;
+}
+
+/**
+ * 배정 오퍼 배선. **정책에 기본값이 없다**(§13-3) — 응답 한도 몇 초가 적당한지, 몇 명까지
+ * 돌릴지는 회선·상품·상담사 수에 따라 다르다.
+ */
+export interface AgentOfferBinding {
+  /** 형태가 틀리면 **생성 시점에 거부된다** — 통화 중에 만나면 모든 이관이 조용히 오퍼 없이 지나간다. */
+  policy: OfferPolicy;
+  /**
+   * 제안 후보. 선언한 **순서 그대로** 쓴다(정렬을 넣는 순간 그것이 배분 정책이 된다, §13-3).
+   * 실패하면 던져도 된다 — 이관은 이미 끝났으므로 통화를 깨지 않고 경고로 내린다.
+   */
+  candidates(req: OfferCandidateRequest): Promise<readonly string[]> | readonly string[];
+  /** 오퍼 id 생성기. **Core 는 id 를 만들지 않는다** — 추측 가능한 id 는 그 자체가 열쇠다(§10.3). */
+  newOfferId(req: OfferCandidateRequest): string;
+  /** 원장. 주지 않으면 인메모리(단일 프로세스용). */
+  ledger?: OfferLedgerStore;
+  /**
+   * 전이 보고 — **상담사 데스크톱에 알리는 자리**다. Core 는 상담사에게 직접 알리지 않는다(§6.2).
+   * 소진(`code: 'alternative'`)은 여기로만 온다(이관 턴은 이미 끝났다) — 받지 않으면
+   * 콜백·음성사서함 지시가 아무에게도 전달되지 않는다. 던져도 통화·만료 수렴은 계속된다.
+   */
+  onStep?(step: AgentOfferStep): void;
+}
+
+/**
+ * 만료 수렴 결과. **빈 보고서를 "만료 0건"으로 읽히게 두지 않는다**(§13-3) —
+ * `issues` 가 비어 있지 않으면 **판정이 돌지 않은 것**이다.
+ */
+export interface OfferExpiryReport {
+  /** 응답 한도를 넘긴 열린 오퍼 수 */
+  expired: number;
+  /** 각 건의 수렴 결과(재배정·소진 대안·거절) */
+  steps: readonly AgentOfferStep[];
+  /** 시각 형태 오류 등. 비어 있지 않으면 `expired`·`steps` 는 판정 결과가 아니다. */
+  issues: readonly string[];
 }
 
 /**
@@ -650,6 +756,29 @@ export interface ConversationCore extends ConversationCorePort {
    * 두 벌 서고, 그 둘은 헬스·사용량을 각자 적는다(§2·§11.2).
    */
   engines(): EngineRuntime | undefined;
+  /**
+   * 오퍼 원장 열람(§2). 배선이 없으면 `undefined` — **빈 원장을 돌려주지 않는다**("오퍼가
+   * 0건"과 "오퍼가 돌지 않는다"는 다르다, §13-3).
+   */
+  agentOffers(): OfferLedger | undefined;
+  /**
+   * 상담사 응답 반영(§2·§9.3). 상담사 데스크톱의 수락·거절, 호스트의 취소가 들어오는 자리다.
+   * 거절·무응답이면 **같은 호출에서** 다음 후보로 이어지고, 재배정 한도를 다 쓰면 §9.3
+   * 대안(`step.placement`)까지 수렴한다 — 호출자가 빠뜨릴 수 없다.
+   *
+   * 배선이 없으면 `undefined`. 어떤 경우에도 던지지 않는다 — **테넌트 격리 위반만** 올라온다
+   * (남의 테넌트 오퍼를 전이시키는 것은 폴백할 사안이 아니다, §11.1).
+   */
+  settleAgentOffer(p: { offerId: string; event: OfferEvent; nowIso?: string }): Promise<AgentOfferStep | undefined>;
+  /**
+   * 만료 수렴 1회(§9.3). **타이머를 Core 가 돌리지 않는다** — 호스트가 부른다(몰래 켠
+   * 인터벌은 끌 수도 없고 프로세스 종료를 막는다, `runRecoveryProbes` 와 같은 이유).
+   *
+   * 목록만 돌려주지 않고 건마다 `tick` 을 반영하는 이유: 목록을 받아 다시 넘기는 자리가
+   * 생기면 거기서 빠뜨려지고, 그러면 그 통화는 큐에 묶인 채 대안으로도 가지 않는다
+   * (`executeOffer` (바)). 배선이 없으면 `undefined` — 빈 보고서는 "만료 0건"으로 읽힌다.
+   */
+  runOfferExpiry(nowIso?: string): Promise<OfferExpiryReport | undefined>;
 }
 
 function stubState(flowId: string, flowVersion: number, channel: ChannelKind, status: RunStatus): FlowState {
@@ -677,6 +806,11 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
   const observer: Observer | undefined = opts.observability === undefined
     ? undefined
     : createObserver(opts.observability);
+  // 오퍼 원장은 **배선이 있을 때만** 만든다 — 없는데 빈 원장을 두면 `agentOffers()` 가
+  // "오퍼가 0건"을 돌려주고, 그것은 "오퍼가 돌지 않는다"와 바깥에서 구분되지 않는다(§13-3).
+  const offerStore: OfferLedgerStore | undefined = opts.routing?.offers === undefined
+    ? undefined
+    : (opts.routing.offers.ledger ?? createMemoryOfferLedger());
 
   /**
    * 쌓인 계약 경고를 로그로 내보낸다 — **경고 하나당 딱 한 줄**이다(§13).
@@ -855,6 +989,40 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     if (rIssues.length > 0) {
       throw new Error(`라우팅 설정 거부: ${rIssues.join(' / ')}`);
     }
+    // 오퍼 배선도 **배포 시점에** 거른다. 정책이 틀린 채 통과시키면 모든 이관이 첫 호출에서
+    // `refused` 로만 끝나고, 통화·이벤트는 정상이라 "아무에게도 제안되지 않는 상태"가 유지된다.
+    const offers = opts.routing.offers;
+    if (offers !== undefined) {
+      if (typeof offers.candidates !== 'function') {
+        throw new Error('배정 오퍼 배선 거부: 후보 상담사 조회가 없다 — Core 는 상담사를 고르지 않는다 (설계서 §13-3)');
+      }
+      if (typeof offers.newOfferId !== 'function') {
+        throw new Error('배정 오퍼 배선 거부: 오퍼 id 생성기가 없다 — Core 는 id 를 만들지 않는다 (설계서 §13-3·§10.3)');
+      }
+      const pIssues = offerPolicyIssues(offers.policy);
+      if (pIssues.length > 0) {
+        throw new Error(`배정 오퍼 정책 거부: ${pIssues.join(' / ')}`);
+      }
+    } else if (opts.channels.some((r) => r.port.capabilities.transferToAgent)) {
+      warnings.push({
+        code: 'W_AGENT_OFFER_UNBOUND',
+        severity: 'warning',
+        messageKo: '큐 배정은 배선됐으나 배정 오퍼 배선(routing.offers)이 없습니다 — 고객은 큐에 '
+          + '들어간 채 어느 상담사에게도 제안되지 않습니다(§2·§9.3). 운영 화면에는 "대기 중"으로만 '
+          + '보이고, 회차 계수·중복 오퍼 차단·재배정 한도 소진 후 대안 수렴이 모두 돌지 않습니다.',
+      });
+    }
+  } else if (opts.channels.some((r) => r.port.capabilities.transferToAgent)) {
+    // 이관이 가능한 채널이 붙어 있는데 큐 판정이 없으면, 시나리오에 적힌 큐 id 가 그대로 나간다 —
+    // 닫힌 큐·넘친 큐·오탈자 큐에도 "상담사 연결 중"이 안내되고 §9.3 대안은 건너뛰어진다.
+    warnings.push({
+      code: 'W_ROUTING_UNBOUND',
+      severity: 'warning',
+      messageKo: '상담사 이관이 가능한 채널이 등록됐으나 큐 배정 배선(routing)이 없습니다 — '
+        + '큐 선택·수용 판정이 한 번도 돌지 않고 시나리오에 적힌 큐 id 가 그대로 전달됩니다(§2·§9.3). '
+        + '업무시간이 끝난 큐·대기가 넘친 큐에도 연결을 안내하게 되며, 그 큐에 선언된 '
+        + '대안(콜백·음성사서함·기존 IVR)은 통째로 건너뛰어집니다.',
+    });
   }
 
   // 전환 배선도 **배포 시점에** 거른다. 형태 오류를 통과로 두면 오타 하나로 토큰 요구가 조용히 꺼진 채
@@ -1864,6 +2032,162 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     if (result.handoff) result.handoff.placement = placement;
     if (placement.placement !== 'queued') return;
     await reg.port.transfer(rec.interactionId, placement.queueId, summaryMasked);
+    // **전달 다음이다.** 먼저 열면 `transfer` 가 실패한 통화에 상담사가 배정되고, 그 상담사는
+    // 고객이 없는 통화에 들어간다. 전달이 던지면 여기까지 오지 않는다(오퍼는 열리지 않는다).
+    if (summaryMasked !== undefined) {
+      rec.handoffSummaryMasked = summaryMasked;
+      // 영속 저장소에서는 대입만으로 남지 않는다 — 소진 수렴(몇 분 뒤)이 요약을 못 찾으면
+      // 콜백·음성사서함으로 간 건만 요약이 빈다. 제안이 서지 않아도 적어 둔다.
+      sessions.put(rec);
+    }
+    await openAgentOffer(rec, placement.queueId, 'handoff');
+  }
+
+  // ── 상담사 배정 오퍼(§2·§9.3) ──────────────────────────────────────────────
+  // 큐에 놓는 것과 제안하는 것 사이가 비어 있었다. `routing/executeOffer.ts` 가 판정을 다
+  // 가지고 있는데 **부르는 곳이 테스트뿐**이어서, 지금까지 어떤 통화에서도 오퍼가 열린 적이
+  // 없다. 전이·대안·격리 판정은 전부 그 파일 하나이며(§2) 여기서 상태표를 다시 쓰지 않는다 —
+  // 이 자리가 하는 일은 셋이다: **이관 직후 같은 호출에서 첫 제안을 열고**, **호스트가 올린
+  // 응답을 원장에 반영하면서 재배정을 이어 주고**, **만료분을 수렴시킨다**.
+
+  /** 원장에서 센 다음 회차. 호스트가 선언할 자리를 두지 않는다(`executeOffer` (가)). */
+  function nextAttempt(ledger: OfferLedger, interactionId: string): number {
+    return ledger.offers.filter((o) => o.interactionId === interactionId).length + 1;
+  }
+
+  /**
+   * 전이 반영. **거절(`refused`)이면 원장을 쓰지 않는다** — `executeOffer` 가 입력 원장을
+   * 그대로 돌려주므로 써도 같지만, 쓰는 것을 규칙으로 두면 나중에 부분 반영이 섞인다.
+   *
+   * 보고(`onStep`)가 던져도 삼키는 이유: 상담사 데스크톱 알림이 실패한 것이고, 그것 때문에
+   * 통화나 만료 수렴이 멈추면 **고객이 큐에 묶인다**. 대신 그 사실을 경고로 남긴다.
+   */
+  function applyOfferStep(rec: SessionRecord | undefined, interactionId: string, step: OfferStep, via: OfferStepVia): AgentOfferStep {
+    const binding = opts.routing?.offers;
+    if (step.code !== 'refused') offerStore?.put(step.ledger);
+    const out: AgentOfferStep = { ...step, interactionId, via };
+    if (step.code === 'refused') {
+      warnOnce('W_AGENT_OFFER', `배정 오퍼가 거절됐습니다(${via}): ${step.reasonKo}`);
+    } else if (step.code === 'waiting' && step.offer === undefined) {
+      // 후보가 없어 큐에 그대로 둔 경우. **소진이 아니다** — 원인은 상담사 부재다.
+      warnOnce('W_AGENT_OFFER', '제안할 상담사가 없어 고객을 큐에 그대로 둡니다 — 재배정 한도 소진이 아닙니다(§9.3).');
+    } else if (step.code === 'requeue') {
+      warnOnce('W_AGENT_OFFER', '재배정이 필요한데 다음 오퍼를 열지 못했습니다 — 해소하지 않으면 고객이 큐에 묶입니다(§9.3).');
+    }
+    if (binding?.onStep !== undefined) {
+      try {
+        binding.onStep(out);
+      } catch {
+        warnOnce('W_AGENT_OFFER', '오퍼 전이 보고(onStep)가 예외로 끝났습니다 — 상담사 데스크톱에 전달되지 않았습니다(§6.2).');
+      }
+    }
+    if (rec !== undefined) sessions.put(rec);
+    return out;
+  }
+
+  /** 다음 제안에 필요한 후보·id. 호스트 조회가 던지면 **통화를 깨지 않고** 비워 돌려준다. */
+  async function askCandidates(req: OfferCandidateRequest): Promise<{ candidates?: readonly string[]; offerId?: string }> {
+    const binding = opts.routing?.offers;
+    if (binding === undefined) return {};
+    let candidates: readonly string[];
+    try {
+      candidates = await binding.candidates(req);
+    } catch {
+      warnOnce('W_AGENT_OFFER', '후보 상담사 조회가 예외로 끝나 제안하지 못했습니다 — 고객은 큐에 남습니다(§9.3).');
+      return {};
+    }
+    let offerId: string;
+    try {
+      offerId = binding.newOfferId(req);
+    } catch {
+      warnOnce('W_AGENT_OFFER', '오퍼 id 생성이 예외로 끝나 제안하지 못했습니다(§13-3).');
+      return {};
+    }
+    return { candidates, offerId };
+  }
+
+  /**
+   * 첫 제안을 연다. 배선이 없으면 아무 일도 하지 않는다(종전과 완전히 같다, §13-3).
+   *
+   * **이미 열린 오퍼가 있으면 열지 않는다** — 같은 세션이 이관 상태에서 턴을 한 번 더 받는
+   * 것은 정상 경로이고(채널 재전송·중복 클릭), 거기서 두 번째 오퍼를 열면 두 상담사가 같은
+   * 콜을 받는다(`executeOffer` (다)). 이미 열려 있는 것이 **의도한 상태**이므로 경고하지 않는다.
+   */
+  async function openAgentOffer(rec: SessionRecord, queueId: string, via: OfferStepVia): Promise<AgentOfferStep | undefined> {
+    const binding = opts.routing?.offers;
+    const cfg = opts.routing?.config;
+    if (binding === undefined || cfg === undefined || offerStore === undefined) return undefined;
+    const ledger = offerStore.get();
+    if (openOfferOf(ledger, opts.scope, rec.interactionId) !== undefined) return undefined;
+    const asked = await askCandidates({
+      interactionId: rec.interactionId,
+      queueId,
+      channel: rec.state.channel,
+      ...(rec.state.handoff !== undefined ? { reason: rec.state.handoff.reason } : {}),
+      attempt: nextAttempt(ledger, rec.interactionId),
+    });
+    if (asked.candidates === undefined || asked.offerId === undefined) return undefined;
+    const step = openOffer(cfg, ledger, binding.policy, {
+      scope: opts.scope,
+      queueId,
+      interactionId: rec.interactionId,
+      candidates: asked.candidates,
+      offerId: asked.offerId,
+      nowIso: now(),
+      ...(rec.handoffSummaryMasked !== undefined ? { summaryMasked: rec.handoffSummaryMasked } : {}),
+    });
+    return applyOfferStep(rec, rec.interactionId, step, via);
+  }
+
+  /**
+   * 오퍼 이벤트 반영 — `settleOffer` 를 부르고 재배정을 **같은 호출에서** 이어 준다.
+   *
+   * 후보·다음 id 를 호출자에게 맡기지 않는 이유: 그러면 거절·무응답마다 호스트가 다음 제안을
+   * 기억해야 하고, 빠뜨리면 전이는 반영된 채 아무도 제안받지 않아 **고객만 큐에 묶인다**
+   * (`executeOffer` (나)). 수락·취소에는 후보를 묻지 않는다 — 재배정이 없는데 상담사 명부를
+   * 조회하면 그 실패가 수락을 막는다.
+   */
+  async function settleAgentOffer(offerId: string, event: OfferEvent, nowIso: string, via: OfferStepVia): Promise<AgentOfferStep | undefined> {
+    const binding = opts.routing?.offers;
+    const cfg = opts.routing?.config;
+    if (binding === undefined || cfg === undefined || offerStore === undefined) return undefined;
+    const ledger = offerStore.get();
+    const target = ledger.offers.find((o) => o.offerId === offerId);
+    const interactionId = target?.interactionId ?? '';
+    const rec = interactionId === '' ? undefined : sessions.get(interactionId);
+    let next: { candidates?: readonly string[]; offerId?: string } = {};
+    if (target !== undefined && (event === 'decline' || event === 'tick')) {
+      next = await askCandidates({
+        interactionId,
+        queueId: target.queueId,
+        ...(rec !== undefined ? { channel: rec.state.channel } : {}),
+        ...(rec?.state.handoff !== undefined ? { reason: rec.state.handoff.reason } : {}),
+        attempt: nextAttempt(ledger, interactionId),
+      });
+    }
+    const step = settleOffer(cfg, ledger, binding.policy, {
+      scope: opts.scope,
+      offerId,
+      event,
+      nowIso,
+      ...(next.candidates !== undefined ? { candidates: next.candidates } : {}),
+      ...(next.offerId !== undefined ? { nextOfferId: next.offerId } : {}),
+      ...(rec?.handoffSummaryMasked !== undefined ? { summaryMasked: rec.handoffSummaryMasked } : {}),
+    });
+    return applyOfferStep(rec, interactionId, step, via);
+  }
+
+  /**
+   * 고객이 끊었는데 오퍼가 열려 있으면 **취소한다**. 이 한 줄이 없으면 그 오퍼는 영구히
+   * `offered` 로 남고, `pickAgent` 는 그 상담사를 "다른 상호작용의 오퍼가 열려 있다"로 보아
+   * **모든 후보 목록에서 영구히 제외한다** — 상담사 한 명이 조용히 사라지고, 그 사실은
+   * 장애가 아니라 "요즘 왜 이관이 느리지"로만 나타난다.
+   */
+  async function cancelAgentOffer(rec: SessionRecord): Promise<void> {
+    if (offerStore === undefined) return;
+    const open = openOfferOf(offerStore.get(), opts.scope, rec.interactionId);
+    if (open === undefined) return;
+    await settleAgentOffer(open.offerId, 'cancel', now(), 'session_end');
   }
 
   /** 통화 중 화면 전환(§5.2) — 채널이 초대 능력을 선언한 경우에만 실제 초대를 건다. */
@@ -2407,6 +2731,12 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       // §11.2 통화 과금 구간. **던지지 않는다** — 과금 근거가 틀렸다는 이유로 종료를 막으면 세션이
       // 열린 채 남고, 그 누수는 장애가 아니라 요금으로 나타난다(브리지가 end 를 막지 않는 것과 같다).
       const check = input?.billableMs === undefined ? undefined : checkBillableMs(input.billableMs);
+      // 열린 오퍼는 **`rec.ended` 분기보다 먼저** 취소한다. 이관된 세션은 그 턴에서 이미
+      // `ended` 가 되므로(이관은 AI 세션의 끝이다), 아래 조기 반환 뒤에 두면 **큐에서 기다리다
+      // 끊은 고객의 오퍼가 영구히 `offered` 로 남는다** — 그러면 그 상담사는 `pickAgent` 가
+      // "다른 상호작용의 오퍼가 열려 있다"로 보아 모든 후보 목록에서 영구히 제외되고, 상담사
+      // 한 명이 조용히 사라진다. 상담사가 이미 수락한 오퍼는 열려 있지 않으므로 손대지 않는다.
+      await cancelAgentOffer(rec);
       if (rec.ended) {
         // 이미 종료된 세션에는 실을 수 없다. `session.ended` 는 추가 전용이므로 뒤늦게 고쳐 넣는
         // 경로를 만들지 않는다(§8.1) — 대신 그 통화의 과금 근거가 집계에 없다는 사실을 돌려준다.
@@ -2461,6 +2791,31 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
 
     // 배선이 없으면 `undefined` — 빈 객체는 "조립했는데 비었다"로 읽힌다(§13-3).
     engines: () => engineRuntime,
+
+    agentOffers: () => offerStore?.get(),
+    settleAgentOffer: (p) => settleAgentOffer(p.offerId, p.event, p.nowIso ?? now(), 'settle'),
+    async runOfferExpiry(nowIso) {
+      if (offerStore === undefined) return undefined;
+      const at = nowIso ?? now();
+      let due: readonly AssignmentOffer[];
+      try {
+        // 시각 형태가 틀리면 `expiredOffers` 가 던진다 — 빈 목록으로 바꾸면 "만료된 오퍼가
+        // 없다"로 읽히므로, 판정이 돌지 않았다는 사실을 보고서에 적어 올린다(§13-3).
+        due = expiredOffers(offerStore.get(), opts.scope, at);
+      } catch (e) {
+        const whyKo = e instanceof Error ? e.message : String(e);
+        warnOnce('W_AGENT_OFFER', `오퍼 만료 판정을 돌리지 못했습니다: ${whyKo}`);
+        return { expired: 0, steps: [], issues: [whyKo] };
+      }
+      const steps: AgentOfferStep[] = [];
+      for (const o of due) {
+        // 건마다 **원장을 다시 읽는다** — 앞 건의 재배정이 같은 원장에 새 오퍼를 더하므로,
+        // 한 번 읽은 원장으로 전부 처리하면 뒤 건이 앞 건의 반영을 덮어쓴다.
+        const step = await settleAgentOffer(o.offerId, 'tick', at, 'expiry');
+        if (step !== undefined) steps.push(step);
+      }
+      return { expired: due.length, steps, issues: [] };
+    },
 
     readiness: (req) => runReadiness({
       timeoutMs: req.timeoutMs,

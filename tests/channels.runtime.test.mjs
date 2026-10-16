@@ -54,7 +54,7 @@ function fakePort(id = 'callbot', capsOver = {}, over = {}) {
   };
 }
 
-function build({ flows = [flowBilling], registry, port = fakePort(), ports, samples = [], policy = {}, components, reprompt, timing, routing, connectors, channelSwitch, disclosure, intent, knowledge, consent, qa, observability, recovery, engines } = {}) {
+function build({ flows = [flowBilling], registry, port = fakePort(), ports, samples = [], policy = {}, components, newId, reprompt, timing, routing, connectors, channelSwitch, disclosure, intent, knowledge, consent, qa, observability, recovery, engines } = {}) {
   const collector = B.createCollectorSink('t');
   const bus = B.createEventBus({
     scope: SCOPE, sinks: [collector],
@@ -72,7 +72,7 @@ function build({ flows = [flowBilling], registry, port = fakePort(), ports, samp
       legacyIvrAvailable: false, agentQueueAvailable: true, ...policy,
     },
     health, bus, now: () => NOW,
-    newInteractionId: () => 'i_test1',
+    newInteractionId: newId ?? (() => 'i_test1'),
     ...(reprompt !== undefined ? { reprompt } : {}),
     ...(timing !== undefined ? { timing } : {}),
     ...(routing !== undefined ? { routing } : {}),
@@ -435,6 +435,297 @@ test('§9.3 장애 폴백 큐는 라우팅 규칙으로 다시 고르지 않는�
   assert.equal(r.status, 'transferred');
   const transfer = port.log.find((l) => l[0] === 'transfer');
   assert.equal(transfer[2], 'q_정책지정');
+});
+
+// ── 상담사 배정 오퍼 배선(§2·§9.3·§10.3·§11.1·§13-3) ────────────────────────
+// 여기서 고정하는 것은 "오퍼가 동작한다"(그건 routing.executeOffer 테스트가 본다)가 아니라
+// **큐에 놓는 것과 제안하는 것 사이가 실제로 꿰여 있다**는 사실이다. 그 사이가 비어 있는 동안
+// 증상은 예외가 아니라 큐에 묶인 고객이고, 운영 화면에서 "대기 중"과 구분되지 않는다.
+const OFFERS = (over = {}) => {
+  const steps = [];
+  let n = 0;
+  return {
+    steps,
+    policy: { timeoutMs: 20000, maxAttempts: 3, ...(over.policy ?? {}) },
+    // `in` 으로 본다 — `?? 기본값` 으로 쓰면 "조회기를 주지 않았다"를 검사할 수 없다.
+    candidates: 'candidates' in over ? over.candidates : (() => ['a_kim', 'a_lee']),
+    newOfferId: 'newOfferId' in over ? over.newOfferId : (() => { n += 1; return `o_${n}`; }),
+    onStep: 'onStep' in over ? over.onStep : ((s) => { steps.push(s); }),
+    ...(over.ledger !== undefined ? { ledger: over.ledger } : {}),
+  };
+};
+/** 이관까지 한 통화를 돌린다. 기본 상호작용 id 는 `i_test1` 이다. */
+const toAgent = async (core, iid = 'i_test1', text = '901010-1234567 입니다') => {
+  await core.start(req({ flowId: 'care' }));
+  return core.send(iid, { input: { kind: 'utterance', text } });
+};
+
+test('이관이 가능한 채널인데 큐 배정 배선이 없으면 드러낸다(W_ROUTING_UNBOUND)', b, () => {
+  const { core } = build({ flows: [flowHandoff] });
+  const w = core.warnings().find((x) => x.code === 'W_ROUTING_UNBOUND');
+  assert.ok(w, '큐 선택·수용 판정이 한 번도 돌지 않는 상태는 조용해서는 안 된다');
+  assert.match(w.messageKo, /대안/);
+  // 이관을 못 하는 채널에는 적지 않는다 — 해당 없는 경고는 진짜 신호를 묻는다.
+  const other = build({ flows: [flowRetry], port: fakePort('callbot', { transferToAgent: false }) });
+  assert.equal(other.core.warnings().some((x) => x.code === 'W_ROUTING_UNBOUND'), false);
+});
+
+test('큐 배정만 배선하면 아무도 제안받지 않는다는 사실이 남는다(W_AGENT_OFFER_UNBOUND)', b, async () => {
+  const { core, port } = build({ flows: [flowHandoff], routing: ROUTING() });
+  assert.ok(core.warnings().some((x) => x.code === 'W_AGENT_OFFER_UNBOUND'));
+  assert.equal(core.warnings().some((x) => x.code === 'W_ROUTING_UNBOUND'), false, '둘을 같이 적으면 안 된다');
+  // 종전과 완전히 같다(§13-3): 전달은 그대로 되고 원장은 **만들어지지도 않는다**.
+  await toAgent(core);
+  assert.equal(port.log.some((l) => l[0] === 'transfer'), true);
+  assert.equal(core.agentOffers(), undefined, '빈 원장은 "오퍼가 0건"으로 읽힌다');
+});
+
+test('이관 직후 같은 호출에서 첫 오퍼가 열린다(§2)', b, async () => {
+  const offers = OFFERS();
+  const { core, port } = build({ flows: [flowHandoff], routing: ROUTING({ offers }) });
+  const r = await toAgent(core);
+  assert.equal(r.handoff.placement.placement, 'queued');
+  const ledger = core.agentOffers();
+  assert.equal(ledger.offers.length, 1);
+  assert.equal(ledger.offers[0].state, 'offered');
+  assert.equal(ledger.offers[0].agentId, 'a_kim', '선언한 순서를 바꾸지 않는다');
+  assert.equal(ledger.offers[0].attempt, 1);
+  assert.equal(ledger.offers[0].queueId, 'q_care');
+  assert.equal(offers.steps.length, 1);
+  assert.equal(offers.steps[0].via, 'handoff');
+  assert.equal(offers.steps[0].code, 'offered');
+  assert.equal(offers.steps[0].interactionId, 'i_test1');
+  // 오퍼가 열려도 이관 자체는 종전 그대로다.
+  assert.equal(port.log.find((l) => l[0] === 'transfer')[2], 'q_care');
+});
+
+test('오버플로 수용 큐로 오퍼를 연다 — 요청 큐로 열면 아무도 안 보는 큐에 제안된다', b, async () => {
+  const offers = OFFERS();
+  const { core } = build({ flows: [flowHandoff], routing: ROUTING({
+    offers,
+    snapshots: () => [
+      { queueId: 'q_care', waiting: 1, availableAgents: 2, observedAt: NOW },
+      { queueId: 'q_backup', waiting: 0, availableAgents: 1, observedAt: NOW },
+    ],
+  }) });
+  await toAgent(core);
+  assert.equal(core.agentOffers().offers[0].queueId, 'q_backup');
+});
+
+test('큐에 놓지 못했으면 오퍼를 열지 않는다(§9.3)', b, async () => {
+  const offers = OFFERS();
+  const { core } = build({ flows: [flowHandoff], routing: ROUTING({ offers, snapshots: () => [] }) });
+  const r = await toAgent(core);
+  assert.equal(r.handoff.placement.placement, 'alternative');
+  assert.equal(core.agentOffers().offers.length, 0, '대안으로 간 고객에게 상담사를 배정하면 안 된다');
+});
+
+test('전달이 실패하면 오퍼가 열리지 않는다 — 고객 없는 통화에 상담사를 넣지 않는다', b, async () => {
+  const offers = OFFERS();
+  const port = fakePort('callbot', {}, { async transfer() { throw new Error('회선 전달 실패'); } });
+  const { core } = build({ flows: [flowHandoff], port, routing: ROUTING({ offers }) });
+  await assert.rejects(() => toAgent(core), /회선 전달 실패/);
+  assert.equal(core.agentOffers().offers.length, 0);
+});
+
+test('오퍼 정책·조회기 결함은 통화 중이 아니라 생성 시점에 거부된다(§13-3)', b, () => {
+  assert.throws(() => build({ flows: [flowHandoff], routing: ROUTING({
+    offers: OFFERS({ policy: { timeoutMs: 0 } }),
+  }) }), /배정 오퍼 정책 거부/);
+  assert.throws(() => build({ flows: [flowHandoff], routing: ROUTING({
+    offers: OFFERS({ policy: { maxAttempts: 0 } }),
+  }) }), /배정 오퍼 정책 거부/);
+  assert.throws(() => build({ flows: [flowHandoff], routing: ROUTING({
+    offers: OFFERS({ candidates: undefined }),
+  }) }), /후보 상담사 조회가 없다/);
+  assert.throws(() => build({ flows: [flowHandoff], routing: ROUTING({
+    offers: OFFERS({ newOfferId: null }),
+  }) }), /오퍼 id 생성기가 없다/);
+});
+
+test('후보 조회가 예외로 끝나도 이관은 끝나고 사실이 남는다', b, async () => {
+  const offers = OFFERS({ candidates: () => { throw new Error('근태 API 장애'); } });
+  const { core, port } = build({ flows: [flowHandoff], routing: ROUTING({ offers }) });
+  const r = await toAgent(core);
+  assert.equal(r.status, 'transferred');
+  assert.equal(port.log.some((l) => l[0] === 'transfer'), true);
+  assert.equal(core.agentOffers().offers.length, 0);
+  const w = core.warnings().find((x) => x.code === 'W_AGENT_OFFER');
+  assert.ok(w);
+  assert.equal(w.messageKo.includes('근태 API 장애'), false, '호스트 예외 원문을 경고에 싣지 않는다(§10.3)');
+});
+
+test('제안할 상담사가 없으면 큐에 그대로 두고 소진으로 적지 않는다(§9.3)', b, async () => {
+  const offers = OFFERS({ candidates: () => [] });
+  const { core } = build({ flows: [flowHandoff], routing: ROUTING({ offers }) });
+  await toAgent(core);
+  assert.equal(core.agentOffers().offers.length, 0);
+  assert.equal(offers.steps[0].code, 'waiting');
+  assert.ok(core.warnings().some((x) => x.code === 'W_AGENT_OFFER' && /소진이 아닙니다/.test(x.messageKo)));
+});
+
+test('개인정보 형태의 상담사 id 는 원장에 들어가지 않는다(§10.3)', b, async () => {
+  const offers = OFFERS({ candidates: () => ['010-3333-4444'] });
+  const { core } = build({ flows: [flowHandoff], routing: ROUTING({ offers }) });
+  await toAgent(core);
+  assert.equal(core.agentOffers().offers.length, 0);
+  assert.equal(offers.steps[0].code, 'refused');
+  assert.equal(JSON.stringify(offers.steps[0].issues).includes('010-3333-4444'), false,
+    '차단한 값을 결과에 담으면 차단이 무의미해진다');
+});
+
+test('거절은 같은 호출에서 다음 후보로 이어진다 — 호스트가 기억하지 않는다', b, async () => {
+  const offers = OFFERS();
+  const { core } = build({ flows: [flowHandoff], routing: ROUTING({ offers }) });
+  await toAgent(core);
+  const step = await core.settleAgentOffer({ offerId: 'o_1', event: 'decline' });
+  assert.equal(step.code, 'offered');
+  assert.equal(step.via, 'settle');
+  assert.equal(step.offer.agentId, 'a_lee', '거절한 상담사에게 다시 제안하지 않는다');
+  assert.equal(step.offer.attempt, 2);
+  const ledger = core.agentOffers();
+  assert.equal(ledger.offers.length, 2);
+  assert.equal(ledger.offers.find((o) => o.offerId === 'o_1').state, 'declined');
+});
+
+test('수락은 후보를 다시 묻지 않는다 — 명부 조회 실패가 수락을 막으면 안 된다', b, async () => {
+  let asked = 0;
+  const offers = OFFERS({ candidates: () => { asked += 1; return asked > 1 ? (() => { throw new Error('장애'); })() : ['a_kim']; } });
+  const { core } = build({ flows: [flowHandoff], routing: ROUTING({ offers }) });
+  await toAgent(core);
+  const step = await core.settleAgentOffer({ offerId: 'o_1', event: 'accept' });
+  assert.equal(step.code, 'assigned');
+  assert.equal(asked, 1);
+  assert.equal(core.agentOffers().offers[0].state, 'accepted');
+});
+
+test('재배정 한도를 다 쓰면 §9.3 대안으로 수렴하고 이관 요약이 함께 간다(§2)', b, async () => {
+  const offers = OFFERS({ policy: { timeoutMs: 20000, maxAttempts: 1 } });
+  const { core } = build({ flows: [flowHandoff], routing: ROUTING({ offers }) });
+  const r = await toAgent(core);
+  const step = await core.settleAgentOffer({ offerId: 'o_1', event: 'decline' });
+  assert.equal(step.code, 'alternative');
+  assert.equal(step.placement.action, 'callback');
+  assert.equal(step.placement.summaryMasked, r.handoff.summaryMasked, '가장 오래 기다린 고객만 요약이 비면 안 된다');
+  assert.equal(step.placement.summaryMasked.includes('901010-1234567'), false, '§10.3');
+});
+
+test('종결된 오퍼의 중복 이벤트는 "응답 대기"가 아니라 거절이다', b, async () => {
+  const offers = OFFERS();
+  const { core } = build({ flows: [flowHandoff], routing: ROUTING({ offers }) });
+  await toAgent(core);
+  await core.settleAgentOffer({ offerId: 'o_1', event: 'accept' });
+  const again = await core.settleAgentOffer({ offerId: 'o_1', event: 'accept' });
+  assert.equal(again.code, 'refused');
+  const unknown = await core.settleAgentOffer({ offerId: 'o_없음', event: 'decline' });
+  assert.equal(unknown.code, 'refused');
+  assert.equal(core.agentOffers().offers.length, 1, '거절은 원장을 바꾸지 않는다');
+});
+
+test('만료는 부를 때 수렴한다 — 목록만 돌려주지 않는다', b, async () => {
+  const offers = OFFERS();
+  const { core } = build({ flows: [flowHandoff], routing: ROUTING({ offers }) });
+  await toAgent(core);
+  const quiet = await core.runOfferExpiry(NOW);
+  assert.equal(quiet.expired, 0, '한도 전에는 만료가 아니다');
+  const later = '2026-09-01T09:00:21.000Z';
+  const rep = await core.runOfferExpiry(later);
+  assert.equal(rep.expired, 1);
+  assert.deepEqual(rep.issues, []);
+  assert.equal(rep.steps[0].code, 'offered', '무응답도 다음 후보로 이어져야 한다');
+  assert.equal(rep.steps[0].via, 'expiry');
+  assert.equal(core.agentOffers().offers.find((o) => o.offerId === 'o_1').state, 'timed_out');
+});
+
+test('만료 판정이 돌지 않은 것을 "만료 0건"으로 적지 않는다(§13-3)', b, async () => {
+  const offers = OFFERS();
+  const { core } = build({ flows: [flowHandoff], routing: ROUTING({ offers }) });
+  await toAgent(core);
+  const rep = await core.runOfferExpiry('2026-09-01 09:00:30');   // 시간대 없음
+  assert.equal(rep.expired, 0);
+  assert.equal(rep.issues.length, 1);
+  assert.equal(core.agentOffers().offers[0].state, 'offered', '판정이 돌지 않았으면 원장도 그대로다');
+});
+
+test('만료가 여러 건이면 앞 건의 재배정이 뒤 건에 덮이지 않는다', b, async () => {
+  // 한 테넌트의 동시 통화 둘을 **같은 원장**에 올린다(운영에서는 같은 프로세스가 둘을 본다).
+  const ledgerShared = R.createMemoryOfferLedger();
+  const offers = OFFERS({ candidates: () => ['a_kim', 'a_lee', 'a_park'], ledger: ledgerShared });
+  const first = build({ flows: [flowHandoff], routing: ROUTING({ offers }) });
+  await toAgent(first.core);
+  const second = build({ flows: [flowHandoff], newId: () => 'i_test2', routing: ROUTING({ offers }) });
+  await toAgent(second.core, 'i_test2', '010-1111-2222');
+  assert.equal(ledgerShared.get().offers.length, 2);
+  const later = '2026-09-01T09:00:21.000Z';
+  const rep = await first.core.runOfferExpiry(later);
+  assert.equal(rep.expired, 2);
+  // 두 건 모두 전이가 반영돼 있어야 한다 — 하나라도 덮이면 그 고객은 영구히 `offered` 로 남는다.
+  const timedOut = ledgerShared.get().offers.filter((o) => o.state === 'timed_out');
+  assert.equal(timedOut.length, 2);
+});
+
+test('다른 상호작용의 오퍼가 열린 상담사는 후보에서 제외되고 그 사실이 드러난다', b, async () => {
+  const ledgerShared = R.createMemoryOfferLedger();
+  const only = OFFERS({ candidates: () => ['a_kim'], ledger: ledgerShared });
+  const first = build({ flows: [flowHandoff], routing: ROUTING({ offers: only }) });
+  await toAgent(first.core);
+  const second = build({ flows: [flowHandoff], newId: () => 'i_test2', routing: ROUTING({ offers: only }) });
+  await toAgent(second.core, 'i_test2', '010-1111-2222');
+  const last = only.steps[only.steps.length - 1];
+  assert.equal(last.code, 'waiting');
+  assert.equal(last.skipped.length, 1);
+  assert.match(last.skipped[0], /다른 상호작용/);
+  assert.equal(ledgerShared.get().offers.length, 1, '같은 상담사에게 두 콜을 동시에 열지 않는다');
+});
+
+test('큐에서 기다리다 끊은 고객의 오퍼는 취소된다 — 상담사가 영구히 사라지지 않는다', b, async () => {
+  const ledgerShared = R.createMemoryOfferLedger();
+  const only = OFFERS({ candidates: () => ['a_kim'], ledger: ledgerShared });
+  const first = build({ flows: [flowHandoff], routing: ROUTING({ offers: only }) });
+  await toAgent(first.core);
+  // 이관된 세션은 그 턴에서 이미 종료 상태다 — 그 분기에서 취소하지 않으면 영구히 열려 있다.
+  await first.core.end('i_test1', '고객 종료');
+  assert.equal(ledgerShared.get().offers[0].state, 'cancelled');
+  assert.equal(only.steps[only.steps.length - 1].via, 'session_end');
+  // 그 상담사는 다시 후보가 된다.
+  const second = build({ flows: [flowHandoff], newId: () => 'i_test2', routing: ROUTING({ offers: only }) });
+  await toAgent(second.core, 'i_test2', '010-1111-2222');
+  assert.equal(ledgerShared.get().offers.length, 2);
+  assert.equal(ledgerShared.get().offers[1].state, 'offered');
+});
+
+test('상담사가 수락한 오퍼는 종료에서 취소되지 않는다', b, async () => {
+  const offers = OFFERS();
+  const { core } = build({ flows: [flowHandoff], routing: ROUTING({ offers }) });
+  await toAgent(core);
+  await core.settleAgentOffer({ offerId: 'o_1', event: 'accept' });
+  await core.end('i_test1', '상담사 연결 후 종료');
+  assert.equal(core.agentOffers().offers[0].state, 'accepted');
+});
+
+test('전이 보고가 던져도 통화·만료 수렴은 멈추지 않는다(§6.2)', b, async () => {
+  const offers = OFFERS({ onStep: () => { throw new Error('데스크톱 알림 실패'); } });
+  const { core, port } = build({ flows: [flowHandoff], routing: ROUTING({ offers }) });
+  const r = await toAgent(core);
+  assert.equal(r.status, 'transferred');
+  assert.equal(port.log.some((l) => l[0] === 'transfer'), true);
+  assert.equal(core.agentOffers().offers.length, 1, '보고 실패가 원장 반영을 되돌리면 안 된다');
+  assert.ok(core.warnings().some((x) => x.code === 'W_AGENT_OFFER' && /onStep/.test(x.messageKo)));
+});
+
+test('남의 테넌트 오퍼가 섞인 원장은 조용히 걸러지지 않는다(§11.1)', b, async () => {
+  const ledger = {
+    offers: [{
+      offerId: 'o_x', queueId: 'q_care', interactionId: 'i_x', tenantId: 'other',
+      agentId: 'a_x', state: 'offered', offeredAt: NOW, timeoutMs: 1000, attempt: 1,
+    }],
+  };
+  const store = { get: () => ledger, put: () => {} };
+  const offers = OFFERS({ ledger: store });
+  const { core } = build({ flows: [flowHandoff], routing: ROUTING({ offers }) });
+  await toAgent(core);
+  assert.equal(offers.steps[0].code, 'refused');
+  assert.ok(offers.steps[0].issues.some((i) => /§11.1/.test(i)));
 });
 
 // ── Api 노드 이행 배선 (§6.1) ────────────────────────────────────────────────

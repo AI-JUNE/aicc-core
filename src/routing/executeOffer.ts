@@ -134,7 +134,17 @@ function isOpen(o: AssignmentOffer): boolean {
   return o.state === OPEN;
 }
 
-/** 정책 검증. 없는 값을 추정하지 않는다 — 0ms 는 모든 오퍼를 즉시 만료시킨다(§13-3). */
+/**
+ * 정책 검증. 없는 값을 추정하지 않는다 — 0ms 는 모든 오퍼를 즉시 만료시킨다(§13-3).
+ *
+ * `offerPolicyIssues` 로 내보내는 이유는 **배선 시점에 같은 판정을 쓰게** 하기 위해서다(§2).
+ * 런타임이 자기 검사를 따로 쓰면 둘의 엄격도가 갈리고, 그러면 생성은 통과한 배선이 첫 이관에서
+ * `refused` 로만 끝난다 — 통화는 멀쩡해 보이고 **아무에게도 제안되지 않는 상태**가 유지된다.
+ */
+export function offerPolicyIssues(policy: OfferPolicy): string[] {
+  return policyIssues(policy);
+}
+
 function policyIssues(policy: OfferPolicy): string[] {
   const out: string[] = [];
   const timeoutMs = policy?.timeoutMs;
