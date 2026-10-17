@@ -192,3 +192,61 @@ test('인텐트 상위 N 은 선언했을 때만 자른다(기본값 금지 §13
 test('계약 버전이 노출된다', b, () => {
   assert.equal(typeof rr.REPORT_RUN_CONTRACT_VERSION, 'number');
 });
+
+// ── 6) §4.1 재문의 보정 — 적용되지 않았다는 사실을 수치 옆에 적는다 ──────────
+//
+// `autoResolved` 는 이 서비스의 대표 수치다. 그런데 §4.1 의 "24시간 내 재문의가 있으면
+// 자동완결이 아니다"는 **한 건에도 적용된 적이 없다** — `resolveOutcome` 은 종료 시점에 돌고
+// 재문의는 그 뒤의 사실이라 종료 이벤트에 채울 시점이 없기 때문이다. 보정 없는 수치를
+// "자동완결률"로 내보내면 그게 §13-3 이 금지한 **근거 없는 KPI** 다.
+
+/** 재문의 선언을 실은 종료 이벤트. 기본 `call` 헬퍼는 이 칸을 채우지 않는다(지금의 현실과 같다). */
+function endedWith(id, { outcome = 'AUTO_RESOLVED', reContact, at = '2026-10-05T10:00:00.000Z' } = {}) {
+  return [
+    ev.sessionStarted(meta(`${id}_s`, id, at), { entryPoint: 'inbound_call' }),
+    ev.sessionEnded(meta(`${id}_e`, id, at), {
+      outcome, turnCount: 1, durationMs: 60000,
+      ...(reContact !== undefined ? { reContactWithin24h: reContact } : {}),
+    }),
+  ];
+}
+
+test('선언이 0건이면 자동완결률이 **상한**이라고 적는다 — 보정이 돈 적 없다는 사실을 감추지 않는다', b, () => {
+  const r = rr.runReport(params(call('i1')));
+  assert.equal(r.outcomes.autoResolvedIsUpperBound, true);
+  assert.equal(r.outcomes.autoResolvedReContactDeclared, 0);
+  assert.equal(r.limitsKo.some((x) => /상한/.test(x) && /§4\.1/.test(x)), true);
+  // 막지 않는다: 표는 그대로 나온다(리포트는 되돌릴 수 없는 동작이 아니다).
+  assert.equal(r.status, 'reported');
+  assert.equal(r.complete, true);
+});
+
+test('자동완결이 0건이면 상한이라고 적지 않는다 — 보정 대상이 없는 기간과 구분한다', b, () => {
+  const r = rr.runReport(params(call('i1', { outcome: 'TRANSFERRED', handoff: true })));
+  assert.equal(r.outcomes.autoResolvedIsUpperBound, false);
+  assert.equal(r.limitsKo.some((x) => /상한/.test(x)), false, '해당 없는 한계는 진짜 신호를 묻는다');
+});
+
+test('재문의 없음이 선언되면 보정이 적용된 것이다 — 상한 문구를 적지 않는다', b, () => {
+  const r = rr.runReport(params(endedWith('i1', { reContact: false })));
+  assert.equal(r.outcomes.autoResolvedReContactDeclared, 1);
+  assert.equal(r.outcomes.autoResolvedReContacted, 0);
+  assert.equal(r.outcomes.autoResolvedIsUpperBound, false);
+  assert.equal(r.limitsKo.some((x) => /상한/.test(x)), false);
+});
+
+test('자동완결로 기록됐는데 재문의가 선언된 건은 모순으로 드러난다 — 집계가 고쳐 세지 않는다(§2)', b, () => {
+  const r = rr.runReport(params([...endedWith('i1', { reContact: true }), ...endedWith('i2')]));
+  assert.equal(r.outcomes.autoResolvedReContacted, 1);
+  // 기록된 값을 그대로 센다 — 같은 원장이 화면마다 다른 값을 내면 안 된다.
+  assert.equal(r.outcomes.autoResolved.numerator, 2);
+  assert.equal(r.complete, false, '완전한 표로 제시하면 안 된다');
+  assert.equal(r.incompletenessKo.some((x) => /ABANDONED/.test(x)), true);
+});
+
+test('TRANSFERRED 에 실린 재문의 선언은 자동완결 보정으로 세지 않는다 — §4.1 규칙이 걸리는 자리가 아니다', b, () => {
+  const r = rr.runReport(params(endedWith('i1', { outcome: 'TRANSFERRED', reContact: true })));
+  assert.equal(r.outcomes.autoResolvedReContacted, 0);
+  assert.equal(r.outcomes.autoResolvedReContactDeclared, 0);
+  assert.equal(r.incompletenessKo.some((x) => /ABANDONED/.test(x)), false);
+});

@@ -97,6 +97,7 @@ export function runReport(p: ReportRunParams): ReportRunResult {
   });
 
   const c = p.projection.counters;
+  const limitsKo: string[] = [...p.projection.limitsKo];
   const incompletenessKo: string[] = [];
   if (c.truncated) {
     incompletenessKo.push(
@@ -152,15 +153,36 @@ export function runReport(p: ReportRunParams): ReportRunResult {
   }
 
   const total = summary.total;
+  const rates = outcomeRates(total);
+  // §4.1 재문의 보정. 자동완결률은 이 서비스의 대표 수치이고, 보정을 거치지 않았다는 사실이
+  // 수치 옆에 없으면 그 숫자는 **근거 없는 KPI** 가 된다(§13-3 이 금지한 바로 그것이다).
+  // 보정 자체를 여기서 하지 않는다 — 재문의는 원장 밖의 사실이고, Core 가 지어내면 그 순간
+  // "실측"이 깨진다. 적을 수 있는 것은 **적용되지 않았다는 관측**뿐이다.
+  if (rates.autoResolvedIsUpperBound) {
+    limitsKo.push(
+      `자동완결 ${total.outcomes.AUTO_RESOLVED}건 중 §4.1 24시간 내 재문의 여부가 선언된 건이 ` +
+      '0건입니다 — 보정이 한 번도 적용되지 않았으므로 이 표의 자동완결률은 **재문의 0건을 가정한 ' +
+      '상한**입니다. 재문의는 통화가 끝난 뒤의 사실이라 종료 이벤트에 채울 시점이 없고, Core 는 ' +
+      '만들어 넣지 않습니다 (설계서 §4.1·§13-3)',
+    );
+  }
+  if (rates.autoResolvedReContacted > 0) {
+    // 기록과 계약이 어긋난 상태다. 집계가 조용히 고쳐 세면 같은 원장이 화면마다 다른 값을 낸다(§2).
+    incompletenessKo.push(
+      `자동완결로 기록된 세션 ${rates.autoResolvedReContacted}건이 같은 이벤트에서 24시간 내 재문의를 ` +
+      '선언했습니다 — §4.1 로는 ABANDONED 입니다. 집계는 기록된 Outcome 을 그대로 세므로 이 표의 ' +
+      '자동완결률은 그만큼 높게 적혀 있습니다 (설계서 §4.1·§8.1)',
+    );
+  }
   const base: Omit<ReportRunResult, 'status' | 'messageKo'> = {
     complete: incompletenessKo.length === 0,
     incompletenessKo,
     warningsKo,
-    limitsKo: [...p.projection.limitsKo],
+    limitsKo,
     ...(p.projection.period !== undefined ? { period: { ...p.projection.period } } : {}),
     summary,
     latency: latencyReport(total),
-    outcomes: outcomeRates(total),
+    outcomes: rates,
     handoff: handoffRate(total),
     unrecognized: unrecognizedRate(total),
     completeness: completeness(total),

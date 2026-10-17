@@ -298,3 +298,72 @@ test('시계를 주지 않으면 헬스 샘플을 만들지 않는다(§13-3)', 
   });
   assert.equal(samples.length, 0);
 });
+
+// ── §10.1 근거 판정이 경계에서 버려지지 않는다 ───────────────────────────────
+//
+// 실행기는 `onLegalBasis` 하나로만 "막지 않은 사실"(확인 불가 참조·수락 기록 없음·선택 목적의
+// 초안 문안)을 내보낸다. 펌프가 그 훅을 넘기지 않으면 호스트가 볼 수 있는 것은 `blocked` 한
+// 글자뿐이고, 막지 않은 사실은 **어디에도 남지 않는다** — 남지 않은 사실은 점검받을 때 다시
+// 만들 수 없다.
+
+function piiHop({ binding: bindOver = {}, ...over } = {}) {
+  return P.pumpConnectorHop({
+    binding: {
+      connectors: registry([piiDef()]),
+      port: recordingPort([{ ok: true, data: { balance: '1' } }]),
+      allowOverseas: false,
+      consent: () => consentCtx(),
+      ...bindOver,
+    },
+    connectorId: 'c_member', scope, interactionId: 'i1', slots, call: 1,
+    ...over,
+  });
+}
+
+test('근거 판정은 훅을 주지 않아도 결과에 남는다 — 훅은 선택이고 사실은 선택이 아니다(§10.1)', b, async () => {
+  const r = await piiHop();
+  assert.equal(r.outcome.kind, 'ok');
+  assert.equal(r.legalBasis.length, 1, '행위(call_backend_with_pii) 하나당 판정 하나');
+  // 등록부를 주지 않았으므로 막지는 않되 "확인하지 못했다"가 남아야 한다(§13-3).
+  assert.equal(r.legalBasis[0].allowed, true);
+  assert.equal(r.legalBasis[0].verified, false);
+  assert.equal(r.legalBasis[0].status, 'unverified');
+  assert.ok(r.legalBasis[0].unverifiableKo.some((x) => /등록부/.test(x)));
+});
+
+test('훅을 주면 행위마다 그대로 올라간다 — 통화·커넥터 식별자가 함께 간다', b, async () => {
+  const seen = [];
+  const r = await piiHop({ binding: { onLegalBasis: (i) => seen.push(i) } });
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].interactionId, 'i1');
+  assert.equal(seen[0].connectorId, 'c_member');
+  assert.equal(seen[0].decision.status, r.legalBasis[0].status);
+});
+
+test('해외 연동은 행위가 둘이라 판정도 둘이다 — 하나로 접지 않는다', b, async () => {
+  const seen = [];
+  const r = await piiHop({
+    binding: {
+      connectors: registry([piiDef({ residency: 'overseas' })]),
+      allowOverseas: true,
+      onLegalBasis: (i) => seen.push(i),
+    },
+  });
+  assert.equal(r.legalBasis.length, 2);
+  assert.equal(seen.length, 2);
+});
+
+test('훅이 던져도 모은 사실은 남고 호출도 막지 않는다(§9.3)', b, async () => {
+  const port = recordingPort([{ ok: true, data: { balance: '1' } }]);
+  const r = await piiHop({ binding: { port, onLegalBasis: () => { throw new Error('호스트 로거 결함'); } } });
+  assert.equal(r.outcome.kind, 'ok');
+  assert.equal(port.calls.length, 1, '기록용 훅의 예외가 업무시스템 호출을 막으면 안 된다');
+  assert.equal(r.legalBasis.length, 1, '훅보다 먼저 모으므로 예외와 무관하게 남는다');
+});
+
+test('동의 컨텍스트가 없으면 판정 자체가 없다 — 빈 배열로 "판정했다"처럼 보이게 하지 않는다', b, async () => {
+  const r = await piiHop({ binding: { consent: undefined } });
+  assert.equal(r.outcome.kind, 'blocked');
+  assert.equal(r.outcome.reason, 'consent_context_missing');
+  assert.equal(r.legalBasis, undefined);
+});

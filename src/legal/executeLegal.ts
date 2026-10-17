@@ -63,6 +63,23 @@ export const LEGAL_BASIS_CONTRACT_VERSION = 1;
  */
 export const LEGAL_NOTICE_REF_PREFIX = 'legal:';
 
+/**
+ * 고지 문안 검사에 필요한 것 한 벌(등록부·수락 기록·언어).
+ *
+ * **한 곳에서 정의한다**: 같은 세 칸을 커넥터 실행기·동의 컨텍스트 조립기·런타임 배선이 각각
+ * 선언하면, 언젠가 한 쪽에만 필드가 늘고 그쪽을 지나는 경로만 검사된다(§2). 세 칸 중 하나라도
+ * 빠지면 `decideLegalBasis` 는 "확인하지 않았다"로 적는데, 그 상태는 **검사에 통과한 것과
+ * 바깥에서 구분되지 않는다**.
+ */
+export interface LegalNoticeContext {
+  /** 등록부 내용(`LegalRegistry.list()` 결과 그대로). */
+  docs: readonly LegalDocument[];
+  /** 문안 수락 기록. 없으면 재수락 판정을 하지 않고 "대조할 수 없다"로 적는다. */
+  acceptances?: readonly AcceptanceRecord[];
+  /** 고객에게 보여 준 언어. 기본 언어를 만들지 않는다(§13-3). */
+  locale: string;
+}
+
 export interface ParsedNoticeRef {
   /** 예약 형식인가. 아니면 Core 가 확정 여부를 알 수 없다. */
   reserved: boolean;

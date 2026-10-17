@@ -71,6 +71,9 @@ import { createRetriever } from '../knowledge/retrieval.ts';
 import type { KnowledgeFailureCause, KnowledgeUsage } from '../knowledge/executeKnowledge.ts';
 import { resolveKnowledgeTurn } from '../knowledge/executeKnowledge.ts';
 import type { ConsentPolicy, ConsentPurpose, ConsentRecord } from '../consent/consent.ts';
+import type { AcceptanceRecord, LegalDocument } from '../legal/documents.ts';
+import type { LegalNoticeContext } from '../legal/executeLegal.ts';
+import { checkConsentNotices } from '../legal/executeLegal.ts';
 import type { ConsentStore } from '../consent/executeConsent.ts';
 import {
   buildConsentLookup, consentNodeDefects, consentNodes, consentPurposeOf, isConsentNode,
@@ -545,6 +548,39 @@ export interface ConsentBinding {
     state?: 'granted' | 'denied';
     reasonKo?: string;
   }) => void;
+  /**
+   * §10.1 고지 문안 등록부. **주지 않으면 종전과 완전히 같다**(§13-3) — 문안 검사를 하지
+   * 않고 동의 게이트 결과만 쓰며, 그 사실이 `W_LEGAL_UNBOUND` 경고로 남는다.
+   */
+  legal?: LegalNoticeBinding;
+}
+
+/**
+ * 고지 문안 등록부 배선(§10.1). 동의 컨텍스트에 등록부를 실어 **통화 경로에서 실제로
+ * 조회되게** 한다 — 이것이 없으면 `legal/documents.ts` 는 저장소에 있으나 아무도 부르지 않는다.
+ *
+ * 왜 Core 가 끼우는가: 등록부를 넣을 수 있는 자리는 커넥터 배선의 동의 컨텍스트(`connectors.consent`)
+ * 하나인데, 그 자리는 동의 배선이 있으면 **Core 가 만들고 호스트 선언을 거부한다**(출처가 둘이면
+ * 어느 쪽이 적용됐는지 알 수 없다, §2). 즉 지금까지 등록부를 통화에 넣을 길 자체가 없었다.
+ */
+export interface LegalNoticeBinding {
+  /**
+   * 등록부 내용(`LegalRegistry.list()` 결과 그대로). **고정 배열로 받는다** — `policy` 와 같은
+   * 이유다: 운영 중 등록부가 바뀌면 진행 중인 통화가 **다른 문안을 근거로** 판정되고, 그러면
+   * "어떤 문안으로 받은 동의인지"가 다시 추적 불가능해진다. 개정본은 재배선으로 싣는다.
+   * 고정이라 기동 시점 검사와 통화 중 판정이 **같은 문서를 본다** — 경고와 실제 동작이
+   * 어긋나지 않는다.
+   */
+  docs: readonly LegalDocument[];
+  /**
+   * 주체별 문안 수락 기록 조회. 수락은 통화 중에도 늘어나므로 조회로 받는다.
+   * 주지 않으면 재수락 판정을 하지 않고 "대조할 수 없다"로 적힌다 — 없다는 사실만으로
+   * 기존 동의를 무효로 보지 않는다(§10.1). 던지면 **기록 없음**으로 본다(미선언으로 적지
+   * 않는다 — 선언은 했고 조회가 실패한 것이라, 두 상태의 대응이 다르다).
+   */
+  acceptances?: (subjectRef: string) => readonly AcceptanceRecord[];
+  /** 고객에게 보여 준 언어(BCP-47). 기본 언어를 만들지 않는다(§13-3). */
+  locale: string;
 }
 
 /**
@@ -1194,6 +1230,16 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     }
   }
 
+  /**
+   * 배선 시점에 **복사해 둔** 고지 문안 등록부(§10.1).
+   *
+   * 호스트가 넘긴 배열을 그대로 들고 있으면, 그 배열을 나중에 비우거나 갈아끼웠을 때
+   * 기동 시점 검사를 통과한 판정이 통화 중에 뒤집힌다 — 경고에는 "문제없음"이 남아 있는데
+   * 실제로는 막히는(또는 그 반대의) 상태이고, 그 어긋남은 어디에도 예외로 나타나지 않는다.
+   * 복사하면 **검사한 것과 판정하는 것이 같은 문서**임이 구조로 보장된다(§2).
+   */
+  let legalDocs: readonly LegalDocument[] | undefined;
+
   // 동의 배선도 **배포 시점에** 거른다. 미승인 정책·다른 테넌트 정책을 통과시키면 그 정책으로
   // 받은 동의가 이력에 쌓이는데, 그건 동의가 아니다(§10.1) — 그리고 통화·이벤트 어디에서도
   // 터지지 않으므로 점검에서 처음 드러난다(고지·라우팅·전환과 같은 규칙).
@@ -1217,6 +1263,58 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
         '동의 배선 거부: 커넥터 배선에 이미 동의 컨텍스트(connectors.consent)가 있다 — '
         + '같은 판정의 출처가 둘이면 어느 쪽이 적용됐는지 알 수 없다 (설계서 §10.1·§2)',
       );
+    }
+
+    // 고지 문안 등록부(§10.1). **형태 오류는 거부하고 문안 결함은 경고다** — 앞은 배선이 조용히
+    // 꺼지는 경로이고(오타 하나로 검사가 돌지 않은 채 "적용했다"로 남는다), 뒤는 Core 가 대신
+    // 결정할 일이 아니다(문안 하나가 미확정이라고 전 채널을 멈추면 원인과 증상이 아주 멀어진다).
+    const lb = cb.legal;
+    if (lb !== undefined) {
+      if (!Array.isArray(lb.docs)) {
+        throw new Error(
+          '동의 배선 거부: 고지 문안 등록부(consent.legal.docs)가 배열이 아니다 — '
+          + 'LegalRegistry.list() 결과를 그대로 넘긴다 (설계서 §10.1)',
+        );
+      }
+      if (typeof lb.locale !== 'string' || lb.locale.trim() === '') {
+        throw new Error(
+          '동의 배선 거부: 고지 문안 언어(consent.legal.locale)가 없다 — '
+          + 'Core 는 기본 언어를 만들지 않는다 (설계서 §13-3)',
+        );
+      }
+      if (lb.acceptances !== undefined && typeof lb.acceptances !== 'function') {
+        throw new Error(
+          '동의 배선 거부: 문안 수락 기록 조회(consent.legal.acceptances)가 함수가 아니다 (설계서 §10.1)',
+        );
+      }
+      legalDocs = [...lb.docs];
+      // 판정은 `checkConsentNotices` 하나다 — 초안·미시행·버전 불일치 규칙을 여기서 다시 쓰지 않는다(§2).
+      // 검사와 통화 중 판정이 **같은 사본**을 보므로 경고와 실제 동작이 어긋나지 않는다.
+      const notices = checkConsentNotices({
+        scope: opts.scope, policy: cb.policy, docs: legalDocs, locale: lb.locale, now: now(),
+      });
+      for (const messageKo of notices.blockersKo) {
+        warnings.push({
+          code: 'W_LEGAL_NOTICE',
+          severity: 'warning',
+          messageKo: `${messageKo} — 이 목적이 필수라면 통화 중 개인정보 조회(§6.1)가 `
+            + 'legal_notice_not_final 로 막힙니다(업무시스템은 멀쩡하므로 장애로 보이지 않습니다).',
+        });
+      }
+      for (const messageKo of notices.unverifiableKo) {
+        // 확인하지 못한 것을 통과로도 실패로도 적지 않는다(§13-3) — 다만 사라지게 두지도 않는다.
+        warnings.push({ code: 'W_LEGAL_NOTICE', severity: 'warning', messageKo });
+      }
+    } else {
+      warnings.push({
+        code: 'W_LEGAL_UNBOUND',
+        severity: 'warning',
+        messageKo: '동의는 배선됐으나 고지 문안 등록부(consent.legal)가 없습니다 — 통화 경로에서 '
+          + '확정본 조회가 한 번도 일어나지 않습니다(§10.1). 초안 문안·시행일 전 문안으로 받은 동의, '
+          + '처리방침이 개정됐는데 정책 버전이 그대로라 여전히 유효로 읽히는 동의가 전부 정상으로 '
+          + '쌓이고, §6.1 근거 판정에는 "문안을 확인하지 않았다"만 적힙니다 — 그 기록은 "확인했고 '
+          + '문제없었다"와 구분되지 않습니다. 드러나는 시점이 분쟁·점검이면 그 기간의 동의 전부가 대상입니다.',
+      });
     }
   }
 
@@ -1325,6 +1423,29 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
    * 개인정보 파라미터를 선언한 커넥터는 통화 중 **언제나** `consent_context_missing` 으로 막혔다.
    * 호스트가 자기 컨텍스트를 넘기고 있으면 덮어쓰지 않는다(위에서 설정 오류로 거부된다).
    */
+  /**
+   * 이 주체의 §10.1 문안 검사 재료. 등록부는 배선 시점에 고정된 배열 그대로 넘기고,
+   * 수락 기록만 주체별로 조회한다.
+   *
+   * 조회가 던지면 **기록 없음(빈 배열)** 으로 본다 — `undefined` 로 떨어뜨리면 판정이
+   * "수락 기록을 선언하지 않았다"로 적히는데, 선언은 했고 조회가 실패한 것이라 그 기록은
+   * 거짓이다. 빈 배열이면 `acceptanceStatus` 가 `none` 으로 적고(막지 않는다), 사실과 같다.
+   */
+  function consentLegalContext(subjectRef: string): LegalNoticeContext | undefined {
+    const lb = opts.consent?.legal;
+    if (lb === undefined || legalDocs === undefined) return undefined;
+    let acceptances: readonly AcceptanceRecord[] | undefined;
+    if (lb.acceptances !== undefined) {
+      try {
+        const rows = lb.acceptances(subjectRef);
+        acceptances = Array.isArray(rows) ? rows : [];
+      } catch {
+        acceptances = [];
+      }
+    }
+    return { docs: legalDocs, locale: lb.locale, ...(acceptances !== undefined ? { acceptances } : {}) };
+  }
+
   const connectorBinding: ConnectorPumpBinding | undefined = (() => {
     const b = opts.connectors;
     if (b === undefined) return undefined;
@@ -1332,9 +1453,13 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     if (cb === undefined || b.consent !== undefined) return b;
     return {
       ...b,
-      consent: ({ interactionId }) => buildConsentLookup(
-        cb.policy, cb.records, consentSubjectRef(interactionId), now(),
-      ),
+      consent: ({ interactionId }) => {
+        const subjectRef = consentSubjectRef(interactionId);
+        return buildConsentLookup(
+          cb.policy, cb.records, subjectRef, now(),
+          subjectRef === undefined ? undefined : consentLegalContext(subjectRef),
+        );
+      },
     };
   })();
 

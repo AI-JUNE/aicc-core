@@ -164,7 +164,54 @@
         `finalizeDocument`·`recordAcceptance`·`gateAction` 을 지나는 검사) ·
         `src/integration/executeConnector.ts`(`ConsentContext.legal`·`onLegalBasis`·
         `legal_notice_not_final`) · `tests/integration.executeConnector.test.mjs`(32건) · `API.md` 반영
+      · Core 측 완료(2026-10-17): **등록부를 통화에 넣을 길이 없었다** — 위 (2026-10-08)이
+        `decideLegalBasis` 를 커넥터 경로에 끼웠지만, 그 판정이 문안을 보려면 `ConsentContext.legal`
+        이 차 있어야 한다. 그 자리를 채울 수 있는 곳은 커넥터 배선의 동의 컨텍스트
+        (`connectors.consent`) 하나인데, 동의가 배선돼 있으면 **Core 가 그 자리를 만들고 호스트
+        선언을 거부한다**(출처가 둘이면 어느 쪽이 적용됐는지 알 수 없다, §2). 즉 §10.1 검사를
+        켤 방법이 저장소 어디에도 없었고, `decideLegalBasis` 는 **언제나** `docs: undefined` 로
+        불려 "문안을 확인하지 않았다"만 적었다 — 그 기록은 "확인했고 문제없었다"와 바깥에서
+        구분되지 않는다. 세 칸을 메웠다.
+        - **배선(`consent.legal`)**: Core 가 `LegalNoticeContext` 를 조립해 끼운다. 등록부는
+          **배선 시점에 복사**한다 — `policy` 를 고정 객체로 받는 것과 같은 이유(운영 중 바뀌면
+          진행 중인 통화가 다른 문안을 근거로 판정된다)에 더해, 복사해야 **기동 시점 검사와 통화
+          중 판정이 같은 문서를 본다**(호스트가 배열을 나중에 비우면 경고에는 "문제없음"이 남은
+          채 실제로는 막힌다). 수락 기록만 주체별 조회이고, **던지면 '기록 없음'으로 본다** —
+          `undefined` 로 떨어뜨리면 판정이 "수락 기록을 선언하지 않았다"로 적히는데 선언은 했고
+          조회가 실패한 것이라 그 기록은 거짓이다(대응도 다르다). 형태 오류(`docs` 비배열·
+          `locale` 없음·`acceptances` 비함수)는 **기동 거부** — 오타 하나로 검사가 조용히 꺼진 채
+          "적용했다"로 남는 것이 여기서 제일 비싼 실패다.
+        - **기동 시점 문안 검사**: `checkConsentNotices` 역시 **부르는 곳이 테스트뿐**이었다.
+          이제 배선 시점에 한 번 돌려 초안·미시행·버전 불일치·형식 오류를 `W_LEGAL_NOTICE` 로
+          적는다(확인할 수 없는 자유 참조도 같은 코드로, 다만 문구를 갈라 적는다 — 막지 않는
+          것을 막는다고 적지 않는다). **막지는 않는다**(§13-3): 문안 하나가 미확정이라고 Core 가
+          기동을 거부하면 전 채널이 멈추고, 그 결정은 Core 가 할 일이 아니다. 대신 **첫 통화보다
+          먼저** 적는다 — 그 목적이 필수면 통화 중 §6.1 조회가 `legal_notice_not_final` 로 막히는데
+          업무시스템은 멀쩡하므로 "그 메뉴만 안 된다"로만 나타난다. 미배선은 `W_LEGAL_UNBOUND` 이고,
+          **동의 자체가 미배선이면 적지 않는다**(`W_CONSENT_UNBOUND` 가 이미 그 사실을 적는다).
+        - **판정이 경계에서 버려지던 것**: `executeConnector` 는 "막지 않은 사실"(확인 불가 참조·
+          수락 기록 없음·선택 목적의 초안 문안)을 `onLegalBasis` 하나로만 내보내는데 **펌프가 그
+          훅을 넘기지 않았다** — 호스트가 볼 수 있는 것은 `blocked` 한 글자뿐이었고, (46)이 비-Node
+          경계에서 고친 것과 같은 모양의 누락이다. 펌프가 판정을 **언제나 모아**
+          `PumpHopResult.legalBasis` 에 싣고(훅은 쓰는 쪽의 선택이고 사실은 선택이 아니다) 선언된
+          훅에 행위마다 올린다. 모으는 것이 먼저라 **훅이 던져도 사실은 남는다**.
+        **변이 검증(도구 출력 그대로)**: 통화에 등록부를 싣지 않으면 6건 실패 · 등록부를 복사하지
+        않으면 1건 실패 · 수락 조회 실패를 미선언으로 적으면 1건 실패 · 펌프에서 `onLegalBasis` 를
+        빼면 10건 실패 · `W_LEGAL_UNBOUND` 를 빼면 1건 실패 · 기동 시점 문안 검사를 빼면 1건 실패 —
+        전부 원본에서는 통과한다. 실호출 없음(가짜 포트·인메모리 등록부로만 검증).
+        근거: `src/legal/executeLegal.ts`(`LegalNoticeContext`) ·
+        `src/consent/executeConsent.ts`(`ConsentLookup.legal`·`buildConsentLookup`) ·
+        `src/channels/runtime.ts`(`LegalNoticeBinding`·등록부 사본·기동 시점 검사) ·
+        `src/channels/contract.ts`(`W_LEGAL_UNBOUND`·`W_LEGAL_NOTICE`) ·
+        `src/integration/connectorPump.ts`(`onLegalBasis`·`legalBasis`) ·
+        `tests/channels.runtime.legal.test.mjs`(14건 신규) ·
+        `tests/integration.connectorPump.test.mjs`(5건 추가, 총 28건) · `API.md` 반영
       · 남은 것: 약관·처리방침 **문안 확정 + 승인 근거(approvalRef)·시행일** — 사람이 정한다 **[승인 필요]**,
+        **등록부 배선의 테넌트 값(2026-10-17 추가)** — 경로는 열렸지만 켜는 데 필요한 것은 코드가
+        아니다: `consent.legal.docs` 에 넣을 **확정본 자체**가 아직 없고(문안 확정 전까지 배선하면
+        `W_LEGAL_NOTICE` 가 초안으로 적는 것이 정상이다), 고객 응대 언어(`locale`)는 테넌트 값이며
+        Core 가 기본 언어를 만들지 않는다(§13-3), 수락 기록(`acceptances`)을 어디에 남길지는
+        운영 DB 선정 뒤 호스트가 정한다 — 그때까지 재수락 판정은 "대조할 수 없다"로 남는다,
         포털 화면(문서 표시·수락 UI)은 포털 저장소 과제, **문안 참조 규칙 적용**: 테넌트 동의 정책의
         `noticeRef` 를 등록부 참조(`legal:<종류>`)로 바꾸는 것은 설정 변경이며 그때까지 Core 는
         "확인할 수 없다"로 적는다, 문서 등록부·수락 기록의 **영속 저장소**는 운영 DB 선정 뒤 호스트가
@@ -2433,6 +2480,51 @@
         **변이 검증(도구 출력 그대로)**: `send` 의 한도 판정을 빼면 4건 실패 — 원본에서는 통과한다.
         근거: `src/channels/runtime.ts`(`rateLimiter`·`rateLimitCost`·`RATE_LIMITED_ENTRIES`·`enforceLimit`) ·
         `tests/channels.runtime.rateLimit.test.mjs`(12건 신규) · `API.md` 반영
+      · Core 측 완료(49): **고지 문안 등록부를 통화에 넣을 길이 없었다(2026-10-17, 4)** —
+        (13)~(48)이 메운 것과 같은 모양의 공백이 §10.1 에 하나 더 있었다. 판정기
+        (`decideLegalBasis`)는 커넥터 경로에 꿰어져 있었는데 **그 입력(`ConsentContext.legal`)을
+        만드는 코드가 0줄**이었고, 그 자리를 채울 수 있는 유일한 지점은 동의가 배선돼 있으면
+        Core 가 만들고 호스트 선언을 거부하는 자리였다(§2) — 즉 켤 방법 자체가 없었다. 더해서
+        펌프가 `onLegalBasis` 를 넘기지 않아 **판정이 경계에서 버려지고** 있었다((46)과 같은 모양).
+        `consent.legal` 배선(등록부 사본·주체별 수락 기록·언어) · 기동 시점 문안 검사
+        (`W_LEGAL_NOTICE`·`W_LEGAL_UNBOUND`) · 펌프의 판정 전달(`PumpHopResult.legalBasis`)로
+        메웠다. 상세·변이 검증·남은 테넌트 값은 위 **약관·개인정보 처리방침 확정본 반영** 항목의
+        `Core 측 완료(2026-10-17)` 에 적었다(같은 사실을 두 번 적지 않는다).
+        근거: `src/channels/runtime.ts` · `src/channels/contract.ts` ·
+        `src/integration/connectorPump.ts` · `src/consent/executeConsent.ts` ·
+        `src/legal/executeLegal.ts` · `tests/channels.runtime.legal.test.mjs`(14건 신규) ·
+        `tests/integration.connectorPump.test.mjs`(5건 추가, 총 28건) · `API.md` 반영
+      · Core 측 완료(50): **자동완결률에 §4.1 보정이 한 번도 적용된 적 없다(2026-10-17, 5)** —
+        앞의 공백들이 "부르는 코드가 없다"였다면 이번 것은 **채울 수 있는 시점이 없는 칸**이다.
+        `aggregate.ts` 는 Outcome 을 재판정하지 않는다고 적어 두었고 그 전제는 "재문의(24h) 반영은
+        `resolveOutcome` 이 끝냈고 결과가 `session.ended` 에 실려 온다"였다. 그런데 `resolveOutcome`
+        은 **종료 시점에** 돌고 재문의는 **그 뒤 24시간의 사실**이라, 종료 이벤트의
+        `re_contact_within_24h` 를 채울 수 있는 자리가 없다 — 실제로 저장소 어디에도 그 칸을 채우는
+        코드가 0줄이다. 결과는 예외가 아니라 **그럴듯한 숫자**다: `autoResolved` 는 언제나 재문의
+        0건을 가정한 **상한**인데 화면에는 그냥 "자동완결률"로 나간다. 이 서비스의 대표 수치가
+        근거 없는 KPI 가 되는 경로가 정확히 이것이다(§13-3).
+        고친 것은 수치가 아니라 **사실을 적는 일**이다.
+        - **보정을 지어내지 않는다.** 재문의는 원장 밖의 사실이고(§8.1 이벤트에는 고객 식별자가
+          없다 — 있으면 그게 §10.3 사고다) Core 가 만들면 그 순간 "실측"이 깨진다. 대신 자동완결로
+          기록된 종료 중 재문의 여부가 **선언된 건수**를 세고, 자동완결이 있는데 선언이 0건이면
+          `limitsKo` 에 "이 자동완결률은 재문의 0건을 가정한 상한"을 적는다. 자동완결 자체가 0건인
+          기간에는 적지 않는다 — 보정 대상이 없는 것과 보정이 돌지 않은 것은 다르다.
+        - **모순은 드러내되 고쳐 세지 않는다.** 자동완결로 기록됐는데 같은 이벤트가 재문의를
+          선언했으면 §4.1 로는 `ABANDONED` 다. 집계가 조용히 다시 세면 같은 원장이 화면마다 다른
+          값을 내므로(§2 — 이 파일이 "재판정하지 않는다"로 세운 선이다) 기록된 값을 그대로 세고
+          `complete: false` 로 적는다.
+        - **단서를 수치와 같은 객체에 둔다.** `outcomeRates` 결과에 실어, 화면이 비율만 가져가고
+          단서는 옆 칸에 남아 아무도 보지 않는 일을 구조로 막는다. `true`/`false` 둘 다 "선언됐다"로
+          센다 — 선언되지 않은 것과 "없었다고 확인한 것"은 다르다.
+        **변이 검증(도구 출력 그대로)**: 상한 문구를 빼면 1건 실패 · 모순 문구를 빼면 1건 실패 ·
+        자동완결 0건에도 상한이라 적으면 1건 실패 · 선언 집계를 Outcome 으로 좁히지 않으면 1건 실패 —
+        전부 원본에서는 통과한다.
+        **남은 것은 사람이 정하는 값이다**: 재문의 판정의 **주체 키와 관측 주체**(같은 고객의 재문의를
+        무엇으로 묶을지)는 §10.3 사항이라 Core 가 정하지 않고, 그 값을 어느 시점에 어디에 적을지
+        (추가 전용 이벤트는 뒤늦게 고칠 수 없다, §8.1)는 운영 DB·원장 설계 결정이다 **[승인 필요]**.
+        근거: `src/reports/aggregate.ts`(`autoResolvedReContactDeclared`·`autoResolvedReContacted`·
+        `autoResolvedIsUpperBound`) · `src/reports/executeReport.ts`(한계·모순 문구) ·
+        `tests/reports.executeReport.test.mjs`(5건 추가, 총 23건) · `API.md` 반영
       · 남은 것: **Callbot 저장소 쪽 배선** — 코드는 훅마다 한 줄(README 참조)이며 더 쓸 것이 없다.
         남은 것은 저장소 결정 사항이다: 현행 LLM 툴(welfare_apply 등)과 Core 시나리오의 역할 분담
         (어느 쪽이 화면 노드를 밀 것인가)·실운영 Core 모듈·Flow id 를 **사람이 정해야 한다**,

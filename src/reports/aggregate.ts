@@ -105,6 +105,25 @@ export interface ReportBucket {
   channelsUnknown: number;
   /** 계약에 없는 Outcome 값(§4.1). 위와 같은 이유로 따로 센다. */
   outcomesUnknown: number;
+  /**
+   * `AUTO_RESOLVED` 로 기록된 종료 중 §4.1 **재문의 여부가 선언된** 건수
+   * (`re_contact_within_24h` 가 `true`/`false` 로 실려 온 건).
+   *
+   * 왜 세는가: 이 파일은 Outcome 을 재판정하지 않고 기록된 값을 그대로 센다 — 그 전제는
+   * "재문의 반영은 `resolveOutcome` 이 끝냈고 결과가 이벤트에 실려 온다"였다. 그런데 그 보정은
+   * **통화가 끝난 뒤에야 알 수 있는 사실**이라 종료 시점에는 채울 수 없고, 실제로 저장소 어디에도
+   * 이 칸을 채우는 코드가 없다. 그러면 `autoResolved` 는 언제나 **재문의 0건을 가정한 상한**인데,
+   * 화면에는 그냥 "자동완결률"로 나간다 — 근거 없는 KPI 가 되는 경로가 정확히 이것이다(§13-3).
+   * 세어 두면 리포트가 "보정이 한 번도 적용되지 않았다"를 사실로 적을 수 있다.
+   */
+  autoResolvedReContactDeclared: number;
+  /**
+   * 그중 **재문의가 있었다고 선언된** 건수. 같은 이벤트가 §4.1 로는 `ABANDONED` 인데 기록은
+   * `AUTO_RESOLVED` 인 상태다 — 여기서 **고쳐 세지 않는다**(판정은 `resolveOutcome` 한 곳, §2.
+   * 집계가 Outcome 을 바꾸기 시작하면 같은 원장이 화면마다 다른 값을 낸다). 대신 모순을 드러내
+   * 리포트가 "자동완결률이 그만큼 높게 적혀 있다"를 적을 수 있게 한다.
+   */
+  autoResolvedReContacted: number;
   /** 계약에 없는 이관 사유(§2). 위와 같은 이유로 따로 센다. */
   handoffReasonsUnknown: number;
 }
@@ -129,6 +148,8 @@ function newBucket(bucket: string): ReportBucket {
     sessionsMissingDuration: 0,
     channelsUnknown: 0,
     outcomesUnknown: 0,
+    autoResolvedReContactDeclared: 0,
+    autoResolvedReContacted: 0,
     handoffReasonsUnknown: 0,
   };
 }
@@ -236,6 +257,12 @@ function accumulate(b: ReportBucket, e: InteractionEvent): void {
       const s = e as SessionEndedEvent;
       b.sessionsEnded += 1;
       if (!bump(b.outcomes as unknown as Record<string, number>, s.outcome)) b.outcomesUnknown += 1;
+      // §4.1 재문의 보정의 **적용 여부**만 센다(값은 고치지 않는다 — 위 필드 주석).
+      // `true`/`false` 둘 다 "선언됐다"로 센다: 선언되지 않은 것과 "없었다고 확인한 것"은 다르다.
+      if (s.outcome === 'AUTO_RESOLVED' && typeof s.re_contact_within_24h === 'boolean') {
+        b.autoResolvedReContactDeclared += 1;
+        if (s.re_contact_within_24h) b.autoResolvedReContacted += 1;
+      }
       if (typeof s.duration_ms === 'number') b.durationMs.push(s.duration_ms);
       else b.sessionsMissingDuration += 1;
       break;
@@ -259,6 +286,11 @@ function boundMs(bound: string | undefined, label: 'from' | 'to'): number | unde
  * 이벤트 스트림 → 리포트 집계.
  * Outcome 은 여기서 재판정하지 않는다 — 재문의(24h) 반영은 §4.1 resolveOutcome 의 몫이고,
  * 그 결과가 session.ended 에 실려 오는 것이 이벤트 계약이다. 두 곳에서 판정하면 값이 갈린다.
+ *
+ * 다만 **그 계약이 실제로 지켜지는지는 세어 둔다**. `resolveOutcome` 은 종료 시점에 돌고
+ * 재문의는 그 뒤 24시간의 사실이라 종료 이벤트에 채울 수 있는 시점이 없다 — 즉 보정은
+ * 지금까지 **한 건에도 적용된 적이 없고**, `autoResolved` 는 언제나 재문의 0건을 가정한
+ * 상한이다. 값을 고치지는 않되(§2) 그 사실이 리포트에 적히게 한다(§13-3).
  */
 export function aggregateReport(events: InteractionEvent[], opts: ReportOptions): ReportSummary {
   assertTenantScope(opts.scope);
@@ -383,16 +415,34 @@ export interface OutcomeRates {
   transferred: Ratio;
   abandoned: Ratio;
   failed: Ratio;
+  /**
+   * §4.1 재문의 보정의 적용 실태. **비율과 같은 객체에 둔다** — 따로 두면 화면이 비율만 가져가
+   * "자동완결률"로 표시하고, 보정이 한 번도 적용되지 않았다는 사실은 그 옆 칸에 남아 아무도
+   * 보지 않는다. 판정하지 않고 건수만 적는다(§13-3).
+   */
+  autoResolvedReContactDeclared: number;
+  /** §4.1 로는 `ABANDONED` 인데 `AUTO_RESOLVED` 로 기록된 건수. 집계는 고쳐 세지 않는다(§2). */
+  autoResolvedReContacted: number;
+  /**
+   * `autoResolved` 가 **재문의 보정을 거치지 않은 상한**인가.
+   * `AUTO_RESOLVED` 기록이 있는데 그중 재문의 선언이 한 건도 없으면 true 다 —
+   * 보정 대상이 아예 없는 기간(자동완결 0건)과 구분하기 위해 분자 0 일 때는 false 다.
+   */
+  autoResolvedIsUpperBound: boolean;
 }
 
 export function outcomeRates(b: ReportBucket): OutcomeRates {
   const d = b.sessionsEnded;
+  const auto = b.outcomes.AUTO_RESOLVED;
   return {
     denominatorSessionsEnded: d,
-    autoResolved: ratio(b.outcomes.AUTO_RESOLVED, d),
+    autoResolved: ratio(auto, d),
     transferred: ratio(b.outcomes.TRANSFERRED, d),
     abandoned: ratio(b.outcomes.ABANDONED, d),
     failed: ratio(b.outcomes.FAILED, d),
+    autoResolvedReContactDeclared: b.autoResolvedReContactDeclared,
+    autoResolvedReContacted: b.autoResolvedReContacted,
+    autoResolvedIsUpperBound: auto > 0 && b.autoResolvedReContactDeclared === 0,
   };
 }
 

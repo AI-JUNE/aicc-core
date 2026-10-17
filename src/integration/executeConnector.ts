@@ -19,8 +19,7 @@
 import type { ConsentPolicy, ConsentRecord } from '../consent/consent.ts';
 import { maskPii } from '../core/policyGuard.ts';
 import type { TenantScope } from '../core/tenancy.ts';
-import { decideLegalBasis, type LegalBasisDecision } from '../legal/executeLegal.ts';
-import type { AcceptanceRecord, LegalDocument } from '../legal/documents.ts';
+import { decideLegalBasis, type LegalBasisDecision, type LegalNoticeContext } from '../legal/executeLegal.ts';
 import type { FlowInput } from '../flow/runner.ts';
 import type { HealthSample } from '../ops/fallback.ts';
 import {
@@ -86,15 +85,11 @@ export type ExecuteOutcome = ExecuteOk | ExecuteFailed | ExecuteBlocked;
  * **선언하지 않으면 종전과 완전히 같다**(§13-3) — 문안 검사를 하지 않고 동의 게이트 결과만 쓴다.
  * 선언하면 초안 문안·시행일 전 문안·개정 후 재수락 누락이 **호출 전에** 막힌다. 판정은
  * `legal/executeLegal.ts` 하나가 만들고 이 파일은 순서만 지킨다(§2).
+ *
+ * 모양은 `legal/executeLegal.ts` 의 `LegalNoticeContext` 하나다 — 같은 세 칸을 여기서 다시
+ * 선언하면 언젠가 한 쪽에만 필드가 늘고, 그쪽을 지나는 경로만 검사된다(§2).
  */
-export interface LegalContext {
-  /** 등록부 내용(`LegalRegistry.list()` 결과 그대로). */
-  docs: readonly LegalDocument[];
-  /** 문안 수락 기록. 없으면 재수락 판정을 하지 않고 "대조할 수 없다"로 적는다. */
-  acceptances?: readonly AcceptanceRecord[];
-  /** 고객에게 보여 준 언어. 기본 언어를 만들지 않는다(§13-3). */
-  locale: string;
-}
+export type LegalContext = LegalNoticeContext;
 
 export interface ConsentContext {
   policy: ConsentPolicy;

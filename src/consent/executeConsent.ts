@@ -39,6 +39,7 @@ import type { TenantScope } from '../core/tenancy.ts';
 import { assertTenantScope } from '../core/tenancy.ts';
 import type { ConsentPolicy, ConsentPurpose, ConsentRecord } from './consent.ts';
 import { ACTION_PURPOSES, deny, evaluateConsents, grant, validateConsentPolicy } from './consent.ts';
+import type { LegalNoticeContext } from '../legal/executeLegal.ts';
 
 /**
  * 동의 질문 노드의 예약 id 접두사. 뒤에 `ConsentPurpose` 를 붙인다
@@ -299,6 +300,15 @@ export interface ConsentLookup {
   records: readonly ConsentRecord[];
   subjectRef: string;
   now: string;
+  /**
+   * §10.1 고지 문안 검사 재료. **없으면 종전과 완전히 같다**(§13-3) — `decideLegalBasis` 는
+   * 문안을 보지 않고 동의 게이트 결과만 쓰며, 그 사실을 `unverifiableKo` 에 적는다.
+   *
+   * 여기까지 실어 주지 않으면 등록부(`legal/documents.ts`)는 저장소에 있으나 **통화 경로에서
+   * 한 번도 조회되지 않는다** — 초안 문안으로 받은 동의가 근거로 쌓여도 어디에서도 드러나지
+   * 않고, 증상은 "점검받을 때 그 기간의 동의 전부가 무효"다.
+   */
+  legal?: LegalNoticeContext;
 }
 
 export function buildConsentLookup(
@@ -306,6 +316,7 @@ export function buildConsentLookup(
   store: ConsentStore,
   subjectRef: string | undefined,
   now: string,
+  legal?: LegalNoticeContext,
 ): ConsentLookup | undefined {
   if (typeof subjectRef !== 'string' || subjectRef.trim() === '') return undefined;
   let records: readonly ConsentRecord[];
@@ -315,7 +326,7 @@ export function buildConsentLookup(
     return undefined;
   }
   if (!Array.isArray(records)) return undefined;
-  return { policy, records, subjectRef, now };
+  return { policy, records, subjectRef, now, ...(legal !== undefined ? { legal } : {}) };
 }
 
 export interface ConsentBindingIssues {

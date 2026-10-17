@@ -33,6 +33,7 @@ import type { HealthSample } from '../ops/fallback.ts';
 import type { ConnectorDef, ConnectorPort } from './connector.ts';
 import type { ConsentContext, ExecuteOutcome } from './executeConnector.ts';
 import { executeConnector, toFlowInput } from './executeConnector.ts';
+import type { LegalBasisDecision } from '../legal/executeLegal.ts';
 
 export const CONNECTOR_PUMP_CONTRACT_VERSION = 1;
 
@@ -85,6 +86,21 @@ export interface ConnectorPumpBinding {
     block?: PumpBlock;
     consentError?: string;
   }) => void;
+  /**
+   * §10.1 근거 판정 보고(행위 하나당 한 번). `executeConnector` 가 이 훅을 위해
+   * `onLegalBasis` 를 열어 두었는데 **펌프가 그것을 넘기지 않아 판정이 경계에서 버려지고
+   * 있었다** — 그래서 지금까지 호스트가 볼 수 있던 것은 `blocked` 한 글자뿐이었다.
+   *
+   * 판정에는 **막지 않은 사실**이 들어 있다: 확정 여부를 확인할 수 없는 참조, 수락 기록이
+   * 없어 "어떤 문안으로 받은 동의인지" 대조하지 못한 것, 선택 목적의 초안 문안. 셋 다 통화를
+   * 막지 않으므로 여기로 나오지 않으면 **어디에도 남지 않고**, 남지 않은 사실은 점검받을 때
+   * 다시 만들 수 없다. 던져도 호출을 막지 않는다(§9.3).
+   */
+  onLegalBasis?: (info: {
+    interactionId: string;
+    connectorId: string;
+    decision: LegalBasisDecision;
+  }) => void;
 }
 
 /** 호출까지 가지 못하고 끊긴 사유. **업무시스템 장애가 아니다** — 헬스에 집계하지 않는다. */
@@ -101,6 +117,11 @@ export interface PumpHopResult {
   block?: PumpBlock;
   /** 동의 컨텍스트 조립이 던졌다 — 설정 문제이므로 삼키지 않고 드러낸다(§10.1). */
   consentError?: string;
+  /**
+   * §10.1 근거 판정(행위 순서 그대로). 동의 컨텍스트가 있고 실행기가 게이트까지 간 경우에만
+   * 있다 — **훅을 주지 않아도 결과에는 남는다**(훅은 쓰는 쪽의 선택이고, 사실은 선택이 아니다).
+   */
+  legalBasis?: LegalBasisDecision[];
 }
 
 /**
@@ -197,6 +218,10 @@ export async function pumpConnectorHop(args: PumpHopInput): Promise<PumpHopResul
     }
   }
 
+  // 판정은 **언제나** 모은다. 훅을 준 호스트에게는 그대로 올리고, 주지 않았어도 결과에 남는다 —
+  // 실행기는 이 훅으로만 "막지 않은 사실"을 내보내므로 여기서 받지 않으면 그 사실이 사라진다.
+  const legalBasis: LegalBasisDecision[] = [];
+
   const outcome = await executeConnector({
     def,
     slots,
@@ -210,12 +235,18 @@ export async function pumpConnectorHop(args: PumpHopInput): Promise<PumpHopResul
     ...(binding.sleep !== undefined ? { sleep: binding.sleep } : {}),
     ...(args.onHealth !== undefined ? { onHealth: args.onHealth } : {}),
     ...(args.now !== undefined ? { now: args.now } : {}),
+    onLegalBasis: (decision) => {
+      legalBasis.push(decision);
+      // 호스트 훅이 던져도 모은 사실은 남는다(순서가 곧 안전장치다). 예외는 실행기가 삼킨다.
+      binding.onLegalBasis?.({ interactionId, connectorId, decision });
+    },
   });
 
   return {
     input: toFlowInput(outcome),
     connectorId, idempotencyKey, outcome,
     ...(consentError !== undefined ? { consentError } : {}),
+    ...(legalBasis.length > 0 ? { legalBasis } : {}),
   };
 }
 
