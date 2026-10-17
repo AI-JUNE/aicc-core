@@ -161,3 +161,41 @@ test('오퍼 — 종결된 오퍼는 다시 전이하지 않는다', b, () => {
   assert.equal(rt.applyOfferEvent(done, 'decline', '2026-03-02T01:00:05.000Z', 3).next, 'waiting');
   assert.throws(() => rt.offerAssignment({ scope, offerId: 'o', queueId: 'q', interactionId: 'i', agentId: 'a', offeredAt: '2026-03-02T01:00:00.000Z', timeoutMs: 0, attempt: 1 }), /timeoutMs/);
 });
+
+test('닿을 수 있는 큐 — 규칙·기본 큐·오버플로를 모두 센다', b, () => {
+  const ids = (channel, over) => rt.reachableQueues(cfg(over), channel).map((x) => x.id).sort();
+  // 음성: q_chat 은 규칙(chat 전용)에도, 큐의 channels 에도 걸리지 않으므로 닿지 않는다.
+  assert.deepEqual(ids('voice'), ['q_general', 'q_vip']);
+  assert.deepEqual(ids('chat'), ['q_chat', 'q_general', 'q_vip']);
+  // 기본 큐는 좁혀 선언해도 닿는다 — selectQueue 가 기본 큐에서는 채널 검사를 건너뛴다.
+  assert.deepEqual(
+    ids('voice', { queues: [q('q_general', { channels: ['chat'] })], rules: [] }),
+    ['q_general'],
+  );
+  // 오버플로 대상은 채널 선언과 무관하게 닿는다 — admitToQueue 는 channels 를 보지 않는다.
+  assert.deepEqual(
+    ids('voice', {
+      queues: [q('q_general', { overflowQueueId: 'q_last' }), q('q_last', { channels: ['chat'] })],
+      rules: [],
+    }),
+    ['q_general', 'q_last'],
+  );
+});
+
+test('닿을 수 있는 큐 — 미참조 큐는 세지 않고, 순환·미정의 선언에도 멈추지 않는다', b, () => {
+  const only = rt.reachableQueues(cfg({ queues: [q('q_general'), q('q_orphan')], rules: [] }), 'voice');
+  assert.deepEqual(only.map((x) => x.id), ['q_general']);
+  // 순환(a→b→a)은 한 번 본 큐에서 끊는다. 끊지 않으면 배선 검증이 무한히 돈다.
+  const cyc = rt.reachableQueues(cfg({
+    queues: [q('q_a', { overflowQueueId: 'q_b' }), q('q_b', { overflowQueueId: 'q_a' })],
+    rules: [], defaultQueueId: 'q_a',
+  }), 'voice');
+  assert.deepEqual(cyc.map((x) => x.id).sort(), ['q_a', 'q_b']);
+  // 없는 큐를 가리키는 선언(기본 큐·오버플로·규칙)에도 던지지 않는다 — 검증은 validateRoutingConfig 가 한다.
+  assert.deepEqual(rt.reachableQueues(cfg({ queues: [], rules: [] }), 'voice'), []);
+  assert.deepEqual(
+    rt.reachableQueues(cfg({ queues: [q('q_general', { overflowQueueId: 'q_none' })], rules: [] }), 'voice')
+      .map((x) => x.id),
+    ['q_general'],
+  );
+});

@@ -251,6 +251,46 @@ export function selectQueue(cfg: RoutingConfig, ctx: RouteContext): RouteSelecti
   return { queue: fallback, reasonKo: '매칭 규칙 없음 — 기본 큐' };
 }
 
+/**
+ * 그 채널의 이관이 **실제로 닿을 수 있는** 큐 전부. 배선 검증용이며 판정 경로가 아니다.
+ *
+ * 세 경로를 다 세는 이유가 있다 — 한쪽만 세면 그 결과로 만든 경고가 실제 경로와 어긋나고,
+ * 어긋난 경고는 과다하면 진짜 신호를 묻고 과소하면 결함을 놓친다.
+ *  1) **규칙 경로**: `selectQueue` 는 규칙의 `when.channels` 와 큐의 `channels` 를 둘 다 본다.
+ *  2) **기본 큐**: `selectQueue` 는 기본 큐에 대해 **그 검사를 건너뛴다**(249행 부근) —
+ *     채널을 좁혀 선언한 기본 큐도 모든 채널이 닿는다. 좁힘을 신뢰하면 여기서 놓친다.
+ *  3) **오버플로 연쇄**: `admitToQueue` 는 `channels` 를 **아예 보지 않는다**. 좁혀 선언한
+ *     오버플로 큐에도 다른 채널의 고객이 들어가며, 그 큐가 닫히면 **그 큐의** 대안이 나간다.
+ *
+ * 어떤 규칙·기본 큐·오버플로에도 걸리지 않은 큐는 넣지 않는다(설정에만 있는 큐의 경고는
+ * 아직 일어날 수 없는 일이다). 순환 선언은 `admitToQueue` 처럼 한 번 본 큐에서 끊는다.
+ */
+export function reachableQueues(cfg: RoutingConfig, channel: ChannelKind): AgentQueue[] {
+  const byId = new Map(cfg.queues.map((q) => [q.id, q] as const));
+  const open: string[] = [];
+  for (const r of cfg.rules) {
+    if (r.when.channels?.length && !r.when.channels.includes(channel)) continue;
+    const q = byId.get(r.toQueue);
+    if (!q) continue;
+    if (q.channels?.length && !q.channels.includes(channel)) continue;
+    open.push(q.id);
+  }
+  if (byId.has(cfg.defaultQueueId)) open.push(cfg.defaultQueueId);
+
+  const seen = new Set<string>();
+  const out: AgentQueue[] = [];
+  while (open.length > 0) {
+    const id = open.pop() as string;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const q = byId.get(id);
+    if (!q) continue;
+    out.push(q);
+    if (q.overflowQueueId !== undefined) open.push(q.overflowQueueId);
+  }
+  return out;
+}
+
 /** 큐의 현재 상태. 실측값만 담는다 — 예측·평균 대기시간은 넣지 않는다(§13-3). */
 export interface QueueSnapshot {
   queueId: string;

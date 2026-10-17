@@ -39,6 +39,10 @@ import { assertTenantScope } from '../core/tenancy.ts';
 import type { FlowInput } from '../flow/runner.ts';
 import type { EntryPoint, LatencyMs, UsageMetrics } from '../events/schema.ts';
 import type { HealthSample, ComponentId } from '../ops/fallback.ts';
+import type { ClosedAction } from '../routing/agentQueue.ts';
+import type {
+  AlternativeCause, HandoffPlacement, HandoffUnavailableCode,
+} from '../routing/executeHandoff.ts';
 import type {
   ChannelAdapterId, ChannelCapabilities, ChannelSessionRequest, ChannelTurnInput,
   ChannelTurnResult, ConversationCorePort,
@@ -85,6 +89,37 @@ export interface BridgeResponse {
   error?: BridgeError;
 }
 
+/**
+ * 이관 목적지 판정(§9.3)의 전송용 투영.
+ *
+ * `placement !== 'queued'` 면 **큐에 사람이 들어가지 않았다**. 그때 호스트가 해야 하는 일은
+ * `action`(콜백·음성사서함·기존 IVR)이며, 상담사 연결 안내를 해서는 안 된다 — 채널 계약
+ * (`ChannelTurnResult.handoff.placement`)이 그렇게 적어 둔 값이다.
+ *
+ * 필드가 판정 종류마다 갈리므로 전부 옵셔널이다. **`summaryMasked` 는 어느 경우에도 여기에
+ * 없다** — 상담사용 요약은 `handoff.summaryMasked` 한 곳에서 노출 스위치를 지난다(두 자리에
+ * 두면 한쪽만 막은 날 약속이 무효가 된다, §2·§10.3). 있었는지는 `summaryPresent` 로 적는다.
+ */
+export interface BridgePlacementPayload {
+  placement: HandoffPlacement['placement'];
+  reasonKo: string;
+  summaryPresent: boolean;
+  warnings: string[];
+  /** 규칙이 고른 큐(오버플로 이전). **여기에 사람을 놓지 않는다** — 집계·사후추적용이다. */
+  requestedQueueId?: string;
+  path?: string[];
+  /** `placement === 'queued'` 에서만. **놓을 수 있는 큐 id 는 이것 하나뿐이다.** */
+  queueId?: string;
+  overflowed?: boolean;
+  matchedRuleId?: string;
+  cause?: AlternativeCause;
+  /** `placement === 'alternative'` 에서만. 큐 설정에 선언된 대안이며 Core 가 만들지 않는다(§13-3). */
+  action?: ClosedAction;
+  /** `placement === 'unavailable'` 에서만. 전부 설정 결함이다. */
+  code?: HandoffUnavailableCode;
+  issues?: string[];
+}
+
 /** 호스트에게 돌려주는 턴 결과의 **전송용 투영**. Core 내부 타입을 그대로 흘리지 않는다. */
 export interface BridgeTurnPayload {
   interactionId: string;
@@ -101,10 +136,33 @@ export interface BridgeTurnPayload {
     /** 값이 아니라 **키만** 나간다. 값이 필요하면 includeSlots 를 켠다(§10.3). */
     slotKeys: string[];
     slots?: Record<string, string>;
+    /**
+     * Api 대기 중인 커넥터 id(§6.1). 값이 있으면 Core 는 **호스트의 조회 결과를 기다리는
+     * 상태**이고, 보내야 하는 다음 입력은 발화가 아니라 `{"kind":"connectorResult",...}` 다.
+     *
+     * 이 값이 없던 동안 비-Node 호스트에는 그 사실을 알 길이 없었다: 대기 중에 발화를 보내면
+     * `steps` 0건·`events` 0건이 돌아오고(§6.1 구간) 오류도 아니라서, 통화는 끊기지도 않은 채
+     * 멈추고 **어떤 알림도 울리지 않는다**. 커넥터 이행이 배선된 테넌트에서는 Core 가 스스로
+     * 불러 이 값이 서지 않으므로, 서 있다는 것 자체가 "호스트가 부를 차례"라는 뜻이다.
+     */
+    pendingConnectorId?: string;
   };
   events: unknown[];
   fallback?: unknown;
-  handoff?: { queue?: string; summaryAvailable: boolean; summaryMasked?: string };
+  handoff?: {
+    queue?: string;
+    summaryAvailable: boolean;
+    summaryMasked?: string;
+    /**
+     * 큐 배정 판정(§9.3). Core 에 라우팅이 배선된 경우에만 실린다.
+     *
+     * 이 값이 없던 동안 비-Node 호스트는 **큐에 들어가지 못한 고객에게도 "상담사를 연결해
+     * 드리겠습니다"를 안내**했다. `queue` 만 보면 구분이 안 되기 때문이다 — 대안으로 간 건은
+     * 놓을 큐 id 를 아예 들고 있지 않아 `queue` 가 비고, 그 상태는 "큐를 선언하지 않은 이관"과
+     * 같은 모양이다. 음성이 바로 그 대안(콜백·음성사서함)이 선언되는 채널이다.
+     */
+    placement?: BridgePlacementPayload;
+  };
   /**
    * 이번 턴에 AI 고지를 냈다는 사실(§10.1). 문구는 `steps` 맨 앞 단계에 실려 있으므로 여기서
    * 되풀이하지 않고 **감사 근거**(어느 매체에 어떤 버전으로)만 내보낸다 — 호스트가 steps 를
@@ -476,6 +534,33 @@ function projectEvents(events: readonly unknown[], opts: BridgeOptions): unknown
   });
 }
 
+/**
+ * 판정을 **필드별로 다시 적는다**. 객체를 그대로 흘리지 않는 이유가 둘이다 —
+ * (1) `summaryMasked` 가 노출 스위치를 건너뛰어 나가는 경로를 만들지 않는다(§2·§10.3),
+ * (2) 배열(`warnings`·`path`·`issues`)을 복사해 호스트가 Core 의 판정을 고칠 수 없게 한다
+ *     (JSON 직렬화 전까지는 고칠 수 있고, 고쳐진 판정은 "Core 가 그렇게 적었다"로 남는다 —
+ *     동의·점검 투영과 같은 규칙이다).
+ */
+function projectPlacement(p: HandoffPlacement): BridgePlacementPayload {
+  const common: BridgePlacementPayload = {
+    placement: p.placement,
+    reasonKo: p.reasonKo,
+    summaryPresent: p.summaryPresent,
+    warnings: [...p.warnings],
+  };
+  if (p.placement === 'unavailable') {
+    return { ...common, code: p.code, issues: [...p.issues] };
+  }
+  const base: BridgePlacementPayload = { ...common, requestedQueueId: p.requestedQueueId, path: [...p.path] };
+  if (p.placement === 'alternative') return { ...base, cause: p.cause, action: p.action };
+  return {
+    ...base,
+    queueId: p.queueId,
+    overflowed: p.overflowed,
+    ...(p.matchedRuleId !== undefined ? { matchedRuleId: p.matchedRuleId } : {}),
+  };
+}
+
 function projectTurn(r: ChannelTurnResult, opts: BridgeOptions): BridgeTurnPayload {
   const slots = r.state.slots ?? {};
   const payload: BridgeTurnPayload = {
@@ -491,6 +576,9 @@ function projectTurn(r: ChannelTurnResult, opts: BridgeOptions): BridgeTurnPaylo
       turnCount: r.state.turnCount,
       failCount: r.state.failCount,
       slotKeys: Object.keys(slots),
+      // 값이 아니라 **대기 사실**이다 — 커넥터 id 는 테넌트 설정 문자열이고 개인정보가 아니므로
+      // 노출 스위치와 무관하게 나간다(없으면 호스트는 위 주석의 무음을 구분할 수 없다).
+      ...(r.state.pendingConnectorId !== undefined ? { pendingConnectorId: r.state.pendingConnectorId } : {}),
     },
     events: projectEvents(r.events as unknown[], opts),
   };
@@ -505,6 +593,10 @@ function projectTurn(r: ChannelTurnResult, opts: BridgeOptions): BridgeTurnPaylo
     if (opts.includeHandoffSummary && r.handoff.summaryMasked !== undefined) {
       handoff.summaryMasked = r.handoff.summaryMasked;
     }
+    // 큐에 들어갔는지 / 대안으로 갔는지. **노출 스위치와 무관하게 나간다** — 여기에는 개인정보가
+    // 없고(큐 id·판정 코드·Core 가 마스킹한 사유뿐), 감추면 호스트는 큐에 넣지 못한 고객에게도
+    // 상담사 연결을 안내한다(§9.3).
+    if (r.handoff.placement !== undefined) handoff.placement = projectPlacement(r.handoff.placement);
     payload.handoff = handoff;
   }
   // 고지 사실은 어떤 노출 스위치와도 무관하게 나간다 — 슬롯 값·상담사용 요약과 달리

@@ -541,3 +541,146 @@ test('합류 토큰은 들어오는 방향으로 통과한다 — 전환 배선�
   // 응답에는 토큰을 되돌려주지 않는다 — 열쇠를 로그로 흘리지 않는다(§10.3).
   assert.equal(JSON.stringify(r).includes('tk_from_link'), false);
 });
+
+// ── 이관 목적지 판정(§9.3) ───────────────────────────────────────────────────
+// 투영이 `placement` 를 버리던 동안, 비-Node 호스트는 **큐에 들어가지 못한 고객에게도**
+// "상담사를 연결해 드리겠습니다"를 안내했다. 대안으로 간 건은 놓을 큐 id 를 들고 있지 않아
+// `queue` 가 비고, 그 모양은 "큐를 선언하지 않은 이관"과 구분되지 않는다.
+
+const QUEUES = [
+  { id: 'q_care', tenantId: 'goone', titleKo: '케어', skills: [], closedAction: 'callback',
+    maxWaiting: 1, overflowQueueId: 'q_backup' },
+  { id: 'q_backup', tenantId: 'goone', titleKo: '예비', skills: [], closedAction: 'voicemail' },
+];
+const routing = (snapshots) => ({
+  config: { tenantId: 'goone', queues: QUEUES, rules: [], defaultQueueId: 'q_care' },
+  snapshots: () => snapshots,
+});
+const toAgent = async (bridge) => {
+  await bridge.handleLine(line({ id: '0', op: 'start', req: { flowId: 'billing', entryPoint: 'inbound_call' } }));
+  return bridge.handleLine(line({
+    id: '1', op: 'send', interactionId: 'i_bridge1', turn: { input: { kind: 'utterance', text: '홍길동' } },
+  }));
+};
+
+test('큐에 들어간 건: 놓을 수 있는 큐 id 와 오버플로 사실이 호스트에 나간다', b, async () => {
+  const { bridge } = build({}, {
+    routing: routing([
+      { queueId: 'q_care', waiting: 1, availableAgents: 2, observedAt: NOW },   // maxWaiting 1 → 꽉 참
+      { queueId: 'q_backup', waiting: 0, availableAgents: 1, observedAt: NOW },
+    ]),
+  });
+  const r = await toAgent(bridge);
+  assert.equal(r.ok, true);
+  const p = r.result.handoff.placement;
+  assert.equal(p.placement, 'queued');
+  assert.equal(p.queueId, 'q_backup', '꽉 찬 큐를 안내하면 "특정 시간대에만 대기가 길다"가 된다');
+  assert.equal(p.overflowed, true);
+  assert.equal(p.requestedQueueId, 'q_care');
+  assert.ok(Array.isArray(p.path));
+});
+
+test('대안으로 간 건: action 이 나가고 호스트가 상담사 연결을 안내하지 않을 근거가 생긴다(§9.3)', b, async () => {
+  const { bridge } = build({}, { routing: routing([]) });   // 상태 미확인 → 보수적으로 닫힘
+  const r = await toAgent(bridge);
+  assert.equal(r.ok, true);
+  const p = r.result.handoff.placement;
+  assert.equal(p.placement, 'alternative');
+  assert.equal(p.action, 'callback');
+  assert.equal(p.cause, 'closed');
+  // **놓을 큐 id 가 아예 없다.** 있으면 호스트가 그 큐로 안내하게 된다.
+  assert.equal(p.queueId, undefined);
+  // 그런데 `handoff.queue` 는 시나리오가 적어 둔 큐 그대로다 — 그래서 **그 필드만 보면
+  // 안 된다**. 이것이 placement 가 나가야 하는 이유 자체다(큐에 못 들어간 고객과 그 큐로
+  // 들어간 고객이 같은 모양으로 보인다).
+  assert.equal(r.result.handoff.queue, 'q_care');
+});
+
+test('목적지를 정하지 못한 건: 설정 결함이 code·issues 로 드러난다 — "대안"으로 뭉개지 않는다', b, async () => {
+  // 시간대가 빠진 시각(호스트가 로컬 시계를 주입한 경우)은 영업시간·신선도 판정을 불가능하게
+  // 만든다. 열린 것으로 추정하지 않으므로 목적지 자체가 서지 않는다.
+  const { bridge } = build({}, {
+    now: () => '2026-09-06 09:00:00',
+    routing: routing([{ queueId: 'q_care', waiting: 0, availableAgents: 2, observedAt: NOW }]),
+  });
+  const r = await toAgent(bridge);
+  assert.equal(r.ok, true);
+  const p = r.result.handoff.placement;
+  assert.equal(p.placement, 'unavailable');
+  assert.equal(p.code, 'E_CLOCK_INVALID');
+  assert.ok(Array.isArray(p.issues));
+  assert.equal(p.queueId, undefined);
+  assert.equal(p.action, undefined, '설정 결함에 대안을 지어내지 않는다(§13-3)');
+});
+
+test('판정 안에는 상담사용 요약이 **어느 경우에도** 없다 — 스위치가 한 곳이어야 한다(§2·§10.3)', b, async () => {
+  for (const include of [false, true]) {
+    const { bridge } = build({ includeHandoffSummary: include }, { routing: routing([]) });
+    const r = await toAgent(bridge);
+    const p = r.result.handoff.placement;
+    assert.equal('summaryMasked' in p, false, `includeHandoffSummary=${include}`);
+    assert.equal(p.summaryPresent, true, '있었다는 사실은 숨기지 않는다');
+    // 켠 경우에만 요약이 나가고, 그 자리는 handoff.summaryMasked 하나다.
+    assert.equal(typeof r.result.handoff.summaryMasked, include ? 'string' : 'undefined');
+  }
+});
+
+test('판정은 호스트가 고칠 수 없다 — 돌려준 배열을 복사해 내보낸다', b, async () => {
+  const { bridge, core } = build({}, { routing: routing([]) });
+  const r = await toAgent(bridge);
+  r.result.handoff.placement.warnings.push('호스트가 끼워 넣음');
+  r.result.handoff.placement.path.length = 0;
+  const kept = core.sessions.get('i_bridge1').lastResult.handoff.placement;
+  assert.equal(kept.warnings.includes('호스트가 끼워 넣음'), false);
+  assert.ok(kept.path.length > 0);
+});
+
+test('라우팅을 주지 않으면 placement 자체가 없다 — 종전과 완전히 같다(§13-3)', b, async () => {
+  const { bridge } = build();
+  const r = await toAgent(bridge);
+  assert.equal(r.result.handoff.placement, undefined);
+  assert.equal(r.result.handoff.queue, 'q_care');
+});
+
+// ── Api 대기(§6.1) ───────────────────────────────────────────────────────────
+
+test('Api 대기 중이면 그 사실이 나간다 — 다음 입력이 발화가 아니라 connectorResult 다', b, async () => {
+  const apiFlow = {
+    id: 'lookup', version: 1, startNodeId: 'ask',
+    nodes: {
+      ask: { id: 'ask', kind: 'Collect', slot: 'cno', prompt: '고객번호를 말씀해 주세요.', next: 'call' },
+      call: { id: 'call', kind: 'Api', connectorId: 'c_balance', waitText: '조회 중입니다.', next: 'bye' },
+      bye: { id: 'bye', kind: 'Say', text: '감사합니다.' },
+    },
+  };
+  const { bridge } = build({}, { flows: R.createMemoryFlowRegistry([apiFlow]) });
+  await bridge.handleLine(line({ id: '0', op: 'start', req: { flowId: 'lookup', entryPoint: 'inbound_call' } }));
+  const w = await bridge.handleLine(line({
+    id: '1', op: 'send', interactionId: 'i_bridge1', turn: { input: { kind: 'utterance', text: '12345' } },
+  }));
+  assert.equal(w.result.state.pendingConnectorId, 'c_balance');
+  assert.ok(w.result.steps.some((s) => s.awaitConnectorId === 'c_balance'));
+
+  // 대기 중에 발화를 보내면 steps·events 가 0건이다(§6.1 구간) — 그래도 **대기 사실은 남는다**.
+  // 이 한 칸이 없던 동안 호스트는 무음과 "아무 일도 없었음"을 구분할 수 없었다.
+  const silent = await bridge.handleLine(line({
+    id: '2', op: 'send', interactionId: 'i_bridge1', turn: { input: { kind: 'utterance', text: '여보세요' } },
+  }));
+  assert.equal(silent.ok, true);
+  assert.equal(silent.result.steps.length, 0);
+  assert.equal(silent.result.events.length, 0);
+  assert.equal(silent.result.state.pendingConnectorId, 'c_balance');
+
+  const done = await bridge.handleLine(line({
+    id: '3', op: 'send', interactionId: 'i_bridge1',
+    turn: { input: { kind: 'connectorResult', ok: true, slots: { balance: '12000' } } },
+  }));
+  assert.equal(done.result.state.pendingConnectorId, undefined, '결과를 받았는데 대기가 남으면 호스트가 또 부른다');
+  assert.ok(done.result.steps.some((s) => s.nodeId === 'bye'));
+});
+
+test('Api 노드가 없는 시나리오에는 대기 필드가 붙지 않는다(§13-3)', b, async () => {
+  const { bridge } = build();
+  const s = await bridge.handleLine(line({ id: '0', op: 'start', req: { flowId: 'billing', entryPoint: 'inbound_call' } }));
+  assert.equal('pendingConnectorId' in s.result.state, false);
+});

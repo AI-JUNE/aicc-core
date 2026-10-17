@@ -3707,3 +3707,110 @@ test('판정을 복사하지 않는다 — 규칙 조건이 runtime.ts 에 없�
   assert.equal(/mayContainPii/.test(code), false);
   assert.equal(/retentionDays/.test(code), false);
 });
+
+// ── 큐 대안과 채널 능력의 어긋남(§9.3) ───────────────────────────────────────
+// 큐가 닫힌 **시각에만** 나타나는 결함이라 평시 검사로는 영영 드러나지 않는다.
+// 대안 중 채널 계약에 대응하는 능력이 있는 것은 legacy_ivr 하나이므로 그것만 검사한다.
+
+const IVR_QUEUES = (over = {}) => ([
+  { id: 'q_care', tenantId: 'goone', titleKo: '케어', skills: [], closedAction: 'legacy_ivr', ...over },
+]);
+const ivrRouting = (over = {}) => ({
+  config: { tenantId: 'goone', queues: IVR_QUEUES(), rules: [], defaultQueueId: 'q_care', ...(over.config ?? {}) },
+  snapshots: () => [{ queueId: 'q_care', waiting: 0, availableAgents: 1, observedAt: NOW }],
+});
+
+test('기존 IVR 회귀를 못 하는 채널이 legacy_ivr 대안 큐에 닿으면 드러낸다(W_ROUTING_ALTERNATIVE)', b, () => {
+  const { core } = build({ flows: [flowHandoff], routing: ivrRouting() });
+  const w = core.warnings().find((x) => x.code === 'W_ROUTING_ALTERNATIVE');
+  assert.ok(w, '큐가 닫힌 시각에 고객이 아무 곳에도 가지 못하는 조합은 조용해서는 안 된다');
+  assert.match(w.messageKo, /q_care/);
+  assert.match(w.messageKo, /routeToLegacyIvr/);
+});
+
+test('능력이 있는 채널에는 적지 않는다 — 해당 없는 경고는 진짜 신호를 묻는다', b, () => {
+  const { core } = build({
+    flows: [flowHandoff], port: fakePort('callbot', { routeToLegacyIvr: true }), routing: ivrRouting(),
+  });
+  assert.equal(core.warnings().some((x) => x.code === 'W_ROUTING_ALTERNATIVE'), false);
+});
+
+test('대안이 콜백·음성사서함이면 적지 않는다 — Core 가 검사할 능력이 없다(§13-3)', b, () => {
+  const { core } = build({ flows: [flowHandoff], routing: ROUTING() });
+  assert.equal(core.warnings().some((x) => x.code === 'W_ROUTING_ALTERNATIVE'), false);
+});
+
+test('기본 큐는 channels 로 좁혀도 모든 채널이 닿는다 — 좁힘을 신뢰하면 놓친다', b, () => {
+  // selectQueue 는 **기본 큐에 대해서만** 채널 검사를 건너뛴다. 좁혀 선언했다는 사실만 보고
+  // 경고를 빼면, 음성 전용으로 적어 둔 기본 큐의 대안이 채팅 고객에게 그대로 적용된다.
+  const { core } = build({
+    flows: [flowHandoff], port: fakePort('chatbot'),
+    routing: ivrRouting({ config: { queues: IVR_QUEUES({ channels: ['voice'] }) } }),
+  });
+  assert.ok(core.warnings().some((x) => x.code === 'W_ROUTING_ALTERNATIVE'));
+});
+
+test('규칙으로만 닿는 큐는 규칙의 채널 조건과 큐의 channels 를 둘 다 본다', b, () => {
+  const config = {
+    tenantId: 'goone',
+    queues: [
+      { id: 'q_open', tenantId: 'goone', titleKo: '일반', skills: [], closedAction: 'callback' },
+      { id: 'q_voice', tenantId: 'goone', titleKo: '음성전용', skills: [], closedAction: 'legacy_ivr', channels: ['voice'] },
+    ],
+    rules: [{ id: 'r1', priority: 10, when: { channels: ['voice'] }, toQueue: 'q_voice' }],
+    defaultQueueId: 'q_open',
+  };
+  const snapshots = () => [{ queueId: 'q_open', waiting: 0, availableAgents: 1, observedAt: NOW }];
+  // 채팅 채널은 규칙(voice 전용)에도, 큐의 channels 에도 걸리지 않으므로 닿을 수 없다.
+  const chat = build({ flows: [flowHandoff], port: fakePort('chatbot'), routing: { config, snapshots } });
+  assert.equal(chat.core.warnings().some((x) => x.code === 'W_ROUTING_ALTERNATIVE'), false);
+  // 음성 채널은 닿는다 — 그리고 callbot 기본 프로파일에는 IVR 회귀 능력이 없다.
+  const voice = build({ flows: [flowHandoff], routing: { config, snapshots } });
+  const w = voice.core.warnings().find((x) => x.code === 'W_ROUTING_ALTERNATIVE');
+  assert.ok(w);
+  assert.match(w.messageKo, /q_voice/);
+});
+
+test('오버플로로만 닿는 큐도 센다 — admitToQueue 는 channels 를 아예 보지 않는다', b, () => {
+  const config = {
+    tenantId: 'goone',
+    queues: [
+      { id: 'q_care', tenantId: 'goone', titleKo: '케어', skills: [], closedAction: 'callback',
+        maxWaiting: 1, overflowQueueId: 'q_last' },
+      { id: 'q_last', tenantId: 'goone', titleKo: '최종', skills: [], closedAction: 'legacy_ivr', channels: ['voice'] },
+    ],
+    rules: [],
+    defaultQueueId: 'q_care',
+  };
+  const { core } = build({
+    flows: [flowHandoff], port: fakePort('chatbot'),
+    routing: { config, snapshots: () => [{ queueId: 'q_care', waiting: 0, availableAgents: 1, observedAt: NOW }] },
+  });
+  const w = core.warnings().find((x) => x.code === 'W_ROUTING_ALTERNATIVE');
+  assert.ok(w, '오버플로 연쇄는 채널 선언을 보지 않으므로 채팅 고객도 그 큐에서 닫힌다');
+  assert.match(w.messageKo, /q_last/);
+});
+
+test('어떤 규칙·기본 큐·오버플로에도 걸리지 않은 큐는 적지 않는다', b, () => {
+  const config = {
+    tenantId: 'goone',
+    queues: [
+      { id: 'q_care', tenantId: 'goone', titleKo: '케어', skills: [], closedAction: 'callback' },
+      { id: 'q_orphan', tenantId: 'goone', titleKo: '미사용', skills: [], closedAction: 'legacy_ivr' },
+    ],
+    rules: [],
+    defaultQueueId: 'q_care',
+  };
+  const { core } = build({
+    flows: [flowHandoff],
+    routing: { config, snapshots: () => [{ queueId: 'q_care', waiting: 0, availableAgents: 1, observedAt: NOW }] },
+  });
+  assert.equal(core.warnings().some((x) => x.code === 'W_ROUTING_ALTERNATIVE'), false,
+    '아직 일어날 수 없는 일의 경고는 진짜 신호를 묻는다');
+});
+
+test('라우팅 자체가 없으면 적지 않는다 — 그 상태는 W_ROUTING_UNBOUND 다', b, () => {
+  const { core } = build({ flows: [flowHandoff] });
+  assert.equal(core.warnings().some((x) => x.code === 'W_ROUTING_ALTERNATIVE'), false);
+  assert.ok(core.warnings().some((x) => x.code === 'W_ROUTING_UNBOUND'));
+});

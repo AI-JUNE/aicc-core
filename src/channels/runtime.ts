@@ -40,7 +40,7 @@ import { createRecoveryProbeRunner } from '../ops/recoveryProbe.ts';
 import type { SummaryOptions } from '../core/handoffSummary.ts';
 import { buildHandoffSummary, requiredSlotsOf } from '../core/handoffSummary.ts';
 import type { AdmissionOptions, AssignmentOffer, OfferEvent, QueueSnapshot, RoutingConfig } from '../routing/agentQueue.ts';
-import { validateRoutingConfig } from '../routing/agentQueue.ts';
+import { reachableQueues, validateRoutingConfig } from '../routing/agentQueue.ts';
 import type { HandoffPlacement } from '../routing/executeHandoff.ts';
 import { executeHandoff } from '../routing/executeHandoff.ts';
 import type { OfferLedger, OfferPolicy, OfferStep } from '../routing/executeOffer.ts';
@@ -80,6 +80,8 @@ import type { TurnBillingNote } from '../billing/turnUsage.ts';
 import { attachTurnUsage, billingNoteOrUndefined, checkBillableMs, mergeTurnUsage, usageNote } from '../billing/turnUsage.ts';
 import type { CoreOp, ObservabilityBinding, ObservedCall, Observer, ObserverStats } from '../obs/executeObservability.ts';
 import { createObserver, isKnownAdapter } from '../obs/executeObservability.ts';
+import type { RateLimiter } from '../api/rateLimit.ts';
+import { enforceRateLimit, rateLimitKey } from '../api/rateLimit.ts';
 import type { ForbiddenPhraseRule, QaReport, QaRuleSet } from '../qa/compliance.ts';
 import type { ComplianceBuffer, ComplianceTurnNote } from '../qa/executeCompliance.ts';
 import {
@@ -698,10 +700,45 @@ export interface ConversationCoreOptions {
    * `RetentionBinding` 주석.
    */
   retention?: RetentionBinding;
+  /**
+   * 요청 제한(§9.3·§11.1·§11.2). **주지 않으면 제한하지 않는다** — 한도 기본값을 코드에 두지
+   * 않는다(§13-3). 한도는 계약·운영 합의값이다.
+   *
+   * 이 자리가 없던 동안 제한은 **브리지(JSONL) 경로에만** 있었다. 그런데 실제로 Core 를
+   * 소비하기 시작한 두 저장소(챗봇·D-ARS)는 TypeScript 호스트라 이 경로를 쓴다 — 즉 보호는
+   * 아무도 지나가지 않는 길에 걸려 있었고, `ChannelTurnInput.usage` 검증이 그랬던 것과 **같은
+   * 모양의 비대칭**이다. 폭주는 악의보다 사고로 온다: 전송 계층의 재시도 루프, 웹훅 재전송,
+   * 잘못 설정된 배치 한 번이 턴마다 LLM·임베딩을 부르고 그 비용은 공급사 청구서에 남는다.
+   *
+   * 키는 **테넌트 스코프 + 진입점**으로 Core 가 만든다(`rateLimitKey`) — 호스트가 키를 정하면
+   * 테넌트 경계 없는 제한이 되고, 한 고객사의 폭주가 다른 고객사를 막는다(§11.1).
+   * 버킷 이름은 `core.*` 이고 브리지는 `bridge.*` 다 — **같은 제한기를 둘에 주면 버킷이 둘**이다
+   * (한 요청을 두 번 세지 않는다. 브리지는 자기 프로세스 경계를, 여기서는 Core 진입을 센다).
+   *
+   * 거절은 `E_RATE_LIMITED` **예외**다(`enforceRateLimit` 가 만든 그 오류 하나 — 판정과 오류
+   * 문구를 여기서 다시 쓰지 않는다, §2). 계산된 `retryAfterMs` 가 함께 실리며 추정치가 아니다.
+   * 거절된 호출은 세션 상태를 바꾸지 않는다 — 제한은 어떤 일을 하기 **전에** 판정한다.
+   *
+   * **`end` 는 어떤 경우에도 막지 않는다**: 막히면 세션이 열린 채 남고 그 누수는 장애가 아니라
+   * 요금으로 나타난다(브리지와 같은 규칙).
+   * **`reportHealth` 도 막지 않는다** — 브리지는 막지만 그쪽에서 막는 비용은 바깥 프로세스가
+   * 보낸 줄을 해석하는 일이고, 여기서는 그 비용이 없다(엔진도 과금도 건드리지 않는 동기 호출이다).
+   * 반면 샘플을 떨어뜨리면 **장애가 정상으로 집계된다**(§9.3) — 그 위험을 보호가 필요 없는
+   * 자리에서 떠안지 않는다. 그래서 `reportHealth` 비용 선언은 **거부한다**(조용히 무시하면
+   * "제한을 걸었다"는 기록만 남는다).
+   */
+  rateLimiter?: RateLimiter;
+  /** 진입점별 비용. 주지 않으면 전부 1. `send` 는 엔진 호출을 동반하므로 무겁게 셀 수 있다. */
+  rateLimitCost?: Partial<Record<RateLimitedEntry, number>>;
   now?: () => string;
   newInteractionId?: (req: ChannelSessionRequest) => string;
   onPublish?: (results: PublishResult[]) => void;
 }
+
+/** 한도 적용 대상 진입점. `end`·`reportHealth` 는 들어 있지 않다(위 `rateLimiter` 주석). */
+export type RateLimitedEntry = 'start' | 'send';
+
+export const RATE_LIMITED_ENTRIES: ReadonlySet<string> = new Set<RateLimitedEntry>(['start', 'send']);
 
 /**
  * 복구 프로브 배선(§9.3). **레지스트리·정책·시계·감시 목록을 받지 않는다** — 호스트가 그것들을
@@ -857,6 +894,46 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
   const offerStore: OfferLedgerStore | undefined = opts.routing?.offers === undefined
     ? undefined
     : (opts.routing.offers.ledger ?? createMemoryOfferLedger());
+
+  // 제한기 **형태** 오류는 설정 오류다(제한기 **장애**는 아래에서 통과로 둔다, §9.3).
+  // 둘을 같게 다루면 오타 하나로 제한이 조용히 꺼진 채 "적용했다"로 남는다 — 브리지와 같은 규칙.
+  if (opts.rateLimiter !== undefined && typeof opts.rateLimiter.check !== 'function') {
+    throw new Error('요청 제한 배선 거부: rateLimiter 는 check(key, cost) 를 가진 제한기여야 합니다 (설계서 §9.3)');
+  }
+  if (opts.rateLimitCost !== undefined) {
+    for (const [entry, cost] of Object.entries(opts.rateLimitCost)) {
+      if (!RATE_LIMITED_ENTRIES.has(entry)) {
+        // `end`·`reportHealth` 가 여기 오면 조용히 무시하지 않는다 — 무시하면 "제한을 걸었다"는
+        // 기록만 남고 실제로는 걸리지 않는다(막지 않는 이유는 `rateLimiter` 주석).
+        throw new Error(`요청 제한 배선 거부: 한도 적용 대상이 아닌 진입점입니다: ${entry} (설계서 §9.3·§11.2)`);
+      }
+      if (typeof cost !== 'number' || !Number.isFinite(cost) || cost <= 0) {
+        throw new Error(`요청 제한 배선 거부: rateLimitCost.${entry} 는 양수여야 합니다 (설계서 §13-3)`);
+      }
+    }
+    if (opts.rateLimiter === undefined) {
+      throw new Error('요청 제한 배선 거부: rateLimitCost 를 주려면 rateLimiter 도 주어야 합니다 (설계서 §9.3)');
+    }
+  }
+
+  /**
+   * 한도 판정. 제한기가 없으면 통과한다(§13-3).
+   *
+   * 제한기 **자체의 예외**는 잠그는 쪽이 아니라 통과로 둔다 — 공유 저장소 장애로 전 통화가
+   * 끊기면 제한이 막으려던 것보다 큰 사고다(§9.3). 거절 오류는 `enforceRateLimit` 하나가
+   * 만든다(판정과 문구를 여기서 다시 쓰지 않는다, §2).
+   */
+  function enforceLimit(entry: RateLimitedEntry): void {
+    const limiter = opts.rateLimiter;
+    if (limiter === undefined) return;
+    let err;
+    try {
+      err = enforceRateLimit(limiter, rateLimitKey(opts.scope, `core.${entry}`), opts.rateLimitCost?.[entry] ?? 1);
+    } catch {
+      return;
+    }
+    if (err !== undefined) throw err;
+  }
 
   /**
    * 쌓인 계약 경고를 로그로 내보낸다 — **경고 하나당 딱 한 줄**이다(§13).
@@ -1034,6 +1111,31 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     const rIssues = validateRoutingConfig(opts.routing.config);
     if (rIssues.length > 0) {
       throw new Error(`라우팅 설정 거부: ${rIssues.join(' / ')}`);
+    }
+    // 큐에 선언된 §9.3 대안이 **그 채널에서 수행 불가**한 조합을 등록 시점에 적는다.
+    // 큐가 닫히면 고객이 가는 곳은 `closedAction` 이고, 그중 채널 계약에 대응하는 능력이 있는
+    // 것은 `legacy_ivr` 하나다(`routeToLegacyIvr`). 그 능력이 false 인 채널로 들어온 이관이 그
+    // 큐에서 닫히면 Core 는 "기존 IVR 로 보내라"를 돌려주는데 채널은 그걸 할 수 없다고 스스로
+    // 선언한 상태다 — 큐에 못 넣었으니 `transfer` 도 부르지 않으므로 **아무 일도 일어나지 않고**
+    // 고객만 남는다. 평시에는 전혀 드러나지 않고 **큐가 닫힌 시각에만** 나타나므로 지금 적는다.
+    // **막지 않는다**(§13-3): 큐의 `channels` 를 좁히는 것이 맞는 설정일 수 있고, 좁혀져 있지
+    // 않은 것이 곧 오류라고 단정할 근거가 Core 에는 없다.
+    // 닿을 수 있는 큐 판정은 `reachableQueues` 하나다 — 규칙·기본 큐·오버플로가 `channels` 를
+    // 각각 다르게 보므로(기본 큐와 오버플로는 아예 보지 않는다) 여기서 다시 읽으면 어긋난다(§2).
+    for (const reg of opts.channels) {
+      const caps = reg.port.capabilities;
+      if (caps.routeToLegacyIvr) continue;
+      for (const q of reachableQueues(opts.routing.config, caps.channel)) {
+        if (q.closedAction !== 'legacy_ivr') continue;
+        warnings.push({
+          code: 'W_ROUTING_ALTERNATIVE',
+          severity: 'warning',
+          messageKo: `큐 ${q.id} 의 대안은 기존 IVR 회귀(legacy_ivr)인데 ${caps.adapter} 채널은 `
+            + 'routeToLegacyIvr 능력이 없습니다 — 이 큐가 닫힌 시각에 이 채널로 들어온 이관은 '
+            + '상담사에게도 대안으로도 가지 못하고 아무 안내 없이 남습니다(§9.3). '
+            + '큐의 channels 를 좁히거나 대안을 바꾸십시오.',
+        });
+      }
     }
     // 오퍼 배선도 **배포 시점에** 거른다. 정책이 틀린 채 통과시키면 모든 이관이 첫 호출에서
     // `refused` 로만 끝나고, 통화·이벤트는 정상이라 "아무에게도 제안되지 않는 상태"가 유지된다.
@@ -2631,6 +2733,9 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
    */
   const impl = {
     async start(req: ChannelSessionRequest): Promise<ChannelTurnResult> {
+      // 한도는 **아무 일을 하기 전에** 본다 — 거절된 호출이 세션·이벤트·과금에 흔적을 남기면
+      // 제한이 막으려던 폭주가 원장에 그대로 쌓인다(§11.2).
+      enforceLimit('start');
       assertTenantScope(req.scope);
       if (req.scope.tenantId !== opts.scope.tenantId) {
         throw new Error(`테넌트 격리 위반(세션 시작): 코어=${opts.scope.tenantId} 요청=${req.scope.tenantId} (설계서 §11.1)`);
@@ -2798,6 +2903,9 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     },
 
     async send(interactionId: string, turn: ChannelTurnInput): Promise<ChannelTurnResult> {
+      // 끝난 세션의 늦은 입력(아래 조기 반환)도 세어야 한다 — 전송 계층의 재시도 루프는
+      // 대개 그 경로로 몰린다. 세지 않으면 제한을 걸어 둔 테넌트에서 그 폭주만 통과한다.
+      enforceLimit('send');
       const rec = sessions.get(interactionId);
       if (!rec) throw new Error(`세션을 찾을 수 없습니다: ${interactionId}`);
       const reg = registration(rec.adapter);
