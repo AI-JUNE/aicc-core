@@ -1117,6 +1117,50 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     });
   }
 
+  // §9.3 폴백 정책의 테넌트. 보존 정책(아래)·라우팅 설정·엔진 기동 선언은 전부 이 검사를
+  // 하는데 **폴백 정책만 아무도 보지 않았다** — 이 정책은 장애 시각에 통화 전체의 행동을
+  // 정하는 값이고, 그중 `fallbackQueue` 는 고객이 **실제로 가는 곳**이다. 남의 테넌트 값이
+  // 들어오면 조용히 덮어쓰지 않는다: 옆 고객사 큐 id 로 전화가 넘어가는 일이 §11.1 위반이고,
+  // 그 밖의 값(`staleAfterMs`·`treatUnknownAsDown`)이 어긋나면 같은 장애에 다른 판정이 난다.
+  // 되돌릴 수 있는 쪽은 기동 거절이고, 되돌릴 수 없는 쪽은 이미 넘어간 통화다.
+  if (opts.policy.tenantId !== opts.scope.tenantId) {
+    throw new Error(
+      `폴백 정책 거부: 다른 테넌트의 §9.3 정책입니다(기대=${opts.scope.tenantId} 실제=${opts.policy.tenantId}) — `
+      + '장애 시각에 고객이 가는 큐가 여기서 정해집니다 (설계서 §11.1)',
+    );
+  }
+  // 워크스페이스는 **선언했을 때만** 본다(§13-3 — 선언하지 않은 호스트는 종전과 완전히 같다).
+  if (opts.policy.workspaceId !== undefined && opts.policy.workspaceId !== opts.scope.workspaceId) {
+    throw new Error(
+      `폴백 정책 거부: 다른 워크스페이스의 §9.3 정책입니다(기대=${String(opts.scope.workspaceId)} 실제=${opts.policy.workspaceId}) (설계서 §11.1)`,
+    );
+  }
+
+  // §9.3 정책은 "기존 IVR 로 내릴 수 있다"고 하는데 그 채널에는 **회귀 구현이 없는** 조합.
+  // 인지 계층이 죽으면 `decideFallbackMode` 는 `legacy_ivr` 을 내고 `applyOutage` 는 상담사
+  // 이관으로 대신하므로, 판정과 실제 행동이 갈라진 채 결과·원장에는 `legacy_ivr` 만 남는다.
+  // 통화가 끊기지 않아 장애로도 잡히지 않고, **인지 계층이 죽은 시각에만** 나타나므로
+  // 평시 검사로는 영영 드러나지 않는다 — `W_ROUTING_ALTERNATIVE` 와 같은 모양이고 출처가
+  // 다르다(저쪽은 큐 설정의 `closedAction`, 이쪽은 폴백 정책).
+  //
+  // **구현 유무로 본다**(§2 — 분기와 같은 기준이어야 한다). 능력 선언(`routeToLegacyIvr`)으로
+  // 보면 경고와 실제 행동이 갈라진다: 그 선언은 채널 프로파일 기본값이라 셋 다 `false` 이고,
+  // 회귀가 가능한지는 **테넌트 계약**(`policy.legacyIvrAvailable`)과 포트 구현이 정한다.
+  // 막지는 않는다(§13-3): 상담사 이관이 서 있으면 고객이 갈 곳은 있다.
+  if (opts.policy.legacyIvrAvailable) {
+    for (const reg of opts.channels) {
+      if (typeof reg.port.routeToLegacyIvr === 'function') continue;
+      warnings.push({
+        code: 'W_FALLBACK_LEGACY_IVR',
+        severity: 'warning',
+        messageKo: `§9.3 폴백 정책은 기존 IVR 회귀가 가능하다고 선언했으나 ${reg.port.capabilities.adapter} 채널에 `
+          + 'routeToLegacyIvr 구현이 없습니다 — 인지 계층 장애에서 이 채널의 통화는 IVR 이 아니라 '
+          + '상담사 이관으로 가는데 판정(fallback.mode)은 legacy_ivr 로 남습니다. 이 채널의 실질 '
+          + '폴백 경로는 agentQueueAvailable·fallbackQueue 이며, 그 값이 비어 있으면 갈 곳이 없습니다.',
+      });
+    }
+  }
+
   // 잘못된 재프롬프트 정책은 통화 중이 아니라 여기서 걸러야 한다 —
   // 빈 대본은 고객에게 무음으로 나가고, 무음은 장애와 구분되지 않는다.
   if (opts.reprompt !== undefined) {
@@ -2185,6 +2229,16 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     if (decision.mode === 'legacy_ivr' && typeof reg.port.routeToLegacyIvr === 'function') {
       await reg.port.routeToLegacyIvr(id, decision.reasonKo);
     } else {
+      if (decision.mode === 'legacy_ivr') {
+        // **판정과 실제 행동이 갈라지는 유일한 자리다.** 정책은 "기존 IVR 로 내린다"인데 그 채널에
+        // 회귀 구현이 없어 상담사 이관으로 대신한다. 판정을 고쳐 적지는 않는다(무엇을 할지는
+        // `decideFallbackMode` 하나다, §2) — 대신 **대신했다는 사실**을 남긴다. 남기지 않으면
+        // 결과·원장에 남는 것은 `fallback.mode: 'legacy_ivr'` 뿐이고 사후 분석은 "IVR 로 내렸다"로
+        // 읽는다(아무도 내리지 않았다). 통화가 끊기지도 않으므로 장애로도 잡히지 않는다.
+        warnOnce('W_FALLBACK_LEGACY_IVR',
+          `§9.3 판정은 기존 IVR 회귀(legacy_ivr)인데 ${reg.port.capabilities.adapter} 채널에 routeToLegacyIvr `
+          + '구현이 없어 상담사 이관으로 대신했습니다 — 통화는 이어지지만 판정과 실제 행동이 다릅니다.');
+      }
       await reg.port.transfer(id, queue, summaryMasked);
     }
     return result;
@@ -3168,7 +3222,26 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       const reg = registration(rec.adapter);
       // 종료된 세션에 늦게 도착한 입력은 새 이벤트를 만들지 않는다(멱등, §8.1).
       // events를 비워 돌려준다 — 채널이 마지막 결과를 다시 발행해 중복 집계하는 경로를 막는다.
-      if (rec.ended || rec.state.status !== 'running') return { ...rec.lastResult, events: [] };
+      if (rec.ended || rec.state.status !== 'running') {
+        // 실측을 선언하지 않았으면 **직전 턴의 결과 그대로**다(종전과 완전히 같다, §13-3).
+        if (turn.usage === undefined) return { ...rec.lastResult, events: [] };
+        // 선언했으면 `billing` 을 그대로 돌려줄 수 없다. 그 필드는 "**이 호출의** 실측이 어디까지
+        // 실렸는가"인데, 직전 턴의 `usageAttached: true` 를 그대로 되돌려주면 호스트는 방금
+        // 보낸 실측이 원장에 들어갔다고 읽는다 — 들어가지 않았고, 그 차이는 예외가 아니라
+        // 몇 주 뒤 대사의 '미설명' 차이로만 나타난다(§11.2). 전송 계층 재시도 루프가 이 경로로
+        // 몰리므로 건수도 적지 않다. 종료된 세션에 `turn.completed` 를 뒤늦게 만들지는 않는다
+        // (추가 전용, §8.1) — `end()` 가 늦은 `billableMs` 를 다루는 방식과 같은 규칙이다.
+        return {
+          ...rec.lastResult,
+          events: [],
+          billing: {
+            usageAttached: false,
+            usageReasonKo: '이미 종료된 세션에 늦게 도착한 입력이라 고객 발화 이벤트를 만들지 않았고 '
+              + '실측을 실을 자리가 없었습니다(추가 전용 이벤트는 뒤늦게 고치지 않습니다, §8.1) — '
+              + '그 사용량은 과금 집계에 들어가지 않습니다(§11.2).',
+          },
+        };
+      }
 
       const decision = health(rec.state.channel);
       const outage = await applyOutage(rec, decision, reg);

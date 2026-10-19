@@ -398,6 +398,20 @@ export type ContractIssueCode =
    */
   | 'W_ROUTING_ALTERNATIVE'
   /**
+   * §9.3 **장애 폴백 정책**이 기존 IVR 회귀를 쓸 수 있다고 선언했는데(`FallbackPolicy.legacyIvrAvailable`)
+   * 그 채널은 `capabilities.routeToLegacyIvr` 를 `false` 로 선언했다. `W_ROUTING_ALTERNATIVE` 와
+   * 모양은 같고 **출처가 다르다** — 저쪽은 큐 설정(`closedAction`)이고 이쪽은 폴백 정책이다.
+   * 인지 계층(STT·TTS·LLM)이 `down` 이 되면 `decideFallbackMode` 는 `legacy_ivr` 을 내는데
+   * 그 채널은 회선을 되돌릴 수 없으므로 Core 는 **상담사 이관으로 대신한다** — 판정과 실제 행동이
+   * 갈라지는 유일한 자리다. 통화가 끊기지는 않으므로 장애로 잡히지 않고, 사후 분석에서는
+   * `fallback.mode` 가 `legacy_ivr` 이라 "IVR 로 내렸다"로 읽힌다(아무도 내리지 않았다).
+   *
+   * 막지는 않는다(§13-3): 음성은 Callbot 이 회귀시키고 화면·채팅 채널은 애초에 회선이 없는
+   * 구성이 정상일 수 있다. 다만 **그 조합에서는 `agentQueueAvailable`·`fallbackQueue` 가
+   * 실질 폴백 경로**라는 사실을 등록 시점에 적는다 — 평시에는 전혀 드러나지 않는다.
+   */
+  | 'W_FALLBACK_LEGACY_IVR'
+  /**
    * 엔진이 기동 선언으로 배선되지 않았다(§6.2·§9.3). 이 상태에서 엔진 실패는 §9.3 헬스
    * 레지스트리에 **한 건도** 들어오지 않는다 — 들어오는 샘플은 채널이 `reportHealth` 로
    * 올리는 것뿐이고, 채널이 올리는 것은 대개 자기 매체(telephony·messaging)다. 그래서

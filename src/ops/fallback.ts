@@ -78,6 +78,12 @@ export function createHealthRegistry(initial: HealthSample[] = []): HealthRegist
 /** 폴백 정책. 값은 테넌트 계약·운영 합의로만 채운다. */
 export interface FallbackPolicy {
   tenantId: string;
+  /**
+   * 워크스페이스까지 묶어 쓰는 테넌트용. **선언하면 검사되고, 선언하지 않으면 종전과 같다**(§13-3).
+   * 선언하는 쪽을 권한다 — `fallbackQueue` 는 장애 시각에 고객이 실제로 가는 곳이라,
+   * 옆 사업부 큐 id 가 들어 있으면 그 사실은 **장애 시각에만** 드러난다(§11.1).
+   */
+  workspaceId?: string;
   /** 샘플이 이 시간보다 오래되면 unknown 으로 본다(ms). */
   staleAfterMs: number;
   /** unknown 을 장애로 볼 것인가. 보수적 운영이면 true. */
