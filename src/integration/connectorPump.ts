@@ -30,7 +30,7 @@ import type { TenantScope } from '../core/tenancy.ts';
 import type { Flow } from '../flow/types.ts';
 import type { FlowInput } from '../flow/runner.ts';
 import type { HealthSample } from '../ops/fallback.ts';
-import type { ConnectorDef, ConnectorPort } from './connector.ts';
+import type { ConnectorDef, ConnectorPort, ConnectorRequest } from './connector.ts';
 import type { ConsentContext, ExecuteOutcome } from './executeConnector.ts';
 import { executeConnector, toFlowInput } from './executeConnector.ts';
 import type { LegalBasisDecision } from '../legal/executeLegal.ts';
@@ -101,6 +101,21 @@ export interface ConnectorPumpBinding {
     connectorId: string;
     decision: LegalBasisDecision;
   }) => void;
+  /**
+   * §6.1·§10.2 호출 기록(시도 하나당 한 번). 실행기가 `onRequest` 를 열어 두었는데 **펌프가
+   * 그것을 넘기지 않아 호출 기록이 경계에서 끊기고 있었다** — (49)의 `onLegalBasis` 와 같은 모양이다.
+   *
+   * 실리는 것은 마스킹 사본이다: pii 선언 파라미터는 값이 지워지고(`[REDACTED]`), 나머지는
+   * 마스킹 규칙을 한 번 더 지난다. 엔드포인트는 **참조 이름**(`endpointRef`)이라 자격증명이 아니다.
+   *
+   * 주지 않으면 조용히 진행한다(§13-3) — 다만 그 상태에서는 "무엇을 몇 번 불렀는가"가 원장에도
+   * 로그에도 남지 않는다. 던져도 호출을 막지 않는다(§9.3).
+   */
+  onCall?: (info: {
+    interactionId: string;
+    connectorId: string;
+    request: ConnectorRequest;
+  }) => void;
 }
 
 /** 호출까지 가지 못하고 끊긴 사유. **업무시스템 장애가 아니다** — 헬스에 집계하지 않는다. */
@@ -122,6 +137,12 @@ export interface PumpHopResult {
    * 있다 — **훅을 주지 않아도 결과에는 남는다**(훅은 쓰는 쪽의 선택이고, 사실은 선택이 아니다).
    */
   legalBasis?: LegalBasisDecision[];
+  /**
+   * §6.1 이번 대기 건에서 **실제로 나간 요청**(시도 순서 그대로, 마스킹 사본). 호출까지 간
+   * 경우에만 있다 — **훅을 주지 않아도 결과에는 남는다**(훅은 쓰는 쪽의 선택이고, 사실은
+   * 선택이 아니다). 길이가 곧 시도 횟수이고, 전부 같은 `idempotencyKey` 를 들고 있다.
+   */
+  requests?: ConnectorRequest[];
 }
 
 /**
@@ -221,6 +242,9 @@ export async function pumpConnectorHop(args: PumpHopInput): Promise<PumpHopResul
   // 판정은 **언제나** 모은다. 훅을 준 호스트에게는 그대로 올리고, 주지 않았어도 결과에 남는다 —
   // 실행기는 이 훅으로만 "막지 않은 사실"을 내보내므로 여기서 받지 않으면 그 사실이 사라진다.
   const legalBasis: LegalBasisDecision[] = [];
+  // 호출 기록도 **언제나** 모은다(판정과 같은 규칙). 받지 않으면 "무엇을 몇 번 불렀는가"가 사라지고,
+  // 사라진 사실은 상대 업무시스템과 대조할 때 다시 만들 수 없다.
+  const requests: ConnectorRequest[] = [];
 
   const outcome = await executeConnector({
     def,
@@ -240,6 +264,10 @@ export async function pumpConnectorHop(args: PumpHopInput): Promise<PumpHopResul
       // 호스트 훅이 던져도 모은 사실은 남는다(순서가 곧 안전장치다). 예외는 실행기가 삼킨다.
       binding.onLegalBasis?.({ interactionId, connectorId, decision });
     },
+    onRequest: (request) => {
+      requests.push(request);
+      binding.onCall?.({ interactionId, connectorId, request });
+    },
   });
 
   return {
@@ -247,6 +275,7 @@ export async function pumpConnectorHop(args: PumpHopInput): Promise<PumpHopResul
     connectorId, idempotencyKey, outcome,
     ...(consentError !== undefined ? { consentError } : {}),
     ...(legalBasis.length > 0 ? { legalBasis } : {}),
+    ...(requests.length > 0 ? { requests } : {}),
   };
 }
 

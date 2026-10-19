@@ -284,6 +284,60 @@ test('기록용 요청 사본은 pii 값을 지운다(§6.1 규약 2)', b, () =>
   assert.equal(X.redactedRequestOf(d, {}, scope, 'i1', 'k'), undefined);
 });
 
+test('onRequest: 나간 요청을 시도마다 **마스킹 사본으로** 올린다(§6.1·§10.3)', b, async () => {
+  const seen = [];
+  const r = await run({
+    def: def({ params: [{ name: 'rrn', fromSlot: 'rrn', required: true, pii: true }], retry: { maxAttempts: 2, retryOn: ['unavailable'] } }),
+    slots: { rrn: '900101-1234567' },
+    consent: consentCtx(),
+    backoffMs: () => 0,
+    port: recordingPort([{ ok: false, code: 'unavailable' }, { ok: true, data: { balance: '1' } }]),
+    onRequest: (req) => seen.push(req),
+  });
+  assert.equal(r.kind, 'ok');
+  assert.deepEqual(seen.map((x) => x.attempt), [1, 2]);
+  assert.equal(seen.every((x) => x.params.rrn === '[REDACTED]'), true);
+  assert.equal(seen.every((x) => x.idempotencyKey === 'idem-1'), true);
+  assert.ok(!JSON.stringify(seen).includes('900101-1234567'));
+});
+
+test('onRequest: 호출 전에 막히면 부르지 않는다 — 보내지 않은 요청은 기록이 아니다', b, async () => {
+  const seen = [];
+  const port = recordingPort([{ ok: true, data: { balance: '1' } }]);
+  const r = await run({
+    def: def({ params: [{ name: 'rrn', fromSlot: 'rrn', required: true, pii: true }] }),
+    slots: { rrn: '900101-1234567' },
+    port,
+    onRequest: (req) => seen.push(req),
+  });
+  assert.equal(r.kind, 'blocked');
+  assert.equal(r.reason, 'consent_context_missing');
+  assert.equal(seen.length, 0);
+  assert.equal(port.calls.length, 0);
+});
+
+test('onRequest: 훅이 던져도 호출은 그대로 나간다(§9.3)', b, async () => {
+  const port = recordingPort([{ ok: true, data: { balance: '1' } }]);
+  const r = await run({ port, onRequest: () => { throw new Error('호스트 로거 결함'); } });
+  assert.equal(r.kind, 'ok');
+  assert.equal(port.calls.length, 1);
+});
+
+test('onRequest: 포트가 받은 요청에는 원문이 그대로 있다 — 마스킹은 기록 경로에만 적용된다', b, async () => {
+  const seen = [];
+  const port = recordingPort([{ ok: true, data: { balance: '1' } }]);
+  await run({
+    def: def({ params: [{ name: 'rrn', fromSlot: 'rrn', required: true, pii: true }] }),
+    slots: { rrn: '900101-1234567' },
+    consent: consentCtx(),
+    port,
+    onRequest: (req) => seen.push(req),
+  });
+  // 업무시스템은 실제 값으로 조회해야 한다 — 기록 사본을 보내면 그 조회는 언제나 빈 결과다.
+  assert.equal(port.calls[0].params.rrn, '900101-1234567');
+  assert.equal(seen[0].params.rrn, '[REDACTED]');
+});
+
 // ── §10.1 고지 문안 근거 (legal 컨텍스트) ────────────────────────────────────
 //
 // 여기서 고정하는 것: **초안 문안으로 받은 동의로는 개인정보 조회가 나가지 않는다.** 그리고

@@ -132,6 +132,26 @@ export interface ExecuteConnectorInput {
    * 기록용 훅의 버그로 통화가 끊기면 안 된다(§9.3).
    */
   onLegalBasis?: (decision: LegalBasisDecision) => void;
+  /**
+   * §6.1·§10.2 호출 기록. **시도마다** 조립된 요청의 마스킹 사본(`redactRequest`)을 넘긴다.
+   *
+   * 왜 이 훅이 필요한가: `redactRequest` 는 "로그·이벤트·감사기록으로 나가는 요청 사본"으로
+   * 만들어졌는데 **부르는 코드가 저장소 전체에 0줄**이었다. 그 상태에서 업무시스템을 무엇으로
+   * 불렀는지는 어디에도 남지 않는다 — 결과(`ok`/`failed`/`blocked`)만 남으므로, 상대 쪽이
+   * "그런 조회는 안 왔다"고 하면 대조할 근거가 우리에게 없다. 더 비싼 쪽은 그 다음이다:
+   * 기록이 필요한 호스트는 `buildRequest` 를 **스스로 한 번 더 불러** 적게 되고, 그 사본에는
+   * 마스킹이 없다. 이 파일이 막으려던 §10.3 사고가 로그에서 되살아난다.
+   *
+   * **시도마다** 주는 이유: 같은 멱등 키로 세 번 나갔다는 사실이 command 재시도 분쟁의 핵심이고,
+   * 한 번만 적으면 그 사실이 사라진다(`attempt` 가 실려 있어 회차를 셀 수 있다).
+   *
+   * **호출 전에 막힌 건에는 아무것도 주지 않는다.** 보내지 않은 요청이 호출 기록에 남으면
+   * "동의가 없어 안 불렀다"가 "불렀다"로 읽히고, 기록을 만들려고 조립하는 순간 게이트가 거절한
+   * 개인정보가 메모리에 다시 올라온다(§6.1 규약 2 — 게이트는 조립 전에 지난다).
+   *
+   * 던져도 호출을 막지 않는다 — 기록용 훅의 버그로 통화가 끊기면 안 된다(§9.3).
+   */
+  onRequest?: (request: ConnectorRequest) => void;
 }
 
 /** 포트가 규약을 어긴 값을 돌려줬을 때. `ok` 로도 `실패`로도 임의 해석하지 않고 형식 오류로 적는다. */
@@ -289,6 +309,11 @@ export async function executeConnector(input: ExecuteConnectorInput): Promise<Ex
   for (;;) {
     // 멱등 키는 그대로 — 시도 번호만 바뀐다. 이 한 줄이 command 중복 처리를 막는 전부다.
     const request: ConnectorRequest = { ...built.request, attempt };
+    if (input.onRequest) {
+      // **마스킹 사본만** 내보낸다. 원문 요청을 주면 기록 경로가 곧 유출 경로가 된다(§10.3) —
+      // 훅을 받는 쪽은 그것을 로그·감사기록에 그대로 적는 쪽이다.
+      try { input.onRequest(redactRequest(def, request)); } catch { /* 무시 */ }
+    }
     let res: ConnectorResponse;
     try {
       res = normalizeResponse(await port.call(request));

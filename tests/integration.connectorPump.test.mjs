@@ -367,3 +367,83 @@ test('동의 컨텍스트가 없으면 판정 자체가 없다 — 빈 배열로
   assert.equal(r.outcome.reason, 'consent_context_missing');
   assert.equal(r.legalBasis, undefined);
 });
+
+// ── 호출 기록 (§6.1·§10.2·§10.3) ─────────────────────────────────────────────
+// `redactRequest` 는 "로그·이벤트·감사기록으로 나가는 요청 사본"으로 만들어졌는데 부르는 코드가
+// 0줄이었다. 그 상태에서는 업무시스템을 **무엇으로 몇 번 불렀는지**가 어디에도 남지 않고,
+// 기록이 필요한 호스트는 `buildRequest` 를 스스로 불러 **마스킹 없는** 사본을 적게 된다.
+
+test('호출 기록은 훅을 주지 않아도 결과에 남는다 — 훅은 선택이고 사실은 선택이 아니다', b, async () => {
+  const r = await hop();
+  assert.equal(r.outcome.kind, 'ok');
+  assert.equal(r.requests.length, 1);
+  assert.equal(r.requests[0].connectorId, 'c_balance');
+  assert.equal(r.requests[0].endpointRef, 'secret://core/balance');
+  assert.equal(r.requests[0].attempt, 1);
+  assert.equal(r.requests[0].idempotencyKey, r.idempotencyKey);
+});
+
+test('훅을 주면 시도마다 올라가고, 재시도는 같은 멱등 키로 센다', b, async () => {
+  const seen = [];
+  const r = await hop({
+    binding: {
+      connectors: registry([def({ retry: { maxAttempts: 3, retryOn: ['unavailable'] } })]),
+      port: recordingPort([
+        { ok: false, code: 'unavailable' },
+        { ok: false, code: 'unavailable' },
+        { ok: true, data: { balance: '10000' } },
+      ]),
+      backoffMs: () => 0,
+      onCall: (i) => seen.push(i),
+    },
+  });
+  assert.equal(r.outcome.kind, 'ok');
+  assert.deepEqual(seen.map((i) => i.request.attempt), [1, 2, 3]);
+  assert.equal(new Set(seen.map((i) => i.request.idempotencyKey)).size, 1, '시도마다 키가 바뀌면 재시도가 곧 이중 신청이다');
+  assert.equal(seen.every((i) => i.interactionId === 'i1' && i.connectorId === 'c_balance'), true);
+  assert.equal(r.requests.length, 3);
+});
+
+test('기록은 마스킹 사본이다 — pii 선언 파라미터는 값이 지워진다(§10.3)', b, async () => {
+  const seen = [];
+  const r = await piiHop({ binding: { onCall: (i) => seen.push(i) } });
+  assert.equal(r.outcome.kind, 'ok');
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].request.params.rrn, '[REDACTED]');
+  // 원문이 기록 경로의 어디에도 없다 — 한 번 로그에 적히면 되돌릴 수 없다.
+  assert.ok(!JSON.stringify(r.requests).includes('900101-1234567'));
+});
+
+test('호출 전에 막힌 건에는 기록이 없다 — 보내지 않은 요청을 "불렀다"로 적지 않는다', b, async () => {
+  const seen = [];
+  const r = await piiHop({ binding: { consent: undefined, onCall: (i) => seen.push(i) } });
+  assert.equal(r.outcome.kind, 'blocked');
+  assert.equal(seen.length, 0);
+  assert.equal(r.requests, undefined);
+});
+
+test('필수 슬롯이 비어 조립되지 않은 건에도 기록이 없다', b, async () => {
+  const r = await hop({ slots: {} });
+  assert.equal(r.outcome.kind, 'blocked');
+  assert.equal(r.outcome.reason, 'missing_slots');
+  assert.equal(r.requests, undefined);
+});
+
+test('선언을 못 찾은 건에도 기록이 없다 — 설정 오류는 호출이 아니다', b, async () => {
+  const r = await hop({ connectorId: 'c_nope' });
+  assert.equal(r.block, 'connector_undefined');
+  assert.equal(r.requests, undefined);
+});
+
+test('기록 훅이 던져도 호출을 막지 않고 사실은 남는다(§9.3)', b, async () => {
+  const port = recordingPort([{ ok: true, data: { balance: '1' } }]);
+  const r = await hop({
+    binding: {
+      connectors: registry([def()]), port, allowOverseas: false,
+      onCall: () => { throw new Error('호스트 로거 결함'); },
+    },
+  });
+  assert.equal(r.outcome.kind, 'ok');
+  assert.equal(port.calls.length, 1);
+  assert.equal(r.requests.length, 1, '훅보다 먼저 모으므로 예외와 무관하게 남는다');
+});

@@ -122,6 +122,19 @@ test('runBridgeLines 는 빈 줄을 건너뛰고 응답 줄만 낸다', b, async
   assert.equal(JSON.parse(out[0]).ok, true);
 });
 
+test('§9.3 판정은 복사해서 내보낸다 — 호스트가 "무엇을 끄라"를 고칠 수 없다', b, async () => {
+  const { bridge, core } = build({}, { health: F.createHealthRegistry([{ component: 'tts', state: 'degraded', observedAt: NOW }]) });
+  const s = await bridge.handleLine(line({ id: '1', op: 'start', req: { flowId: 'billing', entryPoint: 'inbound_call' } }));
+  assert.equal(s.result.fallback.mode, 'degraded_ai');
+  assert.deepEqual(s.result.fallback.disable, ['voice_synthesis']);
+  // 응답 객체를 고쳐도 Core 가 들고 있는 마지막 결과는 그대로다(직렬화 전까지는 고칠 수 있었다).
+  s.result.fallback.disable.push('ai_response');
+  s.result.fallback.causes.length = 0;
+  const kept = core.sessions.get('i_bridge1').lastResult.fallback;
+  assert.deepEqual(kept.disable, ['voice_synthesis']);
+  assert.equal(kept.causes.length, 1);
+});
+
 test('응답 인코딩에 개행이 섞이지 않는다', b, () => {
   const enc = BR.encodeResponse({ id: '1', ok: false, error: { code: 'E_BAD_REQUEST', messageKo: '줄\n바꿈\r포함' } });
   assert.equal(enc.includes('\n'), false);

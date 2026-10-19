@@ -446,3 +446,58 @@ test('KNOWLEDGE_ANSWER: 답변 단계의 nodeId 는 시나리오에 없고 각�
   assert.equal(flow().nodes[answer.nodeId], undefined);
   assert.deepEqual(Object.keys(answer.citations[0]).sort(), ['marker', 'sourceUri', 'title']);
 });
+
+// ── 축소 운영 지시 (§9.3) ────────────────────────────────────────────────────
+// 다른 힌트와 다른 점은 모양이 아니라 **시점**이다. 이 필드는 설정을 켤 때가 아니라
+// **엔진이 저하된 순간** 처음 붙으므로, 여기서 깨지는 포트는 평소 전 검사를 통과하고
+// 하필 장애 중에 전 통화를 깨뜨린다 — 장애 위에 장애를 얹는다.
+
+test('OUTAGE_HINTS: 축소 운영 지시를 흡수하는 구현은 3채널 모두 통과한다', b, async () => {
+  for (const id of ['callbot', 'chatbot', 'dars']) {
+    const port = m.createDryRunPort({ id });
+    const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+    const c = r.checks.find((x) => x.id === 'OUTAGE_HINTS');
+    assert.equal(c.passed, true, `${id}: ${c.messageKo}`);
+    assert.equal(c.severity, 'error');
+    assert.notEqual(c.skipped, true);
+  }
+});
+
+test('OUTAGE_HINTS: 모르는 필드에서 던지는 포트를 잡는다 — 다른 힌트 검사는 통과하는 구현이다', b, async () => {
+  const port = m.createDryRunPort({ id: 'callbot' });
+  port.present = async (_id, steps) => {
+    for (const s of steps) {
+      if ('outage' in s) throw new Error('알 수 없는 필드: outage');
+    }
+  };
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  assert.equal(r.checks.find((c) => c.id === 'TURN_HINTS').passed, true);
+  const c = r.checks.find((x) => x.id === 'OUTAGE_HINTS');
+  assert.equal(c.passed, false);
+  assert.match(c.messageKo, /엔진이 저하된 순간/);
+  assert.equal(r.passed, false);
+});
+
+test('OUTAGE_HINTS: 지시를 지우는 포트를 잡는다 — 판정과 실제 동작이 갈라진다', b, async () => {
+  const port = m.createDryRunPort({ id: 'callbot' });
+  const inner = port.present.bind(port);
+  port.present = async (iid, steps) => {
+    for (const s of steps) delete s.outage;   // "모르는 필드니까 지운다"
+    return inner(iid, steps);
+  };
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  const c = r.checks.find((x) => x.id === 'OUTAGE_HINTS');
+  assert.equal(c.passed, false);
+  assert.match(c.messageKo, /변형/);
+});
+
+test('OUTAGE_HINTS: 검사용 단계의 목록은 MEDIA_DISABLE 하나에서 온다(§2)', b, async () => {
+  const F = await import('../src/ops/fallback.ts');
+  const seen = [];
+  const port = m.createDryRunPort({ id: 'callbot' });
+  const inner = port.present.bind(port);
+  port.present = async (iid, steps) => { seen.push(...steps); return inner(iid, steps); };
+  await m.runChannelConformance({ port, timeoutMs: 500 });
+  const probe = seen.find((s) => s.outage !== undefined);
+  assert.deepEqual(probe.outage.disabled, [...F.MEDIA_DISABLE]);
+});

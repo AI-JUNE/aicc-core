@@ -583,7 +583,16 @@ function projectTurn(r: ChannelTurnResult, opts: BridgeOptions): BridgeTurnPaylo
     events: projectEvents(r.events as unknown[], opts),
   };
   if (opts.includeSlots) payload.state.slots = { ...slots };
-  if (r.fallback !== undefined) payload.fallback = r.fallback;
+  // §9.3 판정도 **복사해서** 내보낸다. 그대로 넘기면 호스트가 `disable`·`causes` 에 push·splice 로
+  // Core 의 판정을 고칠 수 있고(JSON 직렬화 전까지), 고쳐진 판정은 "Core 가 그렇게 적었다"로 남는다 —
+  // 하필 그 배열이 **무엇을 끄라는 지시**다(동의·점검·이관 투영과 같은 규칙).
+  if (r.fallback !== undefined) {
+    payload.fallback = {
+      ...r.fallback,
+      causes: r.fallback.causes.map((c) => ({ ...c })),
+      disable: [...r.fallback.disable],
+    };
+  }
   if (r.handoff !== undefined) {
     const handoff: BridgeTurnPayload['handoff'] = {
       summaryAvailable: r.handoff.summaryMasked !== undefined,

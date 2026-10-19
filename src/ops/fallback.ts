@@ -224,6 +224,29 @@ export function aiResponseAllowed(d: FallbackDecision): boolean {
 }
 
 /**
+ * `disable` 중 **매체가 수행하는 기능**. Core 는 이 둘을 스스로 끌 수 없다 —
+ * STT·TTS 를 부르는 주체가 채널이기 때문이다(§6.2). 그래서 판정만 하고 단계에 실어 보낸다
+ * (`RenderedStep.outage`).
+ *
+ * 목록을 **판정 쪽에** 두는 이유는 §2 다: 렌더 쪽이 자기 목록을 가지면 `disable` 에 항목이
+ * 하나 늘어나는 날 한쪽만 늘고, 늘지 않은 쪽을 지나는 채널에서만 지시가 조용히 사라진다.
+ */
+export const MEDIA_DISABLE = ['voice_synthesis', 'speech_recognition'] as const;
+
+export type MediaDisable = typeof MEDIA_DISABLE[number];
+
+/**
+ * 이번 판정이 **매체에 시킬 수 있는** 축소 지시. 없으면 빈 배열이다 — 빈 목록을 "지시 없음"으로
+ * 읽는 것과 "정상"으로 읽는 것은 같다(여기서는 둘이 같은 뜻이므로 사유를 만들지 않는다).
+ *
+ * 순서는 `MEDIA_DISABLE` 선언 순서로 고정한다. `disable` 쪽 순서를 그대로 쓰면 같은 장애가
+ * 샘플 도착 순서에 따라 다른 배열로 나가고, 그 차이는 채널 로그 비교에서 노이즈가 된다.
+ */
+export function mediaDisabledBy(d: FallbackDecision): MediaDisable[] {
+  return MEDIA_DISABLE.filter((m) => d.disable.includes(m));
+}
+
+/**
  * §5.1 대화 폴백(인식 실패 사다리)과 §9.3 장애 폴백을 합친 최종 판정.
  * 장애 폴백이 항상 우선한다 — 엔진이 죽었는데 "다시 말씀해 주세요"를 반복하는 게 최악이다.
  * conversational 에 'none' 을 넣으면 인식 실패가 없는 정상 턴을 뜻한다.

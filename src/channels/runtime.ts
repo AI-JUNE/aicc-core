@@ -31,7 +31,7 @@ import type { EventMeta, InteractionEvent, LatencyMs, TurnCompletedEvent, Handof
 import { sessionStarted, sessionEnded, handoffRequested, turnCompleted } from '../events/schema.ts';
 import type { EventBus, PublishResult } from '../events/bus.ts';
 import type { ComponentId, FallbackDecision, FallbackPolicy, HealthRegistry, HealthSample } from '../ops/fallback.ts';
-import { decideFallbackMode } from '../ops/fallback.ts';
+import { decideFallbackMode, mediaDisabledBy } from '../ops/fallback.ts';
 import type { BuildInfo, DependencyProbe, Scheduler } from '../ops/health.ts';
 import type { CoreReadinessReport } from '../ops/executeHealth.ts';
 import { runReadiness } from '../ops/executeHealth.ts';
@@ -59,6 +59,7 @@ import { validateIntentCatalog, validateIntentPolicy } from '../nlu/intent.ts';
 import type { FlowLookup, IntentRoutingTable } from '../nlu/intentRouting.ts';
 import { intentRoutingOk, validateIntentRouting } from '../nlu/intentRouting.ts';
 import type { ClassifyStatus, IntentClassifier } from '../nlu/llmClassifier.ts';
+import type { Embedder } from '../knowledge/embedding.ts';
 import type { EngineRuntime, EngineStartupDeclaration } from '../adapters/executeEngines.ts';
 import { startEngines } from '../adapters/executeEngines.ts';
 import type { PendingClarify } from '../nlu/executeIntentEntry.ts';
@@ -79,7 +80,7 @@ import {
   buildConsentLookup, consentNodeDefects, consentNodes, consentPurposeOf, isConsentNode,
   pendingRequiredConsents, planConsentTurn, validateConsentBinding,
 } from '../consent/executeConsent.ts';
-import type { TurnBillingNote } from '../billing/turnUsage.ts';
+import type { TurnBillingNote, UsageContribution } from '../billing/turnUsage.ts';
 import { attachTurnUsage, billingNoteOrUndefined, checkBillableMs, mergeTurnUsage, usageNote } from '../billing/turnUsage.ts';
 import type { CoreOp, ObservabilityBinding, ObservedCall, Observer, ObserverStats } from '../obs/executeObservability.ts';
 import { createObserver, isKnownAdapter } from '../obs/executeObservability.ts';
@@ -1476,6 +1477,49 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
   /** 등록된 채널들이 올리는 컴포넌트의 합집합. readiness·복구 프로브가 **같은 목록**을 본다(§2). */
   const watched = new Set<ComponentId>([...declared.values()].flatMap((set) => [...set]));
 
+  /**
+   * Core 가 **이번 턴에 엔진을 실제로 불렀는지** 세는 계수기(§11.2).
+   *
+   * 왜 세는가: `engineRuntime.lastUsage()` 는 조각당 **마지막 호출**의 실측이다. 호출 여부를 보지
+   * 않고 매 턴 읽으면 엔진을 부르지 않은 턴(DTMF 선택·무입력·커넥터 재개)이 **직전 턴의 값을 한 번
+   * 더** 싣는다. 그 이중 계상은 예외가 아니라 과다청구 방향의 **그럴듯한 숫자**이고, 몇 주 뒤 대사에서
+   * 공급사 청구서보다 우리 수량이 많은 상태로 나타난다. 값 비교로는 가를 수 없다 — 같은 발화는 같은
+   * 토큰 수를 내므로 "안 바뀌었다"가 곧 "안 불렀다"가 아니다(그렇게 가르면 반대로 실측이 사라진다).
+   *
+   * **엔진 기동이 만든 조각만** 센다. 호스트가 조립한 분류기·답변기·검색기는 `lastUsage()` 에 닿지
+   * 않으므로 세어도 읽을 값이 없고, 그 사실은 이미 경고로 적힌다(`W_KNOWLEDGE_PARTS`).
+   * `plan()` 은 실호출이 없으므로 세지 않는다.
+   */
+  let engineCalls = 0;
+
+  function countedClassifier(inner: IntentClassifier): IntentClassifier {
+    return {
+      contractVersion: inner.contractVersion,
+      engine: inner.engine,
+      plan: (r) => inner.plan(r),
+      classify: (r) => { engineCalls += 1; return inner.classify(r); },
+    };
+  }
+
+  function countedAnswerer(inner: Answerer): Answerer {
+    return {
+      contractVersion: inner.contractVersion,
+      engine: inner.engine,
+      plan: (r) => inner.plan(r),
+      answer: (r) => { engineCalls += 1; return inner.answer(r); },
+    };
+  }
+
+  function countedEmbedder(inner: Embedder): Embedder {
+    return {
+      contractVersion: inner.contractVersion,
+      engine: inner.engine,
+      embedTexts: (t) => { engineCalls += 1; return inner.embedTexts(t); },
+      embedChunks: (c) => { engineCalls += 1; return inner.embedChunks(c); },
+      embedQuery: (q) => { engineCalls += 1; return inner.embedQuery(q); },
+    };
+  }
+
   // 엔진 기동(§6.2·§9.3). **레지스트리와 시계를 호스트에게서 받지 않는다** — 런타임의 것을
   // 그대로 넘긴다(ConversationCoreOptions.engines 주석). 테넌트가 어긋나면 거부한다(§11.1).
   let engineRuntime: EngineRuntime | undefined;
@@ -1614,6 +1658,8 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     if (!intentClassifier || typeof intentClassifier.classify !== 'function') {
       throw new Error('인텐트 배선 거부: 분류기(classifier)가 없습니다 — Core 는 엔진을 직접 부르지 않습니다 (설계서 §6.2)');
     }
+    // 엔진 기동이 만든 분류기만 감싼다 — 호스트 조립본은 `lastUsage()` 에 닿지 않아 셀 이유가 없다.
+    if (it.classifier === undefined) intentClassifier = countedClassifier(intentClassifier);
     if (typeof it.clarifyPrompt !== 'string' || it.clarifyPrompt.trim() === '') {
       throw new Error('인텐트 배선 거부: 명확화 문구(clarifyPrompt)가 없습니다 — Core 는 질문 문안을 만들지 않습니다 (설계서 §13-3)');
     }
@@ -1728,7 +1774,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
         // 여기서 복사하면 한쪽만 고쳐지고, 고쳐지지 않은 쪽이 곧 §11.1 구멍이다.
         retriever = createRetriever({
           scope: opts.scope,
-          embedder,
+          embedder: countedEmbedder(embedder),
           store: kb.search.store,
           knowledgeBaseIds: kb.search.knowledgeBaseIds,
           ...(kb.search.storeTimeoutMs !== undefined ? { storeTimeoutMs: kb.search.storeTimeoutMs } : {}),
@@ -1740,10 +1786,11 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     if (!retriever || typeof retriever.retrieve !== 'function') {
       throw new Error('지식 응대 배선 거부: 검색기(retriever)가 없습니다 — Core 는 벡터 스토어를 직접 부르지 않습니다 (설계서 §6.2)');
     }
-    const answerer = kb.answerer ?? engineRuntime?.answerer;
-    if (!answerer || typeof answerer.answer !== 'function') {
+    const resolvedAnswerer = kb.answerer ?? engineRuntime?.answerer;
+    if (!resolvedAnswerer || typeof resolvedAnswerer.answer !== 'function') {
       throw new Error('지식 응대 배선 거부: 답변기(answerer)가 없습니다 — Core 는 엔진을 직접 부르지 않습니다 (설계서 §6.2)');
     }
+    const answerer = kb.answerer === undefined ? countedAnswerer(resolvedAnswerer) : resolvedAnswerer;
     try {
       // 판정 규칙을 복사하지 않는다 — 정책 검증은 `assertRetrievalPolicy` 하나다(§2).
       assertRetrievalPolicy(kb.policy);
@@ -1876,7 +1923,37 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
   }
 
   /**
-   * 채널이 선언한 §11.2 실측을 이번 턴 이벤트에 싣는다.
+   * Core 가 **이번 턴에** 부른 엔진의 §11.2 실측. 턴 안에서 호출이 있었을 때만 읽는다
+   * (위 `engineCalls` 주석 — 호출 없이 읽으면 직전 턴의 값을 한 번 더 싣는다).
+   *
+   * 그동안 이 자리가 비어 있었다: 채널이 선언한 사용량만 이벤트에 실렸고, **Core 가 직접 부른
+   * 엔진**(인텐트 분류·지식 검색·답변 생성)의 토큰은 어디에도 없었다. `UsageContribution.origin`
+   * 주석이 `'engine_set'(Core 가 부른 엔진)` 을 예로 적어 두었는데 그 출처로 기여하는 코드가 0줄이다.
+   * 결과는 예외가 아니다 — 그 비용은 공급사 청구서에만 남고 우리 집계에는 없어서, 몇 주 뒤 대사에서
+   * **'미설명' 차이**로 돌아온다(그 방향은 과소청구이므로 청구는 막히지도 않는다).
+   *
+   * 값을 만들지 않는다(§13-3): 어댑터가 사용량을 주지 않으면 `undefined` 이고 0 으로 적지 않는다.
+   */
+  function engineTurnUsage(callsBefore: number): {
+    usage: UsageMetrics; conflicts: string[]; rejected: string[]; calls: number;
+  } | undefined {
+    const rt = engineRuntime;
+    if (rt === undefined) return undefined;
+    const calls = engineCalls - callsBefore;
+    if (calls <= 0) return undefined;
+    const collected = rt.lastUsage();
+    if (collected === undefined) return undefined;
+    return {
+      usage: collected.usage,
+      conflicts: collected.conflicts.map((c) => c.key),
+      rejected: collected.rejected.map((r) => `engine_set.${r.key}`),
+      calls,
+    };
+  }
+
+  /**
+   * 이번 턴의 §11.2 실측을 이벤트에 싣는다. 출처는 **둘**이다 — 채널이 선언한 것과
+   * Core 가 부른 엔진(위 `engineTurnUsage`).
    *
    * 검증·충돌 판정은 `billing/turnUsage.ts` 한 곳에서 한다 — 브리지(JSONL) 경로는 사용량을
    * 검사했지만 TypeScript 호스트가 `ChannelTurnInput.usage` 로 바로 넘기는 이 경로는 **아무 검사도
@@ -1886,13 +1963,35 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
    * 실을 자리가 없으면 **조용히 버리지 않는다** — 버려진 실측은 원장에도 집계에도 없는데 공급사
    * 청구서에는 남아 있어서, 대사에서 '이벤트 유실'로 오진된다.
    */
-  function attachUsage(events: InteractionEvent[], declared: UsageMetrics | undefined): TurnBillingNote | undefined {
-    if (declared === undefined) return undefined;
-    const merged = mergeTurnUsage([{ origin: 'channel', usage: declared }]);
+  function attachUsage(
+    events: InteractionEvent[],
+    declared: UsageMetrics | undefined,
+    engine: ReturnType<typeof engineTurnUsage>,
+  ): TurnBillingNote | undefined {
+    if (declared === undefined && engine === undefined) return undefined;
+    // 두 출처를 **한 번에** 넘긴다. 따로 붙이면 `attachTurnUsage` 가 두 번째를 "이미 실려 있다"로
+    // 거절하고(덮어쓰지도 합치지도 않는 것이 그쪽 규약이다) 뒤쪽 실측이 통째로 사라진다.
+    const contributions: UsageContribution[] = [];
+    if (declared !== undefined) contributions.push({ origin: 'channel', usage: declared });
+    if (engine !== undefined) contributions.push({ origin: 'engine_set', usage: engine.usage });
+    const merged = mergeTurnUsage(contributions);
     const note = usageNote(merged, merged.usage === undefined ? undefined : attachTurnUsage(events, merged.usage));
     if (merged.usage === undefined) {
       note.usageAttached = false;
       note.usageReasonKo = '선언된 사용량에 실측으로 쓸 수 있는 항목이 없어 이벤트에 싣지 않았습니다(§11.2).';
+    }
+    if (engine !== undefined) {
+      // 조각끼리 같은 키를 낸 것·실측으로 볼 수 없던 값은 `mergeTurnUsage` **앞에서** 이미 빠졌다.
+      // 빠진 사실을 이어 붙이지 않으면 호스트는 그 항목이 애초에 없었다고 읽는다(§11.2).
+      if (engine.conflicts.length > 0) note.usageConflicts = [...(note.usageConflicts ?? []), ...engine.conflicts];
+      if (engine.rejected.length > 0) note.usageRejected = [...(note.usageRejected ?? []), ...engine.rejected];
+      if (engine.calls > 1) {
+        // 어댑터는 **마지막 호출**의 실측만 알려준다(§6.2 `lastUsage`). 한 턴에 두 번 이상 불렀으면
+        // 앞 호출의 값은 같은 조각에서 덮였을 수 있다 — 추정해 더하지 않고 그 사실만 적는다(§13-3).
+        const limit = `이 턴에 Core 가 엔진을 ${engine.calls}번 불렀습니다 — 어댑터는 마지막 호출의 `
+          + '실측만 알려주므로 앞 호출의 사용량은 같은 조각에서 덮였을 수 있습니다(§11.2·§13-3).';
+        note.usageReasonKo = note.usageReasonKo === undefined ? limit : `${note.usageReasonKo} ${limit}`;
+      }
     }
     return billingNoteOrUndefined(note);
   }
@@ -2014,6 +2113,30 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     return decideFallbackMode(channel, opts.health, opts.policy, now());
   }
 
+  /**
+   * §9.3 축소 지시를 이번 턴의 단계마다 찍는다(§6.2 — 끄는 주체는 매체다).
+   *
+   * **제자리에서 고친다.** 호출부의 `presented` 인덱스 계산·결과 `steps`·`port.present` 가 전부
+   * 같은 배열을 본다(고지 끼우기와 같은 이유) — 새 배열을 만들어 돌려주면 한 곳이라도 옛 배열을
+   * 들고 있으면 그 경로에서만 지시가 사라지고, 그건 "어떤 호스트에서만 TTS 가 안 꺼진다"가 된다.
+   *
+   * **단계마다 찍는다.** 턴 결과에 한 번만 실으면 커넥터 이행처럼 한 턴에 `present` 가 두 번
+   * 나가는 경로에서 먼저 나간 안내는 지시 없이 나간다 — 하필 그 안내가 저하된 TTS 로 합성된다.
+   *
+   * 끌 것이 없으면 **아무것도 하지 않는다**(§13-3): 빈 배열을 찍으면 포트는 "축소 운영인데 끌
+   * 것은 없다"와 "정상"을 구분하려 들고, 그 구분에는 근거가 없다.
+   */
+  function stampOutage(steps: RenderedStep[], decision: FallbackDecision): void {
+    const disabled = mediaDisabledBy(decision);
+    if (disabled.length === 0) return;
+    for (const step of steps) {
+      // 이미 찍힌 단계는 덮어쓰지 않는다 — 커넥터 이행 중에 판정이 바뀌어도 그 단계가 실제로
+      // 나갈 때의 지시가 남아야 한다(나중 판정으로 덮으면 "무엇을 보고 합성했는가"가 사라진다).
+      if (step.outage !== undefined) continue;
+      step.outage = { disabled: [...disabled], reasonKo: decision.reasonKo };
+    }
+  }
+
   /** 장애 폴백 실행(§9.3). AI 응대를 계속할 수 있으면 undefined 를 돌려준다. */
   async function applyOutage(
     rec: SessionRecord,
@@ -2093,7 +2216,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
    * - **테넌트 격리 위반은 삼키지 않는다**(§11.1). 실행기가 던지는 유일한 경우이며 그대로 올린다.
    */
   async function drainConnectors(
-    rec: SessionRecord, reg: ChannelRegistration, run: RunResult,
+    rec: SessionRecord, reg: ChannelRegistration, run: RunResult, decision: FallbackDecision,
   ): Promise<{ steps: RenderedStep[]; events: InteractionEvent[]; presented: number; endReasonKo?: string }> {
     const binding = connectorBinding;
     const steps: RenderedStep[] = [...run.steps];
@@ -2158,6 +2281,8 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
 
         const next = runnerSend(rec.flow, rec.state, input, runnerCtx(rec, reg.port.capabilities));
         rec.state = next.state;
+        // 이행이 만든 단계도 같은 지시를 받는다 — 여기서 빠뜨리면 조회 결과 안내만 지시 없이 나간다.
+        stampOutage(next.steps, decision);
         steps.push(...next.steps);
         events.push(...next.events);
         delete rec.connectorCall;                // 결과가 왔다 — 다음에 같은 노드를 밟으면 새 호출이다
@@ -2836,6 +2961,10 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     // 합류는 새 발화가 아니므로 확정된 동의가 없다. 다만 화면이 열리는 이 지점이 §10.1 동의를
     // 받기 가장 좋은 자리이므로, 지금 미획득인 필수 목적은 그대로 드러낸다.
     const consent = applyConsentTurn(rec, null);
+    // 합류한 매체에도 §9.3 축소 지시를 찍는다. 지금 열 수 있는 목적지(화면·채팅)는 STT·TTS 에
+    // 의존하지 않아 대개 빈 목록이지만, **경로마다 따로 판단하지 않는다** — 빠뜨린 경로는
+    // "그 채널에서만 안 꺼진다"로 나타나고 그건 재현이 가장 어려운 종류의 결함이다(§2).
+    stampOutage(steps, health(channel));
     recordTurns(rec, events);
     sessions.put(rec);
     await publish(events);
@@ -2997,9 +3126,12 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       // 고지는 **첫 단계보다 앞에** 들어가야 하므로 커넥터 이행보다 먼저 끼운다(§10.1) —
       // Api 대기 안내가 먼저 present 되는 시나리오에서는 그 안내가 곧 첫 발화다.
       const disclosure = prependDisclosure(rec, run.steps, run.events);
+      // §9.3 축소 지시는 **고지를 끼운 뒤에** 찍는다 — 고지 발화도 같은 매체로 나가므로
+      // 끼우기 전에 찍으면 하필 첫 발화가 지시 없이 합성된다.
+      stampOutage(run.steps, decision);
       // Api 노드는 여기서 이행한다. presetSlots 를 병합한 **뒤에** 부른다 — 커넥터 파라미터가
       // 채널이 넘긴 슬롯에서 오는 경우(발신번호·회원번호) 앞서 부르면 필수 슬롯 누락으로 막힌다.
-      const drained = await drainConnectors(rec, reg, run);
+      const drained = await drainConnectors(rec, reg, run, decision);
       const events = drained.events;
       recordTurns(rec, events);
       const summaryMasked = rec.state.handoff ? attachSummary(rec, events) : undefined;
@@ -3059,20 +3191,23 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       // 확정된 Confirm 값이 세션에 영구히 남아 이후 모든 턴에서 같은 동의가 다시 쌓인다.
       const pendingNodeId = rec.state.currentNodeId;
       const ctx = runnerCtx(rec, reg.port.capabilities);
+      // 엔진 호출 수를 **턴 전에** 기록한다 — 이 턴에 생긴 실측만 싣기 위한 기준점이다(§11.2).
+      const engineCallsBefore = engineCalls;
       const run = await runTurn(rec, ctx, turn.input, decision);
       rec.state = run.state;
 
       // §11.2 과금 근거는 실측만 싣는다. 커넥터 이행 **전에** 붙인다 —
       // 이행이 만든 봇 발화가 뒤에 쌓여도 대상이 흔들리지 않게.
-      const billing = attachUsage(run.events, turn.usage);
+      const billing = attachUsage(run.events, turn.usage, engineTurnUsage(engineCallsBefore));
       // 채널이 이 턴에 바뀌었으면(§5.2) 새 매체는 아직 고지 전이다 — 이미 고지한 채널이면
       // 아무것도 하지 않으므로 턴마다 반복되지 않는다.
       const disclosure = prependDisclosure(rec, run.steps, run.events);
       // 동의는 **커넥터 이행보다 먼저** 반영한다(§10.1·§6.1). 같은 턴에서 동의를 받고 곧바로
       // 개인정보 조회로 넘어가는 시나리오(동의 → Api)가 가장 흔한 모양이고, 순서가 뒤면 방금 받은
       // 동의가 이력에 없는 상태로 게이트를 지나 그 조회만 조용히 막힌다.
+      stampOutage(run.steps, decision);
       const consent = applyConsentTurn(rec, pendingNodeId);
-      const drained = await drainConnectors(rec, reg, run);
+      const drained = await drainConnectors(rec, reg, run, decision);
       const events = drained.events;
       const summaryMasked = rec.state.handoff ? attachSummary(rec, events) : undefined;
       if (!rec.state.handoff) recordTurns(rec, events);

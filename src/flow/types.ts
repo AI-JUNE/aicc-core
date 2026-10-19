@@ -3,6 +3,7 @@
 import type { ChannelKind } from '../domain/types.ts';
 import type { RepromptReason } from './reprompt.ts';
 import type { DisclosurePlacement } from '../portal/aiDisclosure.ts';
+import type { MediaDisable } from '../ops/fallback.ts';
 
 export type NodeKind = 'Say' | 'Collect' | 'Choice' | 'Confirm' | 'Transfer' | 'Api';
 
@@ -125,6 +126,23 @@ export interface RenderedStep {
    * 본문의 `[n]` 과 어긋나 고객이 다른 출처를 보게 된다.
    */
   citations?: StepCitation[];
+  /**
+   * §9.3 축소 운영(`degraded_ai`)으로 이 단계에서 **쓰지 말아야 하는 매체 기능**.
+   * 끌 것이 없으면 필드 자체가 없다 — 이 필드가 없으면 종전과 완전히 같다(§13-3).
+   *
+   * 왜 단계에 싣는가: §9.3 판정(`decideFallbackMode`)은 TTS 저하 시 "합성 대신 사전녹음·텍스트로
+   * 내린다"고 적고 그 사실을 `disable` 에 담는데, **합성을 하는 주체는 Core 가 아니라 채널**이다
+   * (§6.2). 그래서 이 목록이 단계에 실리지 않는 동안 판정은 `disable: ['voice_synthesis']` 인데
+   * 채널은 아무것도 모른 채 저하된 TTS 를 계속 부른다 — 예외도 알림도 없고, 고객에게는
+   * 끊기는 음성으로만 나타난다. 판정을 **다시 하지 않는다**: 무엇을 끄는지는
+   * `decideFallbackMode` 하나이고(§2) 이 필드는 그 판정의 전달이다.
+   *
+   * 모르는 포트는 이 필드를 무시하면 되고, 그것이 곧 종전 동작이다. 읽는 포트는
+   * `voice_synthesis` 에서 사전녹음·텍스트로 내리고 `speech_recognition` 에서 DTMF·텍스트
+   * 입력으로 받는다 — **어느 쪽으로 내릴지는 Core 가 정하지 않는다**(회선·안내 자산이 고객사마다
+   * 다르다, §13-3). `reasonKo` 는 이미 마스킹을 지난 판정 사유다.
+   */
+  outage?: { disabled: MediaDisable[]; reasonKo: string };
 }
 
 export function renderNode(node: FlowNode, channel: ChannelKind): RenderedStep {

@@ -20,6 +20,7 @@ import type { SwitchTicket } from '../core/executeSwitch.ts';
 import { DISCLOSURE_NODE_ID } from '../core/executeDisclosure.ts';
 import { CLARIFY_NODE_ID, renderClarifyStep } from '../nlu/executeIntentEntry.ts';
 import { ANSWER_NODE_ID, renderAnswerStep } from '../knowledge/executeKnowledge.ts';
+import { MEDIA_DISABLE } from '../ops/fallback.ts';
 import type {
   ChannelAdapterId, ChannelCapabilities, ChannelPort, ChannelRegistration,
 } from './contract.ts';
@@ -44,7 +45,8 @@ export type ConformanceCheckId =
   | 'CHANNEL_INVITE'      // 전환 초대에 티켓이 실려도 흡수하는가 — 링크는 토큰으로 만든다(§5.2·§10.3)
   | 'AI_DISCLOSURE'       // 시나리오 노드가 아닌 AI 고지 단계를 그대로 내보내는가(§10.1·§7 7.4)
   | 'INTENT_CLARIFY'      // 시나리오에 없는 **선택지 단계**(명확화)를 렌더할 수 있는가(§5.1)
-  | 'KNOWLEDGE_ANSWER';   // 각주(`citations`)가 붙은 지식 응대 답변 단계를 흡수하는가(§5.2)
+  | 'KNOWLEDGE_ANSWER'    // 각주(`citations`)가 붙은 지식 응대 답변 단계를 흡수하는가(§5.2)
+  | 'OUTAGE_HINTS';       // 축소 운영 지시(`outage`)가 붙은 단계를 흡수하는가(§9.3)
 
 export interface ConformanceCheck {
   id: ConformanceCheckId;
@@ -528,7 +530,42 @@ export async function runChannelConformance(opts: ConformanceOptions): Promise<C
     });
   }
 
-  // 16) 시나리오 렌더 가능성(§5.3) — 능력 선언과 실제 시나리오가 어긋나면 배포 후에야 드러난다.
+  // 16) 축소 운영 지시(§9.3) — 엔진이 저하되면 단계에 `outage` 가 더 붙는다. 이 지시는 **설정이
+  //     아니라 장애 때 처음 붙으므로**, 여기서 깨지는 포트는 평소 전 검사를 통과하고 **하필 엔진이
+  //     저하된 순간** 전 통화가 깨진다 — 장애 위에 장애를 얹는 가장 나쁜 실패 모양이다.
+  //     그래서 다른 힌트 검사(TURN_HINTS)와 따로 둔다: 모양이 아니라 **시점**이 다르다.
+  //     **무엇으로 내릴지는 검사하지 않는다** — 사전녹음·텍스트·DTMF 중 무엇을 쓸지는 고객사의
+  //     안내 자산에 달린 일이고(§13-3), 포트 안에서 일어나는 일이라 관측할 수도 없다. 그래서
+  //     실패 문구에 못박아 둔다: 이 지시를 무시하면 저하된 TTS 를 계속 부르게 되고, 증상은
+  //     예외가 아니라 **끊기는 음성**이라 어디서도 터지지 않는다.
+  {
+    const steps: RenderedStep[] = [{
+      channel, nodeId: 'n_probe_outage', kind: 'Collect', text: '예약 날짜를 말씀해 주세요.',
+      ...(channel === 'voice' ? { acceptDtmf: true } : {}),
+      outage: {
+        disabled: [...MEDIA_DISABLE],
+        reasonKo: '축소 운영(tts, stt) — 해당 기능을 끄고 시나리오 흐름은 유지합니다(§9.3·§5.2).',
+      },
+    }];
+    const snapshot = JSON.stringify(steps);
+    const r = await withBudget(() => port.present('i_probe_outage', steps), budget);
+    const unchanged = JSON.stringify(steps) === snapshot;
+    add({
+      id: 'OUTAGE_HINTS',
+      passed: r.ok === true && unchanged,
+      severity: 'error',
+      messageKo: r.ok === true && unchanged
+        ? '축소 운영 지시가 붙은 단계를 흡수하고 변형하지 않습니다(§9.3). 이 목록에 있는 기능은 '
+          + '그 단계에서 쓰지 마세요 — 무엇으로 대체할지는 채널이 정합니다(사전녹음·텍스트·DTMF).'
+        : !unchanged
+          ? '축소 운영 지시를 present 가 변형했습니다. 같은 배열이 §8.1 이벤트·이력에 쓰이고, '
+            + '지시를 고쳐 쓰면 §9.3 판정과 실제 동작이 갈라집니다.'
+          : `축소 운영 지시가 붙은 단계에서 실패했습니다: ${'timeout' in r ? '예산 초과' : errText((r as { error: unknown }).error)}. `
+            + '이 필드는 설정이 아니라 **엔진이 저하된 순간** 처음 붙습니다 — 여기서 던지면 장애 때 전 통화가 깨집니다(§9.3).',
+    });
+  }
+
+  // 17) 시나리오 렌더 가능성(§5.3) — 능력 선언과 실제 시나리오가 어긋나면 배포 후에야 드러난다.
   if (!opts.flows || opts.flows.length === 0) {
     add({ id: 'FLOW_SUPPORT', passed: true, skipped: true, severity: 'warning', messageKo: 'flows 미지정 — 시나리오 렌더 가능 여부를 검사하지 않았습니다(§5.3).' });
   } else {
