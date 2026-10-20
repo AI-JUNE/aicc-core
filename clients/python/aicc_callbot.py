@@ -15,7 +15,7 @@ agent.py 에 넣을 것은 훅마다 한 줄이다(이 파일은 agent.py 를 im
 
     hooks = AsyncCallbotCoreHooks.from_env()          # 기본 OFF. 켜는 조건은 아래
     @agent.on("call_start")  ... await hooks.on_call_start(call.call_id)
-    @agent.on("transcript")  ... await hooks.on_transcript(call.call_id, role, text)
+    @agent.on("transcript")  ... await hooks.on_transcript(call.call_id, role, text, usage=turn_usage)
     @agent.on("call_end")    ... await hooks.on_call_end(call.call_id, billable_ms=call.billable_ms)
 
 이 어댑터가 지키는 것 (전부 "빠지면 사고가 나는" 지점이다)
@@ -38,6 +38,12 @@ agent.py 에 넣을 것은 훅마다 한 줄이다(이 파일은 agent.py 를 im
    센다 — 세지 않으면 "청구할 근거가 없는 통화"가 몇 건인지 모르는 채 월말이 온다.
 6. **발화·응답을 print 하지 않는다(§10.3).** 이 파일은 어떤 것도 출력하지 않는다.
    결과가 필요하면 `on_turn` 콜백으로 받는다(상담사용 요약·슬롯 값은 기본적으로 들어 있지 않다).
+6-1. **턴 단위 실측을 받을 자리를 둔다(§11.2·§13).** 회선·엔진이 측정한 `usage`(STT/TTS 구간·LLM
+   토큰)와 `latency` 는 **훅으로만** 들어올 수 있다 — Core 는 음성 엔진을 직접 부르지 않으므로
+   (§6.2) 여기서 넘기지 않으면 그 수량은 §8.1 원장에 한 줄도 남지 않는다. 그 방향은 과소청구라
+   청구를 막지도 않고, 공급사 청구서와의 차이는 몇 주 뒤 대사에서 '미설명'으로만 나타난다(§11.2).
+   **추정하지 않는다**(§13-3): 회선이 주지 않으면 싣지 않고, 선언 없이 보낸 턴을
+   `stats.turns_missing_usage` 로 센다 — 세지 않으면 "근거 없는 턴"이 몇 건인지 모르는 채 월말이 온다.
 7. **한도 초과는 장애가 아니다(§9.3).** `E_RATE_LIMITED` 를 브리지 사망과 같게 다루면 통화 전체가
    Core 를 잃는다. 대신 브리지가 준 `retryAfterMs` 동안 **그 통화의 턴만** 보내지 않는다.
    대기 시간을 주지 않았으면 대기하지 않는다(없는 근거를 만들지 않는다, §13-3).
@@ -92,6 +98,9 @@ class HookStats:
     #: §11.2 통화 과금 구간을 선언하지 않고 닫은 통화 수. 그 통화는 통화 분 집계에서 빠진다 —
     #: 추정으로 메우지 않으므로(§13-3) 이 건수가 곧 "청구 근거가 없는 통화 수"다.
     ends_missing_billable_ms: int = 0
+    #: §11.2 턴 단위 실측(`usage`)을 선언하지 않고 보낸 턴 수. 통화 구간과 같은 이유로 센다 —
+    #: 그 턴의 STT·TTS·LLM 수량은 원장에 없고 공급사 청구서에만 남는다.
+    turns_missing_usage: int = 0
 
     def as_dict(self) -> Dict[str, int]:
         return dict(self.__dict__)
@@ -227,24 +236,65 @@ class CallbotCoreHooks:
             self.stats.calls_started += 1
             return res.interaction_id
 
-    def on_transcript(self, call_id: str, role: str, text: str, *,
-                      confidence: Optional[float] = None) -> Optional[BridgeResponse]:
+    def on_transcript(
+        self,
+        call_id: str,
+        role: str,
+        text: str,
+        *,
+        confidence: Optional[float] = None,
+        latency: Optional[Dict[str, float]] = None,
+        usage: Optional[Dict[str, float]] = None,
+    ) -> Optional[BridgeResponse]:
+        """고객 발화 한 건. `latency`·`usage` 는 **회선·엔진이 측정한 값만** 넘긴다(머리말 6-1).
+
+        선언하지 않으면 **종전과 완전히 같은 호출**이 나간다 — 인자를 싣지 않으므로 구버전
+        시그니처의 클라이언트를 감싼 호스트도 턴 자리에서 죽지 않는다(`on_call_end` 와 같은 규칙).
+        """
         if role != "user":
             self.stats.ignored_non_user += 1
             return None
         if not isinstance(text, str) or not text.strip():
             self.stats.ignored_empty += 1
             return None
-        return self._turn(call_id, lambda c, i: c.send_utterance(i, text, confidence=confidence))
+        facts = self._facts(latency=latency, usage=usage)
+        return self._turn(
+            call_id,
+            lambda c, i: c.send_utterance(i, text, confidence=confidence, **facts),
+            usage_declared=bool(usage),
+        )
 
-    def on_dtmf(self, call_id: str, digits: str) -> Optional[BridgeResponse]:
+    def on_dtmf(
+        self,
+        call_id: str,
+        digits: str,
+        *,
+        latency: Optional[Dict[str, float]] = None,
+        usage: Optional[Dict[str, float]] = None,
+    ) -> Optional[BridgeResponse]:
         if not isinstance(digits, str) or not digits:
             self.stats.ignored_empty += 1
             return None
-        return self._turn(call_id, lambda c, i: c.send_dtmf(i, digits))
+        facts = self._facts(latency=latency, usage=usage)
+        return self._turn(
+            call_id,
+            lambda c, i: c.send_dtmf(i, digits, **facts),
+            usage_declared=bool(usage),
+        )
 
-    def on_timeout(self, call_id: str) -> Optional[BridgeResponse]:
-        return self._turn(call_id, lambda c, i: c.send_timeout(i))
+    def on_timeout(
+        self,
+        call_id: str,
+        *,
+        usage: Optional[Dict[str, float]] = None,
+    ) -> Optional[BridgeResponse]:
+        """무음. 응답시간은 받지 않는다 — Core 가 무입력 턴에 실을 자리가 없다(`send_timeout` 주석)."""
+        facts = self._facts(usage=usage)
+        return self._turn(
+            call_id,
+            lambda c, i: c.send_timeout(i, **facts),
+            usage_declared=bool(usage),
+        )
 
     def on_call_end(
         self,
@@ -339,7 +389,33 @@ class CallbotCoreHooks:
             self._report("E_BRIDGE_DOWN", "Core 브리지 호출 중 예외가 나 이후 통화는 Core 없이 진행합니다.")
             return None
 
-    def _turn(self, call_id: str, fn: Callable[[BridgeClient, str], BridgeResponse]) -> Optional[BridgeResponse]:
+    @staticmethod
+    def _facts(
+        *,
+        latency: Optional[Dict[str, float]] = None,
+        usage: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, Any]:
+        """선언된 실측만 호출 인자로 만든다.
+
+        빈 맵은 **선언이 아니다**(§13-3) — 실어 보내면 "측정했고 0건"으로 읽힌다. 아무것도
+        선언되지 않으면 빈 dict 를 돌려주므로 호출 모양이 종전과 완전히 같다(구버전 시그니처의
+        클라이언트를 감싼 호스트가 턴 자리에서 TypeError 로 죽지 않는다 — 죽는 자리가 하필
+        통화 중이라 그 통화는 Core 를 통째로 잃는다).
+        """
+        facts: Dict[str, Any] = {}
+        if latency:
+            facts["latency"] = latency
+        if usage:
+            facts["usage"] = usage
+        return facts
+
+    def _turn(
+        self,
+        call_id: str,
+        fn: Callable[[BridgeClient, str], BridgeResponse],
+        *,
+        usage_declared: bool = False,
+    ) -> Optional[BridgeResponse]:
         if not self._ready():
             return None
         with self._lock:
@@ -361,6 +437,10 @@ class CallbotCoreHooks:
             if res.ok:
                 self.stats.turns_sent += 1
                 call.turns += 1
+                # 보낸 턴 중 §11.2 실측 선언이 없던 건수. 통화 구간(`ends_missing_billable_ms`)과
+                # 같은 이유로 센다 — 그 턴의 엔진 비용은 원장에 없고 청구서에만 남는다.
+                if not usage_declared:
+                    self.stats.turns_missing_usage += 1
                 if self._on_turn is not None:
                     try:
                         self._on_turn(call_id, res.result)
@@ -459,11 +539,13 @@ class AsyncCallbotCoreHooks:
     async def on_transcript(self, call_id: str, role: str, text: str, **kw: Any) -> Optional[BridgeResponse]:
         return await self._run(call_id, lambda: self.inner.on_transcript(call_id, role, text, **kw))
 
-    async def on_dtmf(self, call_id: str, digits: str) -> Optional[BridgeResponse]:
-        return await self._run(call_id, lambda: self.inner.on_dtmf(call_id, digits))
+    # `**kw` 를 받는 이유: 동기 쪽에만 인자를 더하면 **비동기 호스트에서만** 실측이 사라진다.
+    # asyncio 에이전트가 권장 경로이므로 그 비대칭의 증상은 "음성 채널 전체에서 수량이 없다"다.
+    async def on_dtmf(self, call_id: str, digits: str, **kw: Any) -> Optional[BridgeResponse]:
+        return await self._run(call_id, lambda: self.inner.on_dtmf(call_id, digits, **kw))
 
-    async def on_timeout(self, call_id: str) -> Optional[BridgeResponse]:
-        return await self._run(call_id, lambda: self.inner.on_timeout(call_id))
+    async def on_timeout(self, call_id: str, **kw: Any) -> Optional[BridgeResponse]:
+        return await self._run(call_id, lambda: self.inner.on_timeout(call_id, **kw))
 
     async def on_call_end(
         self,

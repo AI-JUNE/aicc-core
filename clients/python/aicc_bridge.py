@@ -24,6 +24,11 @@ Callbot 의 음성 에이전트는 파이썬 프로세스다. Node 로 된 채�
 7. **재시도 대기를 지어내지 않는다.** 한도 초과(`E_RATE_LIMITED`) 응답의 `retryAfterMs` 는 브리지가
    **계산해서 준** 경우에만 `BridgeError.retry_after_ms` 로 노출한다. 없거나 형태가 틀리면 None 이며,
    0 으로 읽지 않는다 — 0 으로 읽으면 곧바로 재시도해 한도를 더 밀어붙인다(§13-3).
+8. **계약에 있는 값은 보낼 수 있어야 한다.** 턴 단위 실측(§11.2 `usage`·§13 `latency`)은 발화 턴만
+   쓰는 값이 아니다 — DTMF 선택·무음 턴에서도 그 턴의 TTS·LLM 은 이미 호출됐고 비용은 공급사
+   청구서에 남는다. 보낼 방법이 없으면 그 수량은 Core 원장에 들어가지 않고, 과소청구 방향이라
+   청구를 막지도 않은 채 몇 주 뒤 대사에서 '미설명' 차이로만 나타난다(§11.2).
+   **없는 값을 만들지는 않는다**(§13-3): 주지 않으면 키 자체를 싣지 않는다.
 
 무엇을 하지 않는가 (build now, activate on approval)
 ---------------------------------------------------
@@ -102,6 +107,24 @@ class BridgeResponse:
             if isinstance(value, str) and value:
                 return value
         return None
+
+    @property
+    def pending_connector_id(self) -> Optional[str]:
+        """Api 대기 중인 커넥터 id(§6.1). 없으면 None.
+
+        값이 있으면 Core 는 **업무시스템 조회 결과를 기다리는 상태**이고, 보내야 하는 다음 입력은
+        발화가 아니라 `send_connector_result(...)` 다. 이 값을 보지 않으면 대기 중에 발화를 보내게
+        되는데 그 응답은 `steps` 0건·`events` 0건이고 **오류도 아니다** — 통화는 끊기지 않은 채
+        멈추고 어떤 알림도 울리지 않는다("그 메뉴만 안 된다"로만 나타난다).
+        커넥터 이행이 배선된 테넌트에서는 Core 가 스스로 부르므로 이 값이 서지 않는다.
+        """
+        if not self.ok or not isinstance(self.result, dict):
+            return None
+        state = self.result.get("state")
+        if not isinstance(state, dict):
+            return None
+        value = state.get("pendingConnectorId")
+        return value if isinstance(value, str) and value else None
 
 
 @dataclass
@@ -257,8 +280,17 @@ class BridgeClient:
         flow_version: Optional[int] = None,
         preset_slots: Optional[Dict[str, str]] = None,
         join_interaction_id: Optional[str] = None,
+        join_token: Optional[str] = None,
         correlation_id: Optional[str] = None,
     ) -> BridgeResponse:
+        """세션을 열거나(flow_id) 진행 중인 상담에 합류한다(join_interaction_id).
+
+        `join_token` 은 §5.2 합류 자격 토큰이다. **Core 에 채널 전환이 배선되면 필수**이며,
+        고객이 누른 링크에 실려 온 값을 그대로 넘긴다 — 이 클라이언트가 만들지 않는다(§10.3).
+        넘길 방법이 없으면 전환 배선을 켜는 순간 **비-Node 호스트만 합류하지 못한다**: 평시에는
+        드러나지 않고 테넌트가 그 보안 설정을 켠 날부터 "이 채널에서만 화면 전환이 안 된다"로
+        나타난다. 배선이 없는 Core 는 이 값을 보지 않으므로 종전과 완전히 같다(§13-3).
+        """
         # scope 와 adapter 는 싣지 않는다 — 테넌트·채널은 브리지 설정이 정한다(§11.1).
         req: Dict[str, Any] = {"flowId": flow_id, "entryPoint": entry_point}
         if flow_version is not None:
@@ -267,6 +299,8 @@ class BridgeClient:
             req["presetSlots"] = preset_slots
         if join_interaction_id:
             req["joinInteractionId"] = join_interaction_id
+        if join_token:
+            req["joinToken"] = join_token
         if correlation_id:
             req["correlationId"] = correlation_id
         return self.request("start", req=req)
@@ -292,12 +326,70 @@ class BridgeClient:
             turn["usage"] = usage
         return self.send(interaction_id, turn)
 
-    def send_dtmf(self, interaction_id: str, digits: str) -> BridgeResponse:
-        return self.send(interaction_id, {"input": {"kind": "dtmf", "digits": digits}})
+    def send_dtmf(
+        self,
+        interaction_id: str,
+        digits: str,
+        *,
+        latency: Optional[Dict[str, float]] = None,
+        usage: Optional[Dict[str, float]] = None,
+    ) -> BridgeResponse:
+        """번호 입력. **실측은 발화 턴만의 것이 아니다**(머리말 8번).
 
-    def send_timeout(self, interaction_id: str) -> BridgeResponse:
-        """무음·응답 없음. 음성 채널에서 가장 자주 쓰는 입력이라 이름을 따로 준다."""
-        return self.send(interaction_id, {"input": {"kind": "timeout"}})
+        DTMF 턴에도 그 턴의 안내를 합성한 TTS·판정에 쓴 LLM 이 있다 — `usage` 를 주지 않으면
+        그 수량은 §8.1 원장에 없고 공급사 청구서에만 남는다. `latency` 는 Core 가 DTMF 입력에
+        실어 주므로(§13 지연 지표) 측정했으면 그대로 넘긴다.
+        """
+        turn: Dict[str, Any] = {"input": {"kind": "dtmf", "digits": digits}}
+        if latency:
+            turn["latency"] = latency
+        if usage:
+            turn["usage"] = usage
+        return self.send(interaction_id, turn)
+
+    def send_timeout(
+        self,
+        interaction_id: str,
+        *,
+        usage: Optional[Dict[str, float]] = None,
+    ) -> BridgeResponse:
+        """무음·응답 없음. 음성 채널에서 가장 자주 쓰는 입력이라 이름을 따로 준다.
+
+        무음 턴도 비용이 있다 — 기다리는 동안 나간 재프롬프트는 TTS 로 합성된 발화다.
+        **`latency` 는 받지 않는다**: Core 는 무입력 턴에 응답시간을 싣지 않고(고객 발화가 없어
+        실을 자리가 없다) 그 사실을 계약 경고로 적는다. 받을 수 있게 열어 두면 호스트가 넘긴
+        실측이 경고와 함께 버려지는 경로가 하나 더 생긴다(§13-3).
+        """
+        turn: Dict[str, Any] = {"input": {"kind": "timeout"}}
+        if usage:
+            turn["usage"] = usage
+        return self.send(interaction_id, turn)
+
+    def send_connector_result(
+        self,
+        interaction_id: str,
+        ok: bool,
+        *,
+        slots: Optional[Dict[str, str]] = None,
+        error_code: Optional[str] = None,
+    ) -> BridgeResponse:
+        """업무시스템 조회 결과를 되돌려준다(§6.1 — `pending_connector_id` 가 섰을 때).
+
+        `ok` 는 **명시해야 한다** — 빠진 값을 성공으로 읽으면 실패한 조회가 성공으로 흘러간다.
+        `slots` 는 커넥터 계층에서 허용목록·마스킹을 마친 값만 넣는다(§10.3). 실패면 `error_code`
+        를 주면 시나리오의 `onError` 분기가 그 코드를 근거로 갈라진다. 분기가 없으면 Core 가
+        상담사로 내린다 — 조회 실패로 콜을 끊지 않는다(§9.3).
+
+        **`usage` 는 받지 않는다**: 커넥터 재개 턴에는 고객 발화 이벤트가 없어 Core 가 실측을
+        실을 자리가 없다(그 턴의 §6.1 커넥터 실측을 어디에 집계할지는 지표 정의 문제이며 Core 가
+        정하지 않는다). 받아서 보내면 응답 `billing` 에 "실을 자리가 없었다"만 적힌다.
+        """
+        payload: Dict[str, Any] = {"kind": "connectorResult", "ok": bool(ok)}
+        if slots:
+            payload["slots"] = slots
+        if error_code:
+            payload["errorCode"] = error_code
+        return self.send(interaction_id, {"input": payload})
 
     def end(
         self,
@@ -359,7 +451,14 @@ class BridgeClient:
 
 
 class _SessionContext:
-    """start ~ end 를 묶는다. 예외가 나도 end 를 부른다 — 세션 누수를 막는 유일한 지점이다."""
+    """start ~ end 를 묶는다. 예외가 나도 end 를 부른다 — 세션 누수를 막는 유일한 지점이다.
+
+    §11.2 통화 과금 구간은 `billable_ms` 로 선언한다. 회선이 알려 준 값을 `call.billable_ms = ...`
+    로 적어 두거나 `call.end(billable_ms=...)` 로 직접 닫으면 되고, **둘 다 하지 않으면 키가
+    실리지 않는다**(§13-3 — 0 을 보내면 "0초 통화를 실측했다"가 된다). 이 자리가 없던 동안
+    권장 사용법(`with client.session(...)`)으로 돈 통화는 **전부** 통화 분 집계에서 빠졌다 —
+    `client.end(..., billable_ms=...)` 는 있었지만 컨텍스트 매니저가 그 인자를 받지 않았다.
+    """
 
     def __init__(self, client: BridgeClient, reason_ko: str, start_kwargs: Dict[str, Any]) -> None:
         self._client = client
@@ -368,6 +467,8 @@ class _SessionContext:
         self.interaction_id: Optional[str] = None
         self.started: Optional[BridgeResponse] = None
         self.ended: Optional[BridgeResponse] = None
+        #: 회선이 준 §11.2 과금 구간(ms). 만들어 넣지 않는다 — None 이면 선언하지 않은 것이다.
+        self.billable_ms: Optional[float] = None
 
     def __enter__(self) -> "_SessionContext":
         self.started = self._client.start(**self._start_kwargs)
@@ -375,21 +476,40 @@ class _SessionContext:
         return self
 
     def __exit__(self, *_exc: Any) -> None:
-        if self.interaction_id and self.ended is None:
-            try:
-                self.ended = self._client.end(self.interaction_id, self._reason_ko)
-            except BridgeProtocolError:
-                # 브리지가 이미 죽었다면 더 할 수 있는 일이 없다. 원래 예외를 덮지 않는다.
-                pass
+        self.end()
+
+    def end(self, reason_ko: Optional[str] = None, *, billable_ms: Optional[float] = None) -> Optional[BridgeResponse]:
+        """세션을 닫는다. **멱등하다** — 이미 닫혔으면 아무것도 보내지 않고 그 결과를 돌려준다.
+
+        예외 경로에서도 불리므로(`__exit__`) 두 번 닫으려는 호출이 실제로 일어난다. 두 번 보내면
+        Core 는 멱등하게 받지만 그 호출의 `billing` 은 "이미 종료돼 실을 수 없었다"가 되고,
+        호스트는 자기가 선언한 과금 구간이 실렸다고 읽는다(§11.2).
+        """
+        if self.ended is not None or not self.interaction_id:
+            return self.ended
+        declared = billable_ms if billable_ms is not None else self.billable_ms
+        try:
+            self.ended = self._client.end(
+                self.interaction_id,
+                reason_ko if reason_ko is not None else self._reason_ko,
+                billable_ms=declared,
+            )
+        except BridgeProtocolError:
+            # 브리지가 이미 죽었다면 더 할 수 있는 일이 없다. 원래 예외를 덮지 않는다.
+            return None
+        return self.ended
 
     def send_utterance(self, text: str, **kwargs: Any) -> BridgeResponse:
         return self._require_id_then(lambda i: self._client.send_utterance(i, text, **kwargs))
 
-    def send_dtmf(self, digits: str) -> BridgeResponse:
-        return self._require_id_then(lambda i: self._client.send_dtmf(i, digits))
+    def send_dtmf(self, digits: str, **kwargs: Any) -> BridgeResponse:
+        return self._require_id_then(lambda i: self._client.send_dtmf(i, digits, **kwargs))
 
-    def send_timeout(self) -> BridgeResponse:
-        return self._require_id_then(self._client.send_timeout)
+    def send_timeout(self, **kwargs: Any) -> BridgeResponse:
+        return self._require_id_then(lambda i: self._client.send_timeout(i, **kwargs))
+
+    def send_connector_result(self, ok: bool, **kwargs: Any) -> BridgeResponse:
+        return self._require_id_then(lambda i: self._client.send_connector_result(i, ok, **kwargs))
 
     def _require_id_then(self, fn: Any) -> BridgeResponse:
         if not self.interaction_id:

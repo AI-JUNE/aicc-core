@@ -506,3 +506,113 @@ h.close()
   assert.deepEqual(out.errors, []);
   assert.equal(out.degraded, false);
 });
+
+// ── 턴 단위 실측(§11.2 usage · §13 latency) ────────────────────────────────────
+// 음성 엔진을 부르는 주체는 회선이고 Core 는 그 수량을 관측할 길이 없다(§6.2) — 훅이 넘기지
+// 않으면 §8.1 원장에 한 줄도 남지 않는다. 그 방향은 과소청구라 청구를 막지도 않고,
+// 공급사 청구서와의 차이는 몇 주 뒤 대사에서 '미설명'으로만 나타난다.
+
+test('§11.2 턴 단위 실측은 받은 그대로 나가고, 선언 없이 보낸 턴을 센다', b, () => {
+  const out = parse(runDriver(`${PRELUDE}
+h = hooks()
+h.on_call_start("call-A")
+h.on_transcript("call-A", "user", "잔액 조회요", confidence=0.91,
+                latency={"stt_ms": 310, "total_ms": 820},
+                usage={"stt_audio_ms": 2400, "llm_prompt_tokens": 180, "llm_completion_tokens": 40})
+h.on_dtmf("call-A", "1", latency={"total_ms": 120}, usage={"tts_audio_ms": 1500})
+h.on_timeout("call-A")                       # 회선이 실측을 주지 않았다 — 만들어 넣지 않는다
+h.on_call_end("call-A", billable_ms=48000)
+dump(h)
+h.close()
+`));
+  const sends = out.transcript.requests.filter((l) => l.includes('"op":"send"'));
+  assert.equal(sends.length, 3);
+  const utter = sends.find((l) => l.includes('utterance'));
+  assert.ok(utter.includes('"usage":{"stt_audio_ms":2400'), `발화 턴 실측이 빠졌다: ${utter}`);
+  assert.ok(utter.includes('"latency":{"stt_ms":310'), `발화 턴 응답시간이 빠졌다: ${utter}`);
+  const dtmf = sends.find((l) => l.includes('"dtmf"'));
+  assert.ok(dtmf.includes('"usage":{"tts_audio_ms":1500}'), `DTMF 턴 실측이 빠졌다: ${dtmf}`);
+  assert.ok(dtmf.includes('"latency":{"total_ms":120}'), `DTMF 턴 응답시간이 빠졌다: ${dtmf}`);
+  const timeout = sends.find((l) => l.includes('timeout'));
+  assert.equal(timeout.includes('usage'), false, '선언하지 않았는데 사용량이 실렸다(§13-3)');
+  // 통화 구간과 같은 규칙으로 센다 — 세지 않으면 "근거 없는 턴"이 몇 건인지 모른다.
+  assert.equal(out.stats.turns_missing_usage, 1, '실측 선언 없이 보낸 턴을 세지 않았다');
+  assert.equal(out.stats.turns_sent, 3);
+  assert.equal(out.stats.ends_missing_billable_ms, 0);
+  assert.deepEqual(out.errors, []);
+});
+
+test('비동기 래퍼도 같은 실측을 넘긴다 — 동기 쪽만 열면 권장 경로에서만 사라진다', b, () => {
+  const out = parse(runDriver(`${PRELUDE}
+async def main():
+    h = AsyncCallbotCoreHooks(hooks())
+    await h.on_call_start("call-A")
+    await h.on_transcript("call-A", "user", "잔액", usage={"stt_audio_ms": 900})
+    await h.on_dtmf("call-A", "2", usage={"tts_audio_ms": 300}, latency={"total_ms": 55})
+    await h.on_timeout("call-A", usage={"llm_prompt_tokens": 7})
+    await h.on_call_end("call-A", "통화 종료", 31000)
+    dump(h.inner)
+    await h.close()
+asyncio.run(main())
+`));
+  const sends = out.transcript.requests.filter((l) => l.includes('"op":"send"'));
+  assert.equal(sends.length, 3);
+  assert.equal(sends.filter((l) => l.includes('usage')).length, 3,
+    '비동기 래퍼가 실측을 떨어뜨렸다 — asyncio 에이전트가 권장 경로다');
+  assert.ok(sends.find((l) => l.includes('"dtmf"')).includes('"latency":{"total_ms":55}'));
+  assert.equal(out.stats.turns_missing_usage, 0);
+  assert.equal(out.stats.turns_sent, 3);
+  assert.deepEqual(out.errors, []);
+});
+
+test('실측을 선언하지 않으면 구버전 클라이언트를 감싼 호스트에서도 호출 모양이 같다', b, () => {
+  // 턴 자리에서 TypeError 로 죽으면 그 통화는 Core 를 통째로 잃는다(degraded) — end 와 같은 규칙으로
+  // **선언이 없으면 인자를 싣지 않는다**(§13-3).
+  const out = parse(runDriver(`${PRELUDE}
+from aicc_bridge import BridgeResponse
+
+class LegacyTurn:
+    def __init__(self):
+        self.calls = []
+        self.transcript = None
+    def hello(self): return BridgeResponse(id="1", ok=True, result={})
+    def start(self, **kw): return BridgeResponse(id="2", ok=True, result={"interactionId": "i1"})
+    def send_utterance(self, i, text, confidence=None):      # latency·usage 를 모르는 구버전
+        self.calls.append(("utterance", text))
+        return BridgeResponse(id="3", ok=True, result={})
+    def send_dtmf(self, i, digits):
+        self.calls.append(("dtmf", digits))
+        return BridgeResponse(id="4", ok=True, result={})
+    def send_timeout(self, i):
+        self.calls.append(("timeout", None))
+        return BridgeResponse(id="5", ok=True, result={})
+    def end(self, i, reason, billable_ms=None): return BridgeResponse(id="9", ok=True, result={})
+    def close(self): pass
+
+c = LegacyTurn()
+h = CallbotCoreHooks(lambda: c, flow_id="f", on_error=lambda code, m: errors.append(code))
+h.on_call_start("c1")
+h.on_transcript("c1", "user", "잔액")
+h.on_dtmf("c1", "1")
+h.on_timeout("c1")
+degraded_before = h.degraded
+stats_before = h.stats.as_dict()
+declared = h.on_transcript("c1", "user", "실측 선언", usage={"stt_audio_ms": 10})
+json.dump({"calls": c.calls, "stats": stats_before, "errors": errors,
+           "degraded": degraded_before, "degraded_after": h.degraded,
+           "enabled": h.enabled, "reason": h.disabled_reason_ko,
+           "transcript": None, "declared_ok": declared is not None and declared.ok},
+          sys.stdout, ensure_ascii=False)
+h.close()
+`));
+  assert.deepEqual(out.calls, [['utterance', '잔액'], ['dtmf', '1'], ['timeout', null]],
+    '선언이 없는데 호출 모양이 바뀌었다 — 구버전 구현이 턴 자리에서 죽는다');
+  assert.equal(out.degraded, false, '선언 없는 턴이 통화를 degraded 로 떨어뜨렸다');
+  assert.equal(out.stats.turns_sent, 3);
+  assert.equal(out.stats.turns_missing_usage, 3);
+  // 선언했는데 받을 수 없는 구버전 구현이면 그 턴은 실패한다 — 삼키지 않고 드러낸다(§9.3).
+  // (복사본 어긋남의 증상이 바로 이것이라 `scripts/client-drift.mjs` 가 CI 게이트로 있다.)
+  assert.equal(out.declared_ok, false);
+  assert.equal(out.degraded_after, true);
+  assert.deepEqual(out.errors, ['E_BRIDGE_DOWN']);
+});

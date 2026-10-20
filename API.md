@@ -129,6 +129,23 @@ Callbot 저장소에 **복사**되어 산다 — 어긋남은 `scripts/client-dr
 - `AsyncCallbotCoreHooks` 는 **같은 통화의 훅을 도착 순서대로** 처리한다. 체인 자리를 앞 훅을
   기다리기 전에 잡으므로, `await` 없이 훅을 던져도 `end` 가 마지막 턴을 앞지르지 않는다.
   `close()` 는 예약된 훅을 먼저 비운 뒤 브리지를 내린다(`drain()` 으로 따로 기다릴 수도 있다).
+- **턴 단위 실측은 모든 입력 종류에서 선언한다**(§11.2·§13): `send_utterance`·`send_dtmf` 는
+  `latency`·`usage` 를, `send_timeout` 은 `usage` 를 받는다(무음 턴은 고객 발화가 없어 Core 에
+  응답시간을 실을 자리가 없으므로 `latency` 는 **받지 않는다**). 훅 어댑터도 같은 인자를 받고
+  (`on_transcript`·`on_dtmf`·`on_timeout`, 비동기 래퍼 포함), **선언이 없으면 인자를 싣지 않는다** —
+  구버전 시그니처를 감싼 호스트가 턴 자리에서 죽지 않게 한 것이고(`on_call_end` 와 같은 규칙)
+  선언 없이 보낸 턴은 `stats.turns_missing_usage` 로 센다. 값 검증은 Core 경로 한 곳이다(§2) —
+  클라이언트가 미리 거르지 않으므로 형태 위반은 그 줄만 `E_BAD_REQUEST` 로 거절되고 통화는 계속된다.
+- **Api 대기(§6.1)** 는 `BridgeResponse.pending_connector_id` 로 읽고 `send_connector_result(ok, …)`
+  로 되돌려준다. 그 자리가 없으면 대기 중에 발화를 보내게 되고 응답은 `steps` 0건·`events` 0건에
+  오류도 아니다 — 통화는 끊기지 않은 채 멈춘다. 커넥터 재개 턴에는 고객 발화 이벤트가 없어
+  `usage` 를 받지 않는다(실을 자리가 없다). 예시: `fixtures/reference-core-connector.mjs`.
+- **합류 토큰(§5.2)** 은 `start(join_interaction_id=…, join_token=…)` 로 넘긴다. 고객이 누른 링크에
+  실려 온 값이며 클라이언트가 만들지 않는다(§10.3) — 넘길 자리가 없으면 전환 배선을 켜는 순간
+  **비-Node 호스트만** 합류하지 못한다. 배선이 없는 Core 는 이 값을 보지 않는다(§13-3).
+- `with client.session(...)` 로 닫는 통화도 §11.2 과금 구간을 선언할 수 있다: `call.billable_ms = …`
+  또는 `call.end(billable_ms=…)`(**멱등** — 두 번 닫으면 두 번째 호출의 `billing` 은 "이미 종료돼
+  실을 수 없었다"가 된다). 선언하지 않으면 키를 싣지 않는다(§13-3).
 
 Core 런타임 배선:
 
