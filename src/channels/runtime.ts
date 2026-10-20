@@ -913,6 +913,13 @@ function visibleSteps(steps: RenderedStep[]): RenderedStep[] {
   return steps.filter((s) => s.silent !== true);
 }
 
+/**
+ * §8.1 `latency_ms` 의 키. **목록을 여기 한 곳에 둔다** — 브리지(JSONL)도 같은 목록으로
+ * 검사하므로, 두 곳에 쓰면 키가 하나 늘어나는 날 한쪽만 늘고 그쪽을 지나지 않는 호스트에서만
+ * 그 실측이 조용히 사라진다(§2).
+ */
+const TURN_LATENCY_KEYS = ['stt_ms', 'llm_ttft_ms', 'tts_ttfb_ms', 'total_ms'] as const;
+
 export function createConversationCore(opts: ConversationCoreOptions): ConversationCore {
   assertTenantScope(opts.scope);
 
@@ -2041,6 +2048,92 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
   }
 
   /**
+   * 턴 단위로 선언된 응답시간을 입력 쪽 선언과 **키별로** 합친다.
+   *
+   * **고르지 않는다**: 같은 키가 둘에서 서로 다른 값으로 오면 입력 쪽을 그대로 두고 사실만
+   * 적는다. 하나를 골라 주면 그 선택 규칙이 Core 에 생기고(§2), 그 규칙은 호스트의 어긋난
+   * 선언을 조용히 덮는다 — `mergeTurnUsage` 가 같은 문제를 같은 방식으로 다룬다.
+   */
+  function mergedLatency(own: LatencyMs | undefined, declared: LatencyMs, whereKo: string): LatencyMs | undefined {
+    const out: LatencyMs = { ...(own ?? {}) };
+    const conflicts: string[] = [];
+    for (const key of TURN_LATENCY_KEYS) {
+      const v = declared[key];
+      if (v === undefined) continue;
+      const mine = out[key];
+      if (mine !== undefined && mine !== v) { conflicts.push(key); continue; }
+      out[key] = v;
+    }
+    if (conflicts.length > 0) {
+      warnOnce('W_TURN_INPUT',
+        `턴 응답시간 선언이 입력 쪽(${whereKo}) 선언과 어긋나 그 키를 입력 쪽 값으로 두었습니다: ${conflicts.join(', ')} — `
+        + '어느 쪽이 실측인지 Core 는 고르지 않습니다(§2·§13-3).');
+    }
+    return Object.keys(out).length === 0 ? undefined : out;
+  }
+
+  /**
+   * 채널이 **턴 단위로** 선언한 실측을 입력에 싣는다(§13-3·§5.1).
+   *
+   * `ChannelTurnInput.latency`·`confidence` 는 채널 계약에 선언돼 있고 브리지(JSONL)가 형태까지
+   * 검사해 채우는데, **런타임이 그 둘을 한 번도 읽지 않았다**. 실측이 §8.1 원장·§5.1 판정에
+   * 도착하는 경로는 `FlowInput.latency`·`utterance.confidence` 하나뿐이어서, 계약대로 턴 단위로
+   * 선언한 호스트의 값은 **경계에서 사라졌다**. 파이썬 참조 클라이언트가 바로 그 모양이다
+   * (`send_utterance(latency=...)` → `turn["latency"]`) — 즉 Callbot 경로에서는 100% 유실이다.
+   *
+   * 사라진 쪽의 증상은 둘 다 예외가 아니다.
+   *  - **응답시간**: `turn.completed.latency_ms` 가 언제나 비어 `turnsMissingLatency` 로만 집계된다 —
+   *    §13 지연 지표(p50·p90·p95)에 표본이 **한 건도** 들어간 적이 없고, 리포트에서
+   *    "측정하지 못했다"와 "선언했는데 유실됐다"가 구분되지 않는다.
+   *  - **신뢰도**: `minConfidence` 를 선언한 테넌트에서도 저신뢰 인식이 **확신한 답으로 확정된다**
+   *    (§5.1 신뢰도 조건을 건너뛴다). 재프롬프트도 예외도 없어 증상은 "엉뚱한 값이 수집된다" 뿐이다.
+   *
+   * 선언이 없으면 **종전과 완전히 같다**(§13-3). 실을 자리가 없는 입력 종류(무입력·커넥터 결과 —
+   * 그 둘은 고객 발화가 아니라 `inputLatency` 가 애초에 싣지 않는다)도 조용히 버리지 않고 적는다.
+   */
+  function applyTurnFacts(turn: ChannelTurnInput): FlowInput {
+    const input = turn.input;
+    if (turn.latency === undefined && turn.confidence === undefined) return input;
+    if (input.kind === 'timeout' || input.kind === 'connectorResult') {
+      warnOnce('W_TURN_INPUT',
+        `${input.kind} 입력에는 고객 발화가 없어 턴 단위로 선언된 실측(latency·confidence)을 실을 자리가 `
+        + '없습니다 — 싣지 않았고, 그 값은 §8.1 원장에 들어가지 않습니다(§13-3).');
+      return input;
+    }
+    const latency = turn.latency === undefined
+      ? input.latency
+      : mergedLatency(input.latency, turn.latency, `${input.kind} 입력`);
+
+    if (input.kind === 'utterance') {
+      let confidence = input.confidence;
+      if (turn.confidence !== undefined) {
+        if (confidence === undefined) confidence = turn.confidence;
+        else if (confidence !== turn.confidence) {
+          warnOnce('W_TURN_INPUT',
+            '턴 신뢰도 선언이 입력 쪽 선언과 어긋나 입력 쪽 값을 그대로 두었습니다 — 어느 쪽이 '
+            + '엔진 실측인지 Core 는 고르지 않습니다(§2·§13-3).');
+        }
+      }
+      return {
+        kind: 'utterance',
+        text: input.text,
+        ...(confidence !== undefined ? { confidence } : {}),
+        ...(latency !== undefined ? { latency } : {}),
+      };
+    }
+
+    if (turn.confidence !== undefined) {
+      warnOnce('W_TURN_INPUT',
+        `${input.kind} 입력에는 인식 신뢰도 칸이 없어 턴 단위로 선언된 confidence 를 싣지 않았습니다 — `
+        + '그 턴은 §5.1 신뢰도 조건을 지나지 않습니다(§13-3).');
+    }
+    if (input.kind === 'dtmf') {
+      return { kind: 'dtmf', digits: input.digits, ...(latency !== undefined ? { latency } : {}) };
+    }
+    return { kind: 'unrecognized', text: input.text, ...(latency !== undefined ? { latency } : {}) };
+  }
+
+  /**
    * 종료 시 넘어온 통화 과금 구간의 처리 결과(§11.2). 사실만 적는다 — 보정·추정이 없다(§13-3).
    *
    * 음성이 아닌 채널로 **끝난** 세션을 따로 적는 이유: `aggregateUsage` 는 `channel === 'voice'` 인
@@ -2973,6 +3066,20 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     if ((rec.scope.workspaceId ?? undefined) !== (req.scope.workspaceId ?? undefined)) {
       throw new Error('워크스페이스 격리 위반(채널 합류): 다른 워크스페이스의 Interaction 입니다 (설계서 §11.1)');
     }
+    // **끝난 상담에는 합류하지 않는다**(§5.2·§8.1). 전환 링크는 고객의 손에 남으므로 통화가
+    // 끊긴 뒤에 눌리는 일이 흔하고(링크가 도착한 순간 통화가 끝나 있는 경우가 가장 많다),
+    // 그때 여기를 그냥 통과시키면 Core 는 **`session.ended` 뒤에 `turn.completed`** 를 더한다 —
+    // §8.1 은 추가 전용이라 그 줄은 지울 수 없고, 하필 그 발화가 §10.1 AI 고지다. 게다가
+    // 그 세션의 §7 5.2 준수 점검은 이미 잠겨 있어(`buf.reviewed`) **그 고지는 점검되지 않는다**.
+    // 렌더할 노드도 없으므로(`currentNodeId === null`) 고객이 보는 것은 빈 화면이고, 어디서도
+    // 터지지 않는다. `send` 가 늦은 입력에 새 이벤트를 만들지 않는 것과 같은 규칙이며, 여기서는
+    // 돌려줄 "직전 결과"가 **다른 매체의 것**이라 거절로 적는다.
+    if (rec.ended || rec.state.status !== 'running') {
+      throw new Error(
+        `합류 거부: 이미 끝난 상담입니다(status=${rec.state.status}) — 종료된 세션에는 새 이벤트를 `
+        + '만들지 않습니다. 새 상담으로 시작하십시오 (설계서 §5.2·§8.1)',
+      );
+    }
     const reg = registration(req.adapter);
     const channel = ADAPTER_CHANNEL[req.adapter];
 
@@ -3020,10 +3127,6 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     // "그 채널에서만 안 꺼진다"로 나타나고 그건 재현이 가장 어려운 종류의 결함이다(§2).
     stampOutage(steps, health(channel));
     recordTurns(rec, events);
-    sessions.put(rec);
-    await publish(events);
-    const shown = visibleSteps(steps);
-    if (shown.length > 0) await reg.port.present(rec.interactionId, shown);
     const result: ChannelTurnResult = {
       interactionId: rec.interactionId, state: rec.state, steps, status: rec.state.status, events,
       ...(disclosure !== undefined ? { disclosure } : {}),
@@ -3031,6 +3134,15 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       ...complianceSlot(rec, events),
     };
     rec.lastResult = result;
+    // **`lastResult` 까지 같은 `put` 에 담는다**(`start`·`send`·`end` 와 같은 순서). 지금까지는
+    // `put` 이 결과 조립보다 앞에 있어서, 영속 `SessionStore` 를 끼운 호스트에서는 합류 턴의
+    // `lastResult` 가 저장되지 않았다 — 인메모리 구현에서는 같은 객체라 보이지 않지만, 직렬화하는
+    // 저장소에서는 다음 호출이 **합류 전(다른 매체) 결과**를 읽고, 그 값이 늦은 입력의 응답으로
+    // 그대로 나간다(§5.2). 전달 실패로 상태를 잃지 않도록 발행·present 보다 먼저 저장한다.
+    sessions.put(rec);
+    await publish(events);
+    const shown = visibleSteps(steps);
+    if (shown.length > 0) await reg.port.present(rec.interactionId, shown);
     return result;
   }
 
@@ -3187,8 +3299,15 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       // 채널이 넘긴 슬롯에서 오는 경우(발신번호·회원번호) 앞서 부르면 필수 슬롯 누락으로 막힌다.
       const drained = await drainConnectors(rec, reg, run, decision);
       const events = drained.events;
-      recordTurns(rec, events);
+      // **이관 턴에서는 여기서 기록하지 않는다**(`send` 와 같은 규칙). 요약은 이번 턴까지
+      // 반영되어야 하므로 `attachSummary` 가 스스로 전문을 기록하는데, 그 전에 한 번 더 기록하면
+      // 같은 발화가 `rec.turns` 에 **두 벌** 쌓인다. 예외는 없고 증상은 상담사 화면에만 나타난다 —
+      // 요약의 "직전 대화"에 같은 줄이 두 번 적히고 턴 수가 2배로 적히며, 그 통화의
+      // §4.1 자동완결 판정(`resolveOutcome`)도 두 벌의 전문을 본다(§2·§13-3).
+      // 첫 턴에 바로 상담사로 가는 시나리오(대표번호 직결·인텐트 `handoffOnly`·커넥터 순회 상한)가
+      // 전부 이 경로다.
       const summaryMasked = rec.state.handoff ? attachSummary(rec, events) : undefined;
+      if (!rec.state.handoff) recordTurns(rec, events);
       rec.ended = rec.state.status !== 'running';
       // 세션 시작에는 확정된 동의가 없다 — 아직 아무것도 묻지 않았다. 다만 **필수인데 지금
       // 미획득인 목적**은 첫 응답부터 드러낸다(그 동안 개인정보 조회가 막힌다는 뜻이다).
@@ -3266,7 +3385,9 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       const ctx = runnerCtx(rec, reg.port.capabilities);
       // 엔진 호출 수를 **턴 전에** 기록한다 — 이 턴에 생긴 실측만 싣기 위한 기준점이다(§11.2).
       const engineCallsBefore = engineCalls;
-      const run = await runTurn(rec, ctx, turn.input, decision);
+      // 턴 단위로 선언된 실측(§13-3 응답시간·§5.1 신뢰도)을 입력에 싣는다 — 선언이 없으면
+      // 종전과 완전히 같다. 이 한 줄이 없는 동안 그 둘은 경계에서 사라졌다(`applyTurnFacts`).
+      const run = await runTurn(rec, ctx, applyTurnFacts(turn), decision);
       rec.state = run.state;
 
       // §11.2 과금 근거는 실측만 싣는다. 커넥터 이행 **전에** 붙인다 —
