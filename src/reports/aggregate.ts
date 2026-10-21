@@ -126,6 +126,29 @@ export interface ReportBucket {
   autoResolvedReContacted: number;
   /** 계약에 없는 이관 사유(§2). 위와 같은 이유로 따로 센다. */
   handoffReasonsUnknown: number;
+  /**
+   * §5.1 되물음 — **봇이 실제로 다시 물은 턴 수**(`retry_count >= 1` 인 봇 턴).
+   *
+   * 왜 세는가: 이 파일은 턴 수와 미인식 비중까지 세면서 **재시도는 한 번도 읽지 않았다**.
+   * 그래서 "한 번에 끝난 통화"와 "세 번 되물은 통화"가 같은 턴 수로 보였고, 재프롬프트
+   * 정책(§5.1)을 켜거나 문안을 고친 뒤 되묻는 횟수가 줄었는지 확인할 실측이 Core 밖에
+   * 없었다 — 원장에는 `retry_count` 가 있는데 읽는 코드가 0줄이었다.
+   */
+  repromptsSent: number;
+  /**
+   * 되물음 뒤에 **고객이 실제로 다시 답한** 턴 수(`retry_count >= 1` 인 고객 턴).
+   * 봇 쪽과 따로 세는 이유: 되묻고 고객이 끊으면 두 수가 벌어진다 — 그 차이가 §5.1
+   * 사다리 조정의 유일한 실측 근거이고, 한 수로 합치면 그 사실이 사라진다.
+   */
+  customerTurnsAfterRetry: number;
+  /** 관측된 최대 재시도 회차. 시나리오의 `maxRetry` 설정과 비교할 수 있는 유일한 실측이다. */
+  maxRetryObserved: number;
+  /**
+   * 쓸 수 없는 `retry_count`(정수 아님·음수·NaN)로 세지 못한 턴 수.
+   * 0 으로도 그대로도 세지 않는다 — `channelsUnknown` 과 같은 이유다(NaN 하나가 최댓값
+   * 비교를 전부 거짓으로 만들고, 그러면 화면에는 "재시도 없음"으로 보인다).
+   */
+  retryValuesRejected: number;
 }
 
 function newBucket(bucket: string): ReportBucket {
@@ -151,6 +174,10 @@ function newBucket(bucket: string): ReportBucket {
     autoResolvedReContactDeclared: 0,
     autoResolvedReContacted: 0,
     handoffReasonsUnknown: 0,
+    repromptsSent: 0,
+    customerTurnsAfterRetry: 0,
+    maxRetryObserved: 0,
+    retryValuesRejected: 0,
   };
 }
 
@@ -227,6 +254,23 @@ function pushLatency(b: ReportBucket, e: InteractionEvent): void {
   if (!any) b.latency.missing += 1;
 }
 
+/**
+ * §5.1 재시도 실측. **없는 것과 쓸 수 없는 것을 가른다**(`duration_ms` 와 같은 규칙):
+ * 필드가 없으면 그 턴은 재시도가 아니었다는 뜻이고(0 과 같다), 정수 아님·음수는 거부로 센다.
+ */
+function pushRetry(b: ReportBucket, t: TurnCompletedEvent): void {
+  const r = t.retry_count;
+  if (r === undefined) return;
+  if (typeof r !== 'number' || !Number.isInteger(r) || r < 0) {
+    b.retryValuesRejected += 1;
+    return;
+  }
+  if (r === 0) return;                       // 명시적 0 은 "재시도 없음" 이다 — 되물음으로 세지 않는다
+  if (t.speaker === 'bot') b.repromptsSent += 1;
+  if (t.speaker === 'customer') b.customerTurnsAfterRetry += 1;
+  if (r > b.maxRetryObserved) b.maxRetryObserved = r;
+}
+
 function accumulate(b: ReportBucket, e: InteractionEvent): void {
   if (!bump(b.channels as unknown as Record<string, number>, e.channel)) b.channelsUnknown += 1;
 
@@ -244,6 +288,7 @@ function accumulate(b: ReportBucket, e: InteractionEvent): void {
       if (t.speaker === 'bot') b.botTurns += 1;
       if (t.intent) b.intents[t.intent] = (b.intents[t.intent] ?? 0) + 1;
       if (t.pii_masked) b.turnsWithPiiMasked += 1;
+      pushRetry(b, t);
       pushLatency(b, t);
       break;
     }
@@ -398,6 +443,31 @@ export function latencyReport(b: ReportBucket): LatencyReport {
   };
 }
 
+/**
+ * §5.1 되물음 실태. **비율을 만들지 않는다**(§13-3) — "되물음률"의 분모를 무엇으로 둘지는
+ * 정의 문제이고(턴·세션·실패 턴 중 어느 것?) 근거 없이 고르면 그 숫자가 곧 대외 수치가 된다.
+ * 건수와 최댓값만 그대로 올린다.
+ */
+export interface RepromptReport {
+  /** 봇이 실제로 다시 물은 턴 수. */
+  sent: number;
+  /** 되물음 뒤 고객이 다시 답한 턴 수. `sent` 와 벌어진 만큼이 되묻고 끊긴 통화다. */
+  customerTurnsAfterRetry: number;
+  /** 관측된 최대 재시도 회차. 시나리오 `maxRetry` 와 비교할 유일한 실측이다. */
+  maxObserved: number;
+  /** 쓸 수 없는 `retry_count` 로 세지 못한 턴 수. 0 과 구분된다. */
+  rejected: number;
+}
+
+export function repromptReport(b: ReportBucket): RepromptReport {
+  return {
+    sent: b.repromptsSent,
+    customerTurnsAfterRetry: b.customerTurnsAfterRetry,
+    maxObserved: b.maxRetryObserved,
+    rejected: b.retryValuesRejected,
+  };
+}
+
 export interface IntentCount { intent: string; count: number }
 
 /** 빈도 내림차순, 동률은 이름 오름차순(리포트 재생성 시 순서가 흔들리지 않게). */
@@ -467,6 +537,8 @@ export interface Completeness {
   endedMinusStarted: number;
   sessionsMissingDuration: number;
   turnsMissingLatency: number;
+  /** 쓸 수 없는 `retry_count` 로 §5.1 재시도 집계에서 빠진 턴 수. */
+  turnsRetryRejected: number;
 }
 
 export function completeness(b: ReportBucket): Completeness {
@@ -476,5 +548,6 @@ export function completeness(b: ReportBucket): Completeness {
     endedMinusStarted: b.sessionsEnded - b.sessionsStarted,
     sessionsMissingDuration: b.sessionsMissingDuration,
     turnsMissingLatency: b.latency.missing,
+    turnsRetryRejected: b.retryValuesRejected,
   };
 }

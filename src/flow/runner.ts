@@ -250,6 +250,12 @@ export interface IntentTurnInput {
 /**
  * 인텐트 진입 턴의 고객 발화 이벤트. **한 곳에서만 만든다** — 두 곳에서 만들면 한쪽이
  * `intent` 를 빠뜨리고, 그 차이는 예외가 아니라 §7 인텐트 분포 통계의 구멍으로만 나타난다.
+ *
+ * `retryCount` 는 **다른 두 자리(`runTurn`·`knowledgeTurn`)와 같은 규칙**으로 싣는다(§5.1·§2).
+ * 여기만 빠져 있던 동안, 미인식으로 한 번 되묻고 나서 확정된 인텐트 턴은 원장에서
+ * **첫 시도에 확정된 턴과 구분되지 않았다** — 즉 인텐트 구간의 재시도는 언제나 0 으로 보였고,
+ * 되묻는 횟수를 줄였는지 늘렸는지 판단할 실측이 §8.1 어디에도 없었다. 예외도 품질 저하도
+ * 아니라 **지표의 구멍**이라, 드러나는 경로가 없다.
  */
 function intentCustomerTurn(s: FlowState, ctx: RunnerContext, events: InteractionEvent[], t: IntentTurnInput): void {
   const nodeId = s.currentNodeId;
@@ -260,6 +266,9 @@ function intentCustomerTurn(s: FlowState, ctx: RunnerContext, events: Interactio
     ...(nodeId !== null ? { nodeId } : {}),
     ...(t.intent !== undefined ? { intent: t.intent } : {}),
     ...(t.confidence !== undefined ? { confidence: t.confidence } : {}),
+    // 실패 카운트는 **초기화 전에** 읽는다(`switchFlow` 는 바로 뒤에서 0 으로 되돌린다) —
+    // 이 턴이 몇 번째 시도였는지는 지금 이 값에만 남아 있다.
+    ...(s.failCount > 0 ? { retryCount: s.failCount } : {}),
     latency: inputLatency(t.input),
   }));
 }

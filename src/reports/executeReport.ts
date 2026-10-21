@@ -28,9 +28,11 @@ import type { PeriodProjection } from '../events/periodLedger.ts';
 import { assertTenantScope } from '../core/tenancy.ts';
 import type {
   Completeness, IntentCount, LatencyReport, OutcomeRates, Ratio, ReportGranularity, ReportSummary,
+  RepromptReport,
 } from './aggregate.ts';
 import {
-  aggregateReport, completeness, handoffRate, latencyReport, outcomeRates, topIntents, unrecognizedRate,
+  aggregateReport, completeness, handoffRate, latencyReport, outcomeRates, repromptReport, topIntents,
+  unrecognizedRate,
 } from './aggregate.ts';
 
 export const REPORT_RUN_CONTRACT_VERSION = 1;
@@ -71,6 +73,12 @@ export interface ReportRunResult {
   outcomes: OutcomeRates;
   handoff: Ratio;
   unrecognized: Ratio;
+  /**
+   * §5.1 되물음 실태. **미인식률 옆에 둔다** — 둘은 같은 화면에서 읽어야 하는 한 쌍이다.
+   * 미인식률만 보면 "고객이 이상하게 말한다"로 읽히고, 되물음 건수가 함께 있어야 "되묻고
+   * 나면 되는가"를 알 수 있다(그 둘의 대응이 §5.1 사다리·문안 조정의 유일한 근거다).
+   */
+  reprompt: RepromptReport;
   completeness: Completeness;
   topIntents: IntentCount[];
 }
@@ -112,6 +120,12 @@ export function runReport(p: ReportRunParams): ReportRunResult {
   }
   if (c.eventsRejected > 0) {
     incompletenessKo.push(`event_id 없는 이벤트 ${c.eventsRejected}건을 제외했습니다 (설계서 §8.1)`);
+  }
+  if (summary.total.retryValuesRejected > 0) {
+    incompletenessKo.push(
+      `쓸 수 없는 재시도 회차(retry_count)로 §5.1 되물음 집계에서 제외한 턴 ${summary.total.retryValuesRejected}건이 ` +
+      '있습니다 — 0 으로 세지 않으므로 되물음 건수는 그만큼 작게 적혀 있습니다 (설계서 §8.1·§13-3)',
+    );
   }
   if (summary.timestampsRejected > 0) {
     incompletenessKo.push(
@@ -185,6 +199,7 @@ export function runReport(p: ReportRunParams): ReportRunResult {
     outcomes: rates,
     handoff: handoffRate(total),
     unrecognized: unrecognizedRate(total),
+    reprompt: repromptReport(total),
     completeness: completeness(total),
     ...(p.topIntentLimit !== undefined
       ? { topIntents: topIntents(total, p.topIntentLimit) }
