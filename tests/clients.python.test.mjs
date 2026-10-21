@@ -498,3 +498,113 @@ c.close(); c2.close()
   // Core 가 사실을 되돌려 준다(참조 Core 픽스처는 billing 을 만들지 않으므로 ok 만 확인한다).
   assert.ok(out.with_result);
 });
+
+// ── 유지 루프(§9.3·§2) ───────────────────────────────────────────────────────
+// Core 는 타이머를 돌리지 않으므로 만료 수렴·복구 확인·readiness·상담사 응답은 **호스트가
+// 부른다**. 브리지에 그 자리가 없던 동안 비-Node 호스트에는 부를 길이 아예 없었고, 증상은
+// 전부 조용했다: 만료 오퍼가 열린 채 쌓이고, 한 번 내려간 폴백이 영구히 풀리지 않고,
+// `/health` 는 모든 통화가 상담사 직결로 떨어진 순간에도 초록이었다.
+
+const MAINTAINED_PRELUDE = `# -*- coding: utf-8 -*-
+import json, os, sys
+sys.path.insert(0, ${JSON.stringify(CLIENT_DIR)})
+from aicc_bridge import BridgeClient
+ROOT = ${JSON.stringify(ROOT)}
+CORE = os.path.join(ROOT, "fixtures", "reference-core-maintained.mjs")
+def client(**kw):
+    return BridgeClient(core_module=CORE, adapter="callbot", core_root=ROOT, cwd=ROOT,
+                        max_line_bytes=65536, keep_transcript=True, **kw)
+`;
+
+test('파이썬 호스트가 유지 루프 다섯 개를 실제로 부른다 — 종전에는 부를 op 가 없었다', b, () => {
+  const source = `${MAINTAINED_PRELUDE}
+c = client()
+c.hello()
+out = {
+    "ops": list(c.maintenance_ops()),
+    "warnings": c.warnings().ok,
+    "readiness": c.readiness().result,
+    "recovery": c.run_recovery_probe().result,
+    "expiry": c.run_offer_expiry().result,
+}
+json.dump(out, sys.stdout, ensure_ascii=False)
+c.close()
+`;
+  const run = withDriver(source, (f) => runPython(f));
+  assert.equal(run.status, 0, run.stderr);
+  const out = JSON.parse(run.stdout);
+  assert.deepEqual(
+    out.ops.slice().sort(),
+    ['offerExpiry', 'readiness', 'recoveryProbe', 'settleOffer', 'warnings'],
+    'hello 가 열린 유지 op 를 알려주지 않으면 호스트는 아무것도 부르지 않는다',
+  );
+  assert.equal(out.warnings, true);
+  assert.ok(out.readiness.status, 'readiness 판정이 없다');
+  assert.ok(out.readiness.core, '§9.3 사실이 없으면 호스트 프로브와 다를 바 없다');
+  assert.ok(Array.isArray(out.recovery.attempts));
+  assert.equal(out.expiry.expired, 0);
+  assert.deepEqual(out.expiry.issues, []);
+});
+
+test('파이썬 호스트가 상담사 수락을 올리고 §9.3 전이가 돌아온다', b, () => {
+  const source = `${MAINTAINED_PRELUDE}
+c = client()
+c.hello()
+started = c.start(flow_id="f_reference_voice", entry_point="inbound_call")
+iid = started.interaction_id
+turned = c.send_utterance(iid, "상담사 연결해 주세요")
+placement = (turned.result or {}).get("handoff", {}).get("placement")
+# 오퍼 id 는 브리지가 돌려주지 않는다 — 상담사 데스크톱이 가진 값이다. 여기서는 예시 생성기의
+# 규칙(o_reference_1)을 그대로 쓴다. 모르는 id 는 거절로 돌아오는 것이 정상이다.
+settled = c.settle_offer("o_reference_1", "accept")
+unknown = c.settle_offer("o_reference_없음", "accept")
+bad = c.settle_offer("o_reference_1", "tick")
+json.dump({
+    "placement": placement,
+    "settled": settled.result, "settled_ok": settled.ok,
+    "unknown_code": (unknown.result or {}).get("code"),
+    "bad_ok": bad.ok, "bad_code": bad.error.code if bad.error else None,
+}, sys.stdout, ensure_ascii=False)
+c.close()
+`;
+  const run = withDriver(source, (f) => runPython(f));
+  assert.equal(run.status, 0, run.stderr);
+  const out = JSON.parse(run.stdout);
+  assert.equal(out.placement?.placement, 'queued', '큐에 들어가지 않았다 — 이 검사의 전제가 깨졌다');
+  assert.equal(out.settled_ok, true);
+  assert.equal(out.settled.code, 'assigned');
+  assert.equal(out.settled.via, 'settle');
+  assert.equal(out.settled.ledger, undefined, '원장 전체가 응답에 실리면 한 줄 상한에 걸린다');
+  // 없는 오퍼는 예외가 아니라 판정이다 — 통화를 깨지 않는다.
+  assert.equal(out.unknown_code, 'refused');
+  // tick 은 만료 수렴의 수단이라 받지 않는다(§2).
+  assert.equal(out.bad_ok, false);
+  assert.equal(out.bad_code, 'E_BAD_REQUEST');
+});
+
+test('유지 루프를 열지 않은 Core 에서는 조용한 0건이 아니라 E_NOT_WIRED 다(실패 경로)', b, () => {
+  const source = `${PRELUDE}
+c = client()
+c.hello()
+out = {"ops": list(c.maintenance_ops())}
+for name, res in (("warnings", c.warnings()), ("readiness", c.readiness()),
+                  ("recovery", c.run_recovery_probe()), ("expiry", c.run_offer_expiry()),
+                  ("settle", c.settle_offer("o_1", "accept"))):
+    out[name] = {"ok": res.ok, "code": res.error.code if res.error else None, "result": res.result}
+json.dump(out, sys.stdout, ensure_ascii=False)
+c.close()
+`;
+  const run = withDriver(source, (f) => runPython(f));
+  assert.equal(run.status, 0, run.stderr);
+  const out = JSON.parse(run.stdout);
+  assert.deepEqual(out.ops, [], '열지 않은 op 를 열렸다고 알려주면 호스트가 돌고 있다고 믿는다');
+  for (const name of ['warnings', 'readiness', 'recovery', 'expiry', 'settle']) {
+    assert.equal(out[name].ok, false, `${name} 가 배선 없이 통과했다`);
+    assert.equal(out[name].code, 'E_NOT_WIRED', `${name}: ${JSON.stringify(out[name])}`);
+    // 파이썬 쪽에서 `None` 이 되어 null 로 직렬화된다 — 어느 쪽이든 **본문이 없다**는 뜻이다.
+    assert.ok(
+      out[name].result === null || out[name].result === undefined,
+      `${name} 가 "0건"으로 읽힐 본문을 돌려줬다: ${JSON.stringify(out[name].result)}`,
+    );
+  }
+});

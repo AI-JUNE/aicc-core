@@ -12,6 +12,9 @@
 // `observability`(로거·수집기 배선)도 같다 — 내놓지 않으면 **경계 실패가 이 프로세스 밖에서
 // 보이지 않는다**(깨진 줄·모르는 op·한도 초과는 Core 를 부르기 전에 끝나므로 Core 로그는 조용하다).
 // 런타임(`createConversationCore`)에 넘긴 배선 객체를 **그대로** 함께 내놓으면 된다.
+// `maintenance`(유지 루프 — readiness·복구 프로브·오퍼 만료·상담사 응답·계약 경고)도 같다.
+// Core 는 타이머를 돌리지 않으므로 그 다섯은 **호스트가 불러야** 하는데, 내놓지 않으면
+// 비-Node 호스트에는 부를 길이 없다. 무엇이 열렸는지는 `hello` 의 `maintenanceOps` 에 나온다.
 //
 // 프로토콜(한 줄 = 한 요청):
 //   → {"id":"1","op":"hello"}
@@ -104,6 +107,11 @@ try {
     // 로그 sink 를 **표준출력에 쓰면 프로토콜이 깨진다** — 응답 줄과 로그 줄이 섞여 호스트의
     // 파서가 죽는다. 표준오류·파일·수집기로 보낸다(`fixtures/reference-core-observed.mjs`).
     ...(built.observability !== undefined ? { observability: built.observability } : {}),
+    // 유지 루프(§9.3·§2)도 모듈에서 온다 — 프로브·제한 시간은 함수·운영값이라 JSONL 로 건널 수
+    // 없다. 내놓지 않으면 그 op 들은 `E_NOT_WIRED` 로 거절되고 종전과 완전히 같다. 내놓지 않은
+    // 채로 운영하면 비-Node 호스트에서는 **만료 수렴·복구 확인이 한 번도 돌지 않는다**
+    // (Core 는 타이머를 돌리지 않는다) — `hello` 의 `maintenanceOps` 가 그 사실을 드러낸다.
+    ...(built.maintenance !== undefined ? { maintenance: built.maintenance } : {}),
   });
 } catch (e) {
   console.error(`브리지 설정 오류: ${e instanceof Error ? e.message : String(e)}`);

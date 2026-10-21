@@ -38,16 +38,21 @@ import type { TenantScope } from '../core/tenancy.ts';
 import { assertTenantScope } from '../core/tenancy.ts';
 import type { FlowInput } from '../flow/runner.ts';
 import type { EntryPoint, LatencyMs, UsageMetrics } from '../events/schema.ts';
+import { ENTRY_POINTS, LATENCY_KEYS, USAGE_METRIC_KEYS } from '../events/schema.ts';
 import type { HealthSample, ComponentId } from '../ops/fallback.ts';
 import type { ClosedAction } from '../routing/agentQueue.ts';
 import type {
   AlternativeCause, HandoffPlacement, HandoffUnavailableCode,
 } from '../routing/executeHandoff.ts';
 import type {
-  ChannelAdapterId, ChannelCapabilities, ChannelSessionRequest, ChannelTurnInput,
-  ChannelTurnResult, ConversationCorePort,
+  BridgeOp, ChannelAdapterId, ChannelCapabilities, ChannelSessionRequest, ChannelTurnInput,
+  ChannelTurnResult, ContractIssue, ConversationCorePort,
 } from './contract.ts';
-import { CHANNEL_CONTRACT_VERSION } from './contract.ts';
+import { BRIDGE_MAINTENANCE_OPS, BRIDGE_OPS, CHANNEL_CONTRACT_VERSION } from './contract.ts';
+import type { AgentOfferStep, OfferExpiryReport, ReadinessRequest } from './runtime.ts';
+import type { OfferEvent } from '../routing/agentQueue.ts';
+import type { RecoveryRunReport } from '../ops/recoveryProbe.ts';
+import type { CoreReadinessReport } from '../ops/executeHealth.ts';
 import { profileFor } from './profiles.ts';
 import type { ChannelActivation } from './basePort.ts';
 import type { RateLimiter } from '../api/rateLimit.ts';
@@ -58,9 +63,9 @@ import { createObserver } from '../obs/executeObservability.ts';
 /** 프로토콜 버전. 호스트는 hello 응답에서 이 값을 보고 자기 구현과 맞는지 판단한다. */
 export const BRIDGE_PROTOCOL_VERSION = 1;
 
-export type BridgeOp = 'hello' | 'start' | 'send' | 'end' | 'health';
-
-const BRIDGE_OPS: ReadonlySet<string> = new Set<BridgeOp>(['hello', 'start', 'send', 'end', 'health']);
+// op 목록은 채널 계약(`contract.ts`) 하나다 — 전사 판정기·관측 분류기도 같은 목록을 본다.
+export type { BridgeOp } from './contract.ts';
+const BRIDGE_OP_SET: ReadonlySet<string> = new Set<string>(BRIDGE_OPS);
 
 export type BridgeErrorCode =
   | 'E_BAD_JSON'       // 줄이 JSON 이 아니다
@@ -69,6 +74,12 @@ export type BridgeErrorCode =
   | 'E_UNKNOWN_OP'     // 모르는 op
   | 'E_TENANT_SCOPE'   // 호스트가 다른 테넌트를 주장했다(§11.1)
   | 'E_RATE_LIMITED'   // 한도 초과 — 재시도 가능 시각을 함께 준다(§9.3·§11.2)
+  /**
+   * 그 유지 루프가 **배선되지 않았다**(§13-3). 빈 보고서를 돌려주지 않는 이유와 같다 —
+   * `{"expired":0}` 은 "만료 0건"으로 읽히고, 그 호스트는 수렴이 **한 번도 돈 적 없다는 사실**을
+   * 모른 채 운영한다. 배선 없음은 실패로 적는다.
+   */
+  | 'E_NOT_WIRED'
   | 'E_INTERNAL';      // Core 실행 중 예외 — 원문·스택을 노출하지 않는다
 
 export interface BridgeError {
@@ -78,7 +89,11 @@ export interface BridgeError {
   retryAfterMs?: number;
 }
 
-/** 한도 적용 대상 op. `hello`(버전 협상)와 `end`(세션 정리)는 **절대 막지 않는다** — end 가 막히면 세션이 새고 요금으로 나타난다. */
+/**
+ * 한도 적용 대상 op. `hello`(버전 협상)와 `end`(세션 정리)는 **절대 막지 않는다** —
+ * end 가 막히면 세션이 새고 요금으로 나타난다. 유지 루프(`BRIDGE_MAINTENANCE_OPS`)도
+ * 막지 않는다(그 목록 주석 참조).
+ */
 export const RATE_LIMITED_OPS: ReadonlySet<BridgeOp> = new Set<BridgeOp>(['start', 'send', 'health']);
 
 export interface BridgeResponse {
@@ -252,6 +267,67 @@ export interface BridgeOptions {
    * 관측기는 둘이지만 로거·수집기가 하나라 중복 억제·창 상한이 같은 기준으로 돈다.
    */
   observability?: ObservabilityBinding;
+  /**
+   * 유지 루프 배선(§9.3·§2). **주지 않으면 그 op 는 `E_NOT_WIRED` 로 거절된다** —
+   * 빈 보고서를 돌려주면 호스트는 "0건"으로 읽고, 수렴이 한 번도 돈 적 없다는 사실을 모른다.
+   *
+   * 왜 자리가 필요한가: `ConversationCore` 의 유지 메서드(`runOfferExpiry`·`runRecoveryProbes`·
+   * `readiness`·`settleAgentOffer`·`warnings`)는 **Core 가 타이머를 돌리지 않으므로** 호스트가
+   * 부른다. 그런데 비-Node 호스트가 Core 에 닿는 길은 이 브리지뿐이고 브리지에는 그 자리가
+   * 없었다 — 즉 파이썬으로 Callbot 을 운영하는 배치에서는 **그 다섯 개를 부를 방법이 아예
+   * 없었다**. 증상은 전부 조용하다: 만료된 오퍼가 열린 채 쌓여 같은 콜이 두 번 제안되고,
+   * 한 번 `degraded_ai` 로 내려간 테넌트는 엔진이 돌아와도 **영구히** 폴백에 남고(아무도 찌르지
+   * 않으므로 헬스 샘플이 갱신되지 않는다), `/health` 는 §9.3 상태 없이 초록이고, 상담사의
+   * 수락·거절은 원장에 도착하지 않아 재배정도 소진 수렴도 일어나지 않는다.
+   */
+  maintenance?: BridgeMaintenanceBinding;
+}
+
+/**
+ * 유지 루프의 **함수 인자**는 JSONL 을 건널 수 없다(프로브·시계·스케줄러). 그래서 Node 쪽
+ * 배선이 준다 — 호스트가 줄마다 다시 선언하게 두면 같은 `/health` 가 호출마다 다른 기준으로
+ * 판정되고(§2), 시각을 호스트가 주면 **틀린 시계 하나가 열린 오퍼를 전부 만료시킨다**.
+ * 그래서 이 브리지의 유지 op 는 본문에서 판정 기준을 받지 않는다(`settleOffer` 의 상담사
+ * 응답만 예외다 — 그것은 기준이 아니라 사실이다).
+ */
+export interface BridgeMaintenanceBinding {
+  /**
+   * `core.readiness(req)` 에 넘길 요청. 호스트 프로브·제한 시간·빌드 정보는 운영 합의값이라
+   * Core 가 기본값을 만들지 않는다(§13-3) — 주지 않으면 `readiness` op 가 거절된다.
+   */
+  readiness?: ReadinessRequest;
+  /**
+   * `recoveryProbe`·`offerExpiry`·`settleOffer`·`warnings` 를 열지 여부. Core 쪽 배선이 없으면
+   * 메서드가 `undefined` 를 돌려주므로 그때도 거절한다 — **켰다고 적힌 op 가 0건을 돌려주는
+   * 상태를 만들지 않는다**. 기본값은 모두 닫힘이다(종전과 완전히 같다).
+   */
+  recoveryProbe?: boolean;
+  offerExpiry?: boolean;
+  settleOffer?: boolean;
+  warnings?: boolean;
+}
+
+/**
+ * 브리지가 부르는 유지 메서드. `ConversationCorePort` 에는 없고 `ConversationCore` 에만 있으므로
+ * **선택**으로 받는다 — 포트만 주는 호스트(적합성 더미 등)는 종전과 완전히 같다.
+ */
+type MaintenanceCapableCore = ConversationCorePort & {
+  warnings?(): ContractIssue[];
+  readiness?(req: ReadinessRequest): Promise<CoreReadinessReport>;
+  runRecoveryProbes?(nowIso?: string): Promise<RecoveryRunReport | undefined>;
+  runOfferExpiry?(nowIso?: string): Promise<OfferExpiryReport | undefined>;
+  settleAgentOffer?(p: { offerId: string; event: OfferEvent; nowIso?: string }): Promise<AgentOfferStep | undefined>;
+};
+
+const OFFER_EVENTS: ReadonlySet<string> = new Set<OfferEvent>(['accept', 'decline', 'cancel', 'tick']);
+
+/**
+ * 와이어로 나갈 값의 복사. **JSON 왕복이 곧 경계다** — 호스트가 결과 객체를 손에 쥐고
+ * `recovered.push(...)`·`issues.sort(...)` 로 Core 의 판정을 고치는 길을 막고(직렬화 전까지
+ * 가능하다, 동의·점검·이관 투영과 같은 규칙), 직렬화할 수 없는 값이 섞였는지도 여기서 드러난다.
+ */
+function wireCopy<T>(v: T): T {
+  return JSON.parse(JSON.stringify(v)) as T;
 }
 
 export class BridgeConfigError extends Error {
@@ -322,15 +398,14 @@ function numberMap(v: unknown, allowed: ReadonlySet<string>): Record<string, num
   return out;
 }
 
-const LATENCY_KEYS: ReadonlySet<string> = new Set(['stt_ms', 'llm_ttft_ms', 'tts_ttfb_ms', 'total_ms']);
-const USAGE_KEYS: ReadonlySet<string> = new Set([
-  'llm_prompt_tokens', 'llm_completion_tokens', 'stt_audio_ms', 'tts_audio_ms',
-]);
+// 허용 키·허용값은 **여기서 선언하지 않는다** — §8.1 타입 옆의 목록에서 파생시킨다.
+// 손으로 적어 두었던 동안 이 세 줄은 타입과 어긋날 수 있는 세 곳이었고, 어긋남의 증상은
+// 전부 "비-Node 호스트에서만 거부된다"였다(`LATENCY_KEYS`·`USAGE_METRIC_KEYS`·`ENTRY_POINTS` 주석).
+const LATENCY_KEY_SET: ReadonlySet<string> = new Set<string>(LATENCY_KEYS);
+const USAGE_KEY_SET: ReadonlySet<string> = new Set<string>(USAGE_METRIC_KEYS);
 const HEALTH_STATES: ReadonlySet<string> = new Set(['up', 'degraded', 'down', 'unknown']);
 
-const ENTRY_POINTS: ReadonlySet<string> = new Set<EntryPoint>([
-  'inbound_call', 'outbound_call', 'visual_link', 'web_chat', 'app_chat',
-]);
+const ENTRY_POINT_SET: ReadonlySet<string> = new Set<string>(ENTRY_POINTS);
 
 class RequestError extends Error {
   readonly code: BridgeErrorCode;
@@ -366,7 +441,7 @@ export function parseBridgeLine(line: string, maxLineBytes?: number): { id: stri
   if (!isPlainObject(parsed)) throw new RequestError('E_BAD_REQUEST', '요청은 JSON 객체여야 합니다.');
   const id = typeof parsed.id === 'string' && parsed.id !== '' ? parsed.id : null;
   const op = parsed.op;
-  if (typeof op !== 'string' || !BRIDGE_OPS.has(op)) {
+  if (typeof op !== 'string' || !BRIDGE_OP_SET.has(op)) {
     const e = new RequestError('E_UNKNOWN_OP', `알 수 없는 op 입니다: ${typeof op === 'string' ? maskPii(op).text : typeof op}`);
     (e as RequestError & { id?: string | null }).id = id;
     throw e;
@@ -385,7 +460,7 @@ function toSessionRequest(body: Record<string, unknown>, opts: BridgeOptions): C
     throw new RequestError('E_TENANT_SCOPE', '요청이 브리지 설정과 다른 테넌트를 주장했습니다. 스코프는 호스트가 정하지 않습니다.');
   }
   if (!nonEmptyString(req.flowId)) bad('flowId 가 없습니다.');
-  if (!nonEmptyString(req.entryPoint) || !ENTRY_POINTS.has(req.entryPoint)) {
+  if (!nonEmptyString(req.entryPoint) || !ENTRY_POINT_SET.has(req.entryPoint)) {
     bad(`entryPoint 가 유효하지 않습니다: ${String(req.entryPoint)}`);
   }
   if (req.flowVersion !== undefined && (typeof req.flowVersion !== 'number' || !Number.isInteger(req.flowVersion) || req.flowVersion < 1)) {
@@ -467,10 +542,10 @@ function toFlowInput(v: unknown): FlowInput {
 function toTurnInput(body: Record<string, unknown>): ChannelTurnInput {
   const turn = isPlainObject(body.turn) ? body.turn : bad('send 에는 turn 객체가 필요합니다.');
   const out: ChannelTurnInput = { input: toFlowInput(turn.input) };
-  const latency = numberMap(turn.latency, LATENCY_KEYS);
+  const latency = numberMap(turn.latency, LATENCY_KEY_SET);
   if (latency === 'invalid') bad('latency 는 알려진 키의 음이 아닌 유한 숫자여야 합니다.');
   if (latency) out.latency = latency as LatencyMs;
-  const usage = numberMap(turn.usage, USAGE_KEYS);
+  const usage = numberMap(turn.usage, USAGE_KEY_SET);
   if (usage === 'invalid') bad('usage 는 알려진 키의 음이 아닌 유한 숫자여야 합니다(§11.2).');
   if (usage) out.usage = usage as UsageMetrics;
   if (turn.confidence !== undefined) {
@@ -559,6 +634,44 @@ function projectPlacement(p: HandoffPlacement): BridgePlacementPayload {
     overflowed: p.overflowed,
     ...(p.matchedRuleId !== undefined ? { matchedRuleId: p.matchedRuleId } : {}),
   };
+}
+
+/**
+ * 오퍼 전이의 전송용 투영.
+ *
+ * **원장(`step.ledger`)을 싣지 않는다.** 두 가지 이유다 — (1) 그 안에는 같은 테넌트의 **다른
+ * 상호작용** 오퍼가 전부 들어 있고, 채널 호스트가 알아야 하는 것은 이번 건의 결과뿐이다
+ * (§11.1 의 격리는 테넌트 경계지만, 필요 없는 것을 내보내지 않는 것은 그와 별개의 규칙이다),
+ * (2) 통화가 많은 시각에는 그 배열이 매 응답마다 커진다 — 한 줄 상한(`maxLineBytes`)에
+ * 걸리는 순간 **수락 응답이 거부로 바뀐다**.
+ *
+ * 배열은 복사한다(`skipped`·`issues`·`warnings`) — 호스트가 "제외된 상담사 없음"으로 고칠 수
+ * 있게 두면 그 거짓이 "Core 가 그렇게 적었다"로 남는다(이관·동의 투영과 같은 규칙).
+ */
+function projectOfferStep(step: AgentOfferStep): Record<string, unknown> {
+  const out: Record<string, unknown> = {
+    code: step.code,
+    via: step.via,
+    interactionId: step.interactionId,
+    reasonKo: step.reasonKo,
+    skipped: [...step.skipped],
+    issues: [...step.issues],
+    warnings: [...step.warnings],
+  };
+  if (step.attempt !== undefined) out.attempt = step.attempt;
+  // 상담사 id·오퍼 id 는 호스트가 선언한 값이므로 되돌려준다(Core 가 만든 값이 아니다).
+  if (step.offer !== undefined) {
+    out.offer = {
+      offerId: step.offer.offerId,
+      queueId: step.offer.queueId,
+      agentId: step.offer.agentId,
+      state: step.offer.state,
+      offeredAt: step.offer.offeredAt,
+      attempt: step.offer.attempt,
+    };
+  }
+  if (step.placement !== undefined) out.placement = projectPlacement(step.placement);
+  return out;
 }
 
 function projectTurn(r: ChannelTurnResult, opts: BridgeOptions): BridgeTurnPayload {
@@ -660,7 +773,17 @@ export function createBridge(opts: BridgeOptions): Bridge {
   }
   if (opts.rateLimitCost) {
     for (const [op, cost] of Object.entries(opts.rateLimitCost)) {
-      if (!BRIDGE_OPS.has(op)) throw new BridgeConfigError(`rateLimitCost 에 모르는 op 가 있습니다: ${op}`);
+      if (!BRIDGE_OP_SET.has(op)) throw new BridgeConfigError(`rateLimitCost 에 모르는 op 가 있습니다: ${op}`);
+      // **제한 대상이 아닌 op 에 비용을 주면 거절한다.** 종전에는 조용히 무시했다 —
+      // 같은 실수를 런타임(`RATE_LIMITED_ENTRIES`)은 거절하고 브리지는 통과시켰으므로,
+      // `{ end: 10 }` 같은 설정은 경로에 따라 "거절"과 "적용했다고 믿는 무제한"으로 갈렸다(§2).
+      // 조용히 무시하는 쪽이 더 나쁘다: 한도를 걸었다고 적힌 운영 문서만 남는다.
+      if (!RATE_LIMITED_OPS.has(op as BridgeOp)) {
+        throw new BridgeConfigError(
+          `rateLimitCost.${op} 는 한도 적용 대상이 아닙니다 — 적용 대상은 `
+          + `${[...RATE_LIMITED_OPS].join('·')} 입니다(hello·end·유지 루프는 막지 않습니다).`,
+        );
+      }
       if (typeof cost !== 'number' || !Number.isFinite(cost) || cost <= 0) {
         throw new BridgeConfigError(`rateLimitCost.${op} 는 양수여야 합니다.`);
       }
@@ -711,6 +834,57 @@ export function createBridge(opts: BridgeOptions): Bridge {
     return span.returned ? 'response' : 'core';
   }
 
+  const maintCore = opts.core as MaintenanceCapableCore;
+
+  /** op 별 배선 스위치. 선언이 없으면 닫힘이다 — 기본으로 열면 종전 동작이 조용히 바뀐다(§13-3). */
+  function maintenanceSwitch(op: BridgeOp): boolean {
+    const m = opts.maintenance;
+    if (m === undefined) return false;
+    switch (op) {
+      case 'warnings': return m.warnings === true;
+      case 'readiness': return m.readiness !== undefined;
+      case 'recoveryProbe': return m.recoveryProbe === true;
+      case 'offerExpiry': return m.offerExpiry === true;
+      case 'settleOffer': return m.settleOffer === true;
+      default: return false;
+    }
+  }
+
+  /** Core 쪽 메서드까지 있는지 — `hello` 가 알려주는 것은 **실제로 부를 수 있는 것**이다. */
+  function maintenanceOpen(op: BridgeOp): boolean {
+    if (!maintenanceSwitch(op)) return false;
+    switch (op) {
+      case 'warnings': return typeof maintCore.warnings === 'function';
+      case 'readiness': return typeof maintCore.readiness === 'function';
+      case 'recoveryProbe': return typeof maintCore.runRecoveryProbes === 'function';
+      case 'offerExpiry': return typeof maintCore.runOfferExpiry === 'function';
+      case 'settleOffer': return typeof maintCore.settleAgentOffer === 'function';
+      default: return false;
+    }
+  }
+
+  function notWired(op: BridgeOp, reasonKo: string): never {
+    throw new RequestError('E_NOT_WIRED', `${op} 가 열려 있지 않습니다: ${reasonKo}`);
+  }
+
+  /**
+   * 배선 스위치와 Core 메서드를 **부르기 전에** 함께 확인한다(stage=request). 둘을 따로 보면
+   * 스위치만 켠 배치에서 `TypeError` 가 `E_INTERNAL` 로 올라가고, 그 줄은 수집기에 "Core 예외"로
+   * 남아 설정 누락이 장애로 보인다.
+   */
+  function requireMaintenance(
+    op: BridgeOp,
+    pick: (c: MaintenanceCapableCore) => unknown,
+  ): MaintenanceCapableCore {
+    if (!maintenanceSwitch(op)) {
+      notWired(op, '브리지 설정(maintenance)에 선언되지 않았습니다.');
+    }
+    if (typeof pick(maintCore) !== 'function') {
+      notWired(op, 'Core 가 이 유지 메서드를 제공하지 않습니다(ConversationCorePort 만 주어졌습니다).');
+    }
+    return maintCore;
+  }
+
   async function dispatch(op: BridgeOp, body: Record<string, unknown>, span: CoreSpan): Promise<unknown> {
     switch (op) {
       case 'hello':
@@ -723,6 +897,12 @@ export function createBridge(opts: BridgeOptions): Bridge {
           activation,
           includesHandoffSummary: opts.includeHandoffSummary === true,
           includesSlots: opts.includeSlots === true,
+          /**
+           * **열려 있는 유지 루프를 알려준다.** 호스트가 op 를 하나씩 찔러 보고 알아내게 두면
+           * 세 저장소가 각자 다르게 알아내고(§2), 더 나쁜 것은 **아무도 찔러 보지 않는 것**이다 —
+           * 그러면 그 배치는 만료 수렴·복구 확인이 돌지 않는 채로 조용히 운영된다.
+           */
+          maintenanceOps: BRIDGE_MAINTENANCE_OPS.filter((o) => maintenanceOpen(o)),
         };
       case 'start': {
         // 요청 해석은 **부르기 전에** 끝낸다 — 해석 실패는 Core 가 본 적 없는 줄이다(stage=request).
@@ -761,6 +941,67 @@ export function createBridge(opts: BridgeOptions): Bridge {
         opts.core.reportHealth({ adapter: opts.adapter, samples, observedAt });
         span.returned = true;
         return { accepted: samples.length };
+      }
+
+      // ── 유지 루프(§9.3·§2) ─────────────────────────────────────────────────
+      // 공통 규칙 셋이다:
+      //  (1) **배선이 없으면 거절한다**(`E_NOT_WIRED`) — 빈 보고서는 "0건"으로 읽힌다.
+      //  (2) **판정 기준을 본문에서 받지 않는다** — 시각·제한 시간·프로브는 Node 쪽 배선이 준다.
+      //  (3) **Core 가 `undefined` 를 돌려주면 그것도 거절이다** — Core 쪽 배선이 없다는 뜻이고,
+      //      브리지만 열려 있는 상태를 "확인했고 0건"으로 적으면 안 된다.
+      case 'warnings': {
+        const core = requireMaintenance('warnings', (c) => c.warnings);
+        span.entered = true;
+        const issues = core.warnings!();
+        span.returned = true;
+        // 전문은 호스트가 읽는다(로그에는 코드만 간다 — `obs/executeObservability.ts`).
+        return { issues: wireCopy(issues) };
+      }
+      case 'readiness': {
+        const core = requireMaintenance('readiness', (c) => c.readiness);
+        const req = opts.maintenance?.readiness;
+        if (req === undefined) {
+          notWired('readiness', 'maintenance.readiness 요청(프로브·제한 시간)이 배선되지 않았습니다.');
+        }
+        span.entered = true;
+        const report = await core.readiness!(req);
+        span.returned = true;
+        return wireCopy(report);
+      }
+      case 'recoveryProbe': {
+        const core = requireMaintenance('recoveryProbe', (c) => c.runRecoveryProbes);
+        span.entered = true;
+        const report = await core.runRecoveryProbes!();
+        span.returned = true;
+        if (report === undefined) notWired('recoveryProbe', 'Core 에 복구 프로브 배선이 없습니다(§9.3).');
+        return wireCopy(report);
+      }
+      case 'offerExpiry': {
+        const core = requireMaintenance('offerExpiry', (c) => c.runOfferExpiry);
+        span.entered = true;
+        const report = await core.runOfferExpiry!();
+        span.returned = true;
+        if (report === undefined) notWired('offerExpiry', 'Core 에 배정 오퍼 배선이 없습니다(§2).');
+        return wireCopy(report);
+      }
+      case 'settleOffer': {
+        const core = requireMaintenance('settleOffer', (c) => c.settleAgentOffer);
+        // 상담사 응답은 **사실**이므로 본문에서 받는다. 형태는 부르기 전에 끝낸다.
+        if (!nonEmptyString(body.offerId)) bad('offerId 가 없습니다.');
+        if (typeof body.event !== 'string' || !OFFER_EVENTS.has(body.event)) {
+          // 값은 되돌려 적지 않는다 — 호스트가 그 자리에 임의 문자열을 넣을 수 있다(§10.3).
+          bad(`event 가 유효하지 않습니다. 허용값: ${[...OFFER_EVENTS].join('·')}`);
+        }
+        // `tick` 은 **만료 수렴의 수단**이라 여기서 받지 않는다 — 받으면 호스트가 임의 시점에
+        // 한 건씩 만료시킬 수 있고, 그 판정은 `offerExpiry` 가 보는 것과 갈라진다(§2).
+        if (body.event === 'tick') {
+          bad('tick 은 offerExpiry 가 수행합니다 — 건별로 만료시키면 만료 판정이 두 곳이 됩니다(§2).');
+        }
+        span.entered = true;
+        const step = await core.settleAgentOffer!({ offerId: body.offerId, event: body.event as OfferEvent });
+        span.returned = true;
+        if (step === undefined) notWired('settleOffer', 'Core 에 배정 오퍼 배선이 없습니다(§2).');
+        return projectOfferStep(step);
       }
     }
   }

@@ -1,7 +1,7 @@
 // Interaction 이벤트 스키마 — 설계서 §8.1.
 // 대시보드·리포트·QA·정산이 전부 이 이벤트를 원천으로 삼는다. 형식이 흔들리면 지표가 흔들린다.
 // 모든 이벤트는 tenant_id로 스코프되며(§11.1), 본문 텍스트는 저장 전 마스킹된다(§10.3).
-import type { ChannelKind, Outcome, Handoff } from '../domain/types.ts';
+import type { ChannelKind, Outcome, Handoff, LatencyBreakdown } from '../domain/types.ts';
 import { maskPii } from '../core/policyGuard.ts';
 
 export const EVENT_SCHEMA_VERSION = 1;
@@ -12,13 +12,16 @@ export type InteractionEventType =
   | 'handoff.requested'
   | 'session.ended';
 
-/** 구간별 지연(ms). 값은 실측으로만 채운다 — 기본값·목표치를 코드에 박지 않는다(§13-3). */
-export interface LatencyMs {
-  stt_ms?: number;
-  llm_ttft_ms?: number;
-  tts_ttfb_ms?: number;
-  total_ms?: number;
-}
+/**
+ * 구간별 지연(ms). 값은 실측으로만 채운다 — 기본값·목표치를 코드에 박지 않는다(§13-3).
+ *
+ * §8.1 의 이름은 `latency_ms` 이고 §4 턴 이력의 이름은 `Turn.latency` 지만 **측정은 하나**다.
+ * 그래서 선언은 `domain/types.ts` 에 한 번만 두고 여기서는 그것을 가리킨다(그 파일 주석 참조) —
+ * 두 벌로 두었던 동안 키 이름이 갈라져 한쪽을 채운 실측이 반대쪽 집계에 도착하지 못했다.
+ */
+export type LatencyMs = LatencyBreakdown;
+
+export { LATENCY_KEYS } from '../domain/types.ts';
 
 /**
  * 과금 근거가 되는 사용량(§11.2). 실측값만 넣는다 — 추정·기본값 금지(§13-3).
@@ -35,7 +38,44 @@ export interface UsageMetrics {
   tts_audio_ms?: number;
 }
 
+/**
+ * 위 사용량 항목의 키 목록. `LATENCY_KEYS` 와 같은 이유로 **타입에 묶어** 둔다 —
+ * 종전에는 이 목록이 브리지 검증·엔진셋 수집·턴 귀속에 각각 복사돼 있었다.
+ *
+ * 과금 근거에서는 어긋남의 값이 더 비싸다: 키가 하나 늘었는데 브리지만 모르면 **비-Node 호스트의
+ * 그 턴 전체가 거부**되고(§11.2 근거가 아예 안 쌓인다), 반대로 턴 귀속만 모르면 그 항목이 조용히
+ * 집계에서 빠져 몇 주 뒤 대사에서 '미설명' 차이로 돌아온다(그 방향은 과소청구라 청구도 막히지 않는다).
+ */
+const USAGE_METRIC_KEY_TUPLE = [
+  'llm_prompt_tokens', 'llm_completion_tokens', 'stt_audio_ms', 'tts_audio_ms',
+] as const;
+
+/** 없는 키·오타를 막는다. */
+export const USAGE_METRIC_KEYS: readonly (keyof UsageMetrics)[] = USAGE_METRIC_KEY_TUPLE;
+
+/** 목록이 `UsageMetrics` 의 키를 **전부** 덮는지. 덮지 못하면 컴파일 오류다. */
+const _usageKeysCover: Exclude<keyof UsageMetrics, typeof USAGE_METRIC_KEY_TUPLE[number]> extends never
+  ? true : never = true;
+void _usageKeysCover;
+
 export type EntryPoint = 'inbound_call' | 'outbound_call' | 'visual_link' | 'web_chat' | 'app_chat';
+
+/**
+ * 위 유입 경로의 값 목록. 유니온은 **실행 시점에 검사할 수 없으므로** 경계(브리지 JSONL)가
+ * 목록을 따로 들고 있었다 — 유입 경로가 하나 늘면 그 경로로 들어오는 **세션 시작 자체가 거부된다**
+ * (`E_BAD_REQUEST`). 비-Node 호스트에서만 그러므로 증상은 "그 채널에서만 통화가 안 열린다"다.
+ */
+const ENTRY_POINT_TUPLE = [
+  'inbound_call', 'outbound_call', 'visual_link', 'web_chat', 'app_chat',
+] as const;
+
+/** 없는 값·오타를 막는다. */
+export const ENTRY_POINTS: readonly EntryPoint[] = ENTRY_POINT_TUPLE;
+
+/** 목록이 `EntryPoint` 를 **전부** 덮는지. 덮지 못하면 컴파일 오류다. */
+const _entryPointsCover: Exclude<EntryPoint, typeof ENTRY_POINT_TUPLE[number]> extends never
+  ? true : never = true;
+void _entryPointsCover;
 
 /** 이벤트 생성 시 호출자가 제공하는 식별 정보 (id·시각은 주입 — 순수 함수 유지) */
 export interface EventMeta {

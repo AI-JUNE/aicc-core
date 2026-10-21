@@ -416,6 +416,60 @@ class BridgeClient:
         """관측 시각은 호출자가 준다 — 클라이언트가 시각을 만들어 넣지 않는다(§13-3)."""
         return self.request("health", report={"observedAt": observed_at, "samples": list(samples)})
 
+    # ── 유지 루프(§9.3·§2) ────────────────────────────────────────────────
+    # Core 는 **타이머를 돌리지 않는다**(몰래 켠 인터벌은 끌 수도 없고 프로세스 종료를 막는다).
+    # 그래서 아래 다섯은 호스트가 주기적으로 불러야 한다. 부를 자리가 없던 동안 비-Node 호스트의
+    # 배치에서는 전부 **한 번도 돌지 않았고**, 증상은 하나도 예외가 아니었다:
+    #   - `run_offer_expiry` 미호출 → 만료된 오퍼가 열린 채 쌓여 같은 콜이 두 번 제안되고,
+    #     그 통화는 큐에 묶인 채 §9.3 대안(콜백·음성사서함)으로도 가지 않는다.
+    #   - `run_recovery_probe` 미호출 → 한 번 `degraded_ai`·`agent_only` 로 내려간 테넌트는
+    #     엔진이 돌아와도 **영구히** 폴백에 남는다(아무도 찌르지 않으니 샘플이 갱신되지 않는다).
+    #   - `readiness` 미호출 → 호스트 `/health` 에 §9.3 상태가 닿지 않아, 모든 통화가 상담사
+    #     직결로 떨어진 순간에도 200·up 이다.
+    #   - `settle_offer` 미호출 → 상담사의 수락·거절이 원장에 없어 재배정도 소진 수렴도 없다
+    #     (그 상태는 "상담사가 안 받는다"와 구분되지 않는다).
+    #   - `warnings` 미호출 → `W_AI_DISCLOSURE_UNBOUND` 처럼 **통화는 정상으로 끝나는데
+    #     고지가 한 번도 나가지 않는** 상태를 호스트가 읽을 길이 없다.
+    #
+    # **주기는 이 클라이언트가 정하지 않는다**(§13-3) — 회선 수·상담사 수에 따라 다르다.
+    # 브리지가 그 op 를 열지 않았으면 `E_NOT_WIRED` 로 돌아온다(조용한 0건이 아니다).
+    def maintenance_ops(self) -> Sequence[str]:
+        """브리지가 실제로 열어 둔 유지 op. `hello` 응답에서 읽는다(찔러 보지 않는다)."""
+        res = self.hello()
+        if not res.ok or not isinstance(res.result, dict):
+            return []
+        ops = res.result.get("maintenanceOps")
+        return [str(o) for o in ops] if isinstance(ops, list) else []
+
+    def warnings(self) -> BridgeResponse:
+        """등록 시점 계약 경고 전문(§9.3·§10.1). 코드가 아니라 사유까지 온다."""
+        return self.request("warnings")
+
+    def readiness(self) -> BridgeResponse:
+        """§9.3 폴백 상태를 포함한 readiness.
+
+        제한 시간·프로브는 **브리지 쪽 배선**이 준다 — 호출마다 호스트가 바꾸면 같은 `/health`
+        가 호출마다 다른 기준으로 판정된다(§2). 그래서 이 호출에는 인자가 없다.
+        """
+        return self.request("readiness")
+
+    def run_recovery_probe(self) -> BridgeResponse:
+        """§9.3 복구 확인 1회. 보고서의 `unprobed` 가 비어 있지 않으면 **확인할 길이 없는** 컴포넌트다."""
+        return self.request("recoveryProbe")
+
+    def run_offer_expiry(self) -> BridgeResponse:
+        """배정 오퍼 만료 수렴 1회. `issues` 가 비어 있지 않으면 `expired` 는 판정 결과가 아니다."""
+        return self.request("offerExpiry")
+
+    def settle_offer(self, offer_id: str, event: str) -> BridgeResponse:
+        """상담사 응답 반영. `event` 는 accept·decline·cancel 이다.
+
+        `tick`(만료)은 받지 않는다 — 건별로 만료시키면 만료 판정이 두 곳이 되므로
+        `run_offer_expiry` 가 수행한다(§2). 거절·무응답이면 **같은 호출에서** 다음 후보로
+        이어지고, 재배정 한도를 다 쓰면 응답의 `placement` 에 §9.3 대안이 실려 온다.
+        """
+        return self.request("settleOffer", offerId=offer_id, event=event)
+
     # ── 세션 ──────────────────────────────────────────────────────────────
     def session(self, *, reason_ko: str = "정상 종료", **start_kwargs: Any) -> "_SessionContext":
         return _SessionContext(self, reason_ko, start_kwargs)

@@ -26,9 +26,11 @@
 //  - **저장하지 않는다**: 색인·캐시·조회 이력 보관은 호스트 몫이다(§6.2).
 import type { ChannelKind, Handoff, Outcome } from '../domain/types.ts';
 import type {
+  EntryPoint,
   HandoffRequestedEvent,
   InteractionEvent,
   SessionEndedEvent,
+  SessionStartedEvent,
   TurnCompletedEvent,
 } from '../events/schema.ts';
 import type { EventLog, ReadOptions } from '../events/store.ts';
@@ -37,7 +39,7 @@ import { maskPii } from '../core/policyGuard.ts';
 import type { AuditChain, AuditRecord, Hasher } from '../audit/log.ts';
 import { decideAccess, recordAccess, type AccessActor, type AccessRequest } from '../audit/access.ts';
 import {
-  buildQueryAudit, runQuery, validateQuery,
+  buildQueryAudit, runQuery, validateQuery, ENTRY_POINT_VALUES,
   type InteractionQuery, type InteractionSummary, type QueryAuditEntry, type QueryIssue, type QueryLimits,
 } from './interactionQuery.ts';
 
@@ -101,6 +103,17 @@ export interface InteractionIndexCounters {
   turnsRemasked: number;
   /** 규약 밖 화자 등으로 전문에 담지 못한 턴. */
   turnsDropped: number;
+  /**
+   * 시작 이벤트는 봤는데 §8.1 유입 경로 선언이 없거나 계약 밖 값이던 세션 수.
+   * **행에는 필드를 만들지 않는다**(§13-3) — `inbound_call` 로 채우면 아웃바운드 캠페인 콜이
+   * 인바운드 문의로 조회되고, 그 목록을 근거로 한 판단은 조용히 틀린다.
+   */
+  sessionsMissingEntryPoint: number;
+  /**
+   * 한 세션에 **서로 다른** 유입 경로가 선언된 수. 그 행은 유입 경로를 적지 않는다 —
+   * 어느 쪽이 맞는지 Core 는 고를 수 없고, 골라 주면 그 규칙이 조용히 실적을 한쪽으로 옮긴다(§2).
+   */
+  entryPointConflicts: number;
 }
 
 export interface InteractionIndexResult {
@@ -125,6 +138,8 @@ function newCounters(): InteractionIndexCounters {
     sessionsWithMultipleHandoffs: 0,
     turnsRemasked: 0,
     turnsDropped: 0,
+    sessionsMissingEntryPoint: 0,
+    entryPointConflicts: 0,
   };
 }
 
@@ -136,6 +151,8 @@ interface Acc {
   endedAt?: string;
   sawStart: boolean;
   sawEnd: boolean;
+  /** `null` 은 "선언이 어긋났다" — 적지 않는다(`undefined` 는 "아직 못 봤다"). */
+  entryPoint?: EntryPoint | null;
   outcome?: Outcome;
   durationMs?: number;
   channels: ChannelKind[];
@@ -230,10 +247,22 @@ export function projectInteractions(
     if (!acc.channels.includes(e.channel)) acc.channels.push(e.channel);
 
     switch (e.type) {
-      case 'session.started':
+      case 'session.started': {
         acc.sawStart = true;
         if (acc.startedAt === undefined || e.occurred_at < acc.startedAt) acc.startedAt = e.occurred_at;
+        // §8.1 유입 경로. 계약 밖 값은 **그대로 적지 않는다** — 원장에는 과거 호스트가 넣은
+        // 값도 남아 있고(`channelsUnknown` 과 같은 이유), 그 문자열이 목록 화면의 필터 칸에
+        // 그대로 뜨면 조회 조건이 영영 맞지 않는다.
+        const declared = (e as SessionStartedEvent).entry_point;
+        const known = declared !== undefined && ENTRY_POINT_VALUES.includes(declared) ? declared : undefined;
+        if (known === undefined) counters.sessionsMissingEntryPoint += 1;
+        else if (acc.entryPoint === undefined) acc.entryPoint = known;
+        else if (acc.entryPoint !== known) {
+          counters.entryPointConflicts += 1;
+          acc.entryPoint = null;
+        }
         break;
+      }
       case 'turn.completed': {
         const t = e as TurnCompletedEvent;
         if (!SPEAKERS.includes(t.speaker)) {
@@ -298,6 +327,7 @@ export function projectInteractions(
       startedAt: acc.startedAt ?? acc.firstAt,
       ...(acc.endedAt !== undefined ? { endedAt: acc.endedAt } : {}),
       channels: [...acc.channels],
+      ...(acc.entryPoint ? { entryPoint: acc.entryPoint } : {}),
       ...(acc.outcome !== undefined ? { outcome: acc.outcome } : {}),
       intents: [...acc.intents],
       ...(acc.handoffReason !== undefined ? { handoffReason: acc.handoffReason } : {}),
@@ -325,6 +355,8 @@ export function indexNoteKo(c: InteractionIndexCounters): string | undefined {
   if (c.durationValuesRejected > 0) parts.push(`쓸 수 없는 통화 길이 ${c.durationValuesRejected}건 거부`);
   if (c.sessionsMissingDuration > 0) parts.push(`통화 길이 실측이 없는 종료 세션 ${c.sessionsMissingDuration}건`);
   if (c.sessionsWithMultipleHandoffs > 0) parts.push(`이관 요청이 둘 이상인 세션 ${c.sessionsWithMultipleHandoffs}건(마지막 사유를 적었다)`);
+  if (c.sessionsMissingEntryPoint > 0) parts.push(`§8.1 유입 경로 선언이 없는 시작 이벤트 ${c.sessionsMissingEntryPoint}건(행에 적지 않았다)`);
+  if (c.entryPointConflicts > 0) parts.push(`유입 경로 선언이 어긋난 세션 ${c.entryPointConflicts}건(고르지 않고 비웠다)`);
   return parts.length > 0 ? parts.join(' · ') : undefined;
 }
 

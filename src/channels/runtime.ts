@@ -10,7 +10,7 @@
 // 하지 않는 것: 실회선·실엔진·실발신. 매체 동작은 전부 ChannelPort 구현(각 채널 저장소)이 맡고,
 // 여기서는 "무엇을 시킬지"만 정한다 — [승인 필요] 지점은 채널 저장소 쪽에 있다.
 import type { ChannelKind, Handoff, Interaction, Turn } from '../domain/types.ts';
-import { resolveOutcome } from '../domain/types.ts';
+import { LATENCY_KEYS, resolveOutcome } from '../domain/types.ts';
 import type { Flow, RenderedStep } from '../flow/types.ts';
 import { isIntentEntryNode, isKnowledgeEntryNode, renderNode } from '../flow/types.ts';
 import type { FlowResolution } from '../flow/deployedFlows.ts';
@@ -913,12 +913,9 @@ function visibleSteps(steps: RenderedStep[]): RenderedStep[] {
   return steps.filter((s) => s.silent !== true);
 }
 
-/**
- * §8.1 `latency_ms` 의 키. **목록을 여기 한 곳에 둔다** — 브리지(JSONL)도 같은 목록으로
- * 검사하므로, 두 곳에 쓰면 키가 하나 늘어나는 날 한쪽만 늘고 그쪽을 지나지 않는 호스트에서만
- * 그 실측이 조용히 사라진다(§2).
- */
-const TURN_LATENCY_KEYS = ['stt_ms', 'llm_ttft_ms', 'tts_ttfb_ms', 'total_ms'] as const;
+// §8.1 `latency_ms` 의 키 목록은 `LATENCY_KEYS`(타입 옆) 하나다. 종전에 이 자리에 있던 사본의
+// 주석은 "목록을 여기 한 곳에 둔다"고 적어 두었으나 브리지에도 같은 리터럴이 있었다 —
+// 즉 그 주석이 막겠다고 한 실패가 그 주석 밑에서 그대로 성립해 있었다(§2).
 
 export function createConversationCore(opts: ConversationCoreOptions): ConversationCore {
   assertTenantScope(opts.scope);
@@ -1985,6 +1982,11 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       const turn: Turn = { id: t.turn_id, at: t.occurred_at, channel: t.channel, speaker: t.speaker, utterance: t.utterance_masked };
       if (t.intent !== undefined) turn.intent = t.intent;
       if (t.confidence !== undefined) turn.confidence = t.confidence;
+      // 지연 실측도 **같은 이벤트에서** 옮긴다. `Turn.latency` 는 선언만 있고 채우는 코드가
+      // 0줄이었다 — 호스트가 세션 이력(`core.sessions`)으로 턴을 되짚으면 원장에는 있는 실측이
+      // 거기서는 언제나 없었고, 두 곳이 같은 턴을 다르게 보여 주는 상태였다(§2).
+      // 값을 만들지 않는다: 이벤트에 키가 없으면 필드를 만들지 않는다(§13-3).
+      if (Object.keys(t.latency_ms).length > 0) turn.latency = { ...t.latency_ms };
       rec.turns.push(turn);
     }
   }
@@ -2073,7 +2075,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
   function mergedLatency(own: LatencyMs | undefined, declared: LatencyMs, whereKo: string): LatencyMs | undefined {
     const out: LatencyMs = { ...(own ?? {}) };
     const conflicts: string[] = [];
-    for (const key of TURN_LATENCY_KEYS) {
+    for (const key of LATENCY_KEYS) {
       const v = declared[key];
       if (v === undefined) continue;
       const mine = out[key];

@@ -6,12 +6,16 @@
 //     주민번호·카드번호로 사람을 찾는 검색은 규약 단계에서 막는다 — 저장소에 그 값이 없어야 정상이고,
 //     그런 검색어가 들어온다는 것 자체가 사고 신호다.
 import type { ChannelKind, Outcome, Handoff } from '../domain/types.ts';
+import type { EntryPoint } from '../events/schema.ts';
+import { ENTRY_POINTS } from '../events/schema.ts';
 import { assertTenantScope, type TenantScope } from '../core/tenancy.ts';
 import { partitionKey } from '../core/tenancy.ts';
 import { maskPii } from '../core/policyGuard.ts';
 
 export const CHANNEL_VALUES: readonly ChannelKind[] = ['voice', 'visual', 'chat'];
 export const OUTCOME_VALUES: readonly Outcome[] = ['AUTO_RESOLVED', 'TRANSFERRED', 'ABANDONED', 'FAILED'];
+/** §8.1 유입 경로. 목록을 여기서 다시 적지 않는다 — 선언은 이벤트 스키마 하나다(§2). */
+export const ENTRY_POINT_VALUES: readonly EntryPoint[] = ENTRY_POINTS;
 
 export type SortField = 'started_at' | 'ended_at' | 'duration_ms';
 export type SortOrder = 'asc' | 'desc';
@@ -29,6 +33,12 @@ export interface InteractionQuery {
   intents?: string[];
   outcomes?: Outcome[];
   handoffReasons?: Handoff['reason'][];
+  /**
+   * §8.1 유입 경로. **이 조건이 없던 동안 목록은 인바운드 문의와 아웃바운드 캠페인 콜을 한
+   * 덩어리로 보여 주었다** — 원장에는 가를 근거가 있었고 읽는 코드가 0줄이었다. 조사·민원
+   * 대응에서 "이 통화가 우리가 걸었던 건가"는 가장 먼저 묻는 질문이고, 그 답이 화면에 없었다.
+   */
+  entryPoints?: EntryPoint[];
   /** 마스킹 전문 대상 키워드(부분일치, 대소문자 무시) */
   keyword?: string;
   /** 이관 발생 여부로만 거르고 싶을 때 */
@@ -47,6 +57,11 @@ export interface InteractionSummary {
   startedAt: string;
   endedAt?: string;
   channels: ChannelKind[];
+  /**
+   * §8.1 유입 경로. **없으면 필드를 만들지 않는다**(§13-3) — 선언하지 않은 세션을
+   * `inbound_call` 로 적으면 아웃바운드 캠페인이 인바운드 문의로 조회된다.
+   */
+  entryPoint?: EntryPoint;
   outcome?: Outcome;
   intents: string[];
   handoffReason?: Handoff['reason'];
@@ -67,6 +82,7 @@ export type QueryIssueCode =
   | 'period_too_wide'
   | 'limit'
   | 'channel'
+  | 'entry_point'
   | 'outcome'
   | 'keyword_empty'
   | 'keyword_pii';
@@ -125,6 +141,13 @@ export function validateQuery(q: InteractionQuery, limits: QueryLimits): QueryIs
   for (const o of q.outcomes ?? []) {
     if (!OUTCOME_VALUES.includes(o)) issues.push({ field: 'outcomes', code: 'outcome', messageKo: `알 수 없는 결과: ${o}` });
   }
+  // 모르는 값을 **조용히 무시하지 않는다**. 무시하면 오타 하나로 조건이 꺼진 채 전 유입 경로가
+  // 조회되고, 화면에는 "아웃바운드만 보기"가 켜진 것으로 남는다(§7 2.2).
+  for (const p of q.entryPoints ?? []) {
+    if (!ENTRY_POINT_VALUES.includes(p)) {
+      issues.push({ field: 'entryPoints', code: 'entry_point', messageKo: `알 수 없는 유입 경로: ${p}` });
+    }
+  }
 
   if (q.keyword !== undefined) {
     const k = q.keyword.trim();
@@ -149,6 +172,7 @@ export function normalizeQuery(q: InteractionQuery): Required<Pick<InteractionQu
   return {
     ...q,
     channels: uniq(q.channels),
+    entryPoints: uniq(q.entryPoints),
     outcomes: uniq(q.outcomes),
     intents: uniq(q.intents?.map((s) => s.trim()).filter((s) => s.length > 0)),
     handoffReasons: uniq(q.handoffReasons),
@@ -177,6 +201,7 @@ export function toStorageFilter(q: InteractionQuery): StorageFilter {
     { field: 'started_at', op: 'lt', value: n.period.toIso },
   ];
   if (n.channels) conditions.push({ field: 'channels', op: 'in', value: n.channels });
+  if (n.entryPoints) conditions.push({ field: 'entry_point', op: 'in', value: n.entryPoints });
   if (n.outcomes) conditions.push({ field: 'outcome', op: 'in', value: n.outcomes });
   if (n.intents) conditions.push({ field: 'intents', op: 'in', value: n.intents });
   if (n.handoffReasons) conditions.push({ field: 'handoff_reason', op: 'in', value: n.handoffReasons });
@@ -202,6 +227,9 @@ export function matchesQuery(s: InteractionSummary, q: InteractionQuery): boolea
   if (Number.isNaN(started) || started < from || started >= to) return false;
 
   if (q.channels?.length && !s.channels.some((c) => q.channels!.includes(c))) return false;
+  // 유입 경로를 **선언하지 않은 행은 조건이 있으면 제외한다**. 포함시키면 "아웃바운드만 보기"에
+  // 경로 미선언 통화가 섞여 들어오고, 그 목록을 근거로 한 판단은 조용히 틀린다(§13-3).
+  if (q.entryPoints?.length && (s.entryPoint === undefined || !q.entryPoints.includes(s.entryPoint))) return false;
   if (q.outcomes?.length && (s.outcome === undefined || !q.outcomes.includes(s.outcome))) return false;
   if (q.intents?.length && !s.intents.some((i) => q.intents!.includes(i))) return false;
   if (q.handoffReasons?.length && (s.handoffReason === undefined || !q.handoffReasons.includes(s.handoffReason))) return false;

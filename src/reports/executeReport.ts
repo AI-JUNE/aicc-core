@@ -180,6 +180,25 @@ export function runReport(p: ReportRunParams): ReportRunResult {
       '만들어 넣지 않습니다 (설계서 §4.1·§13-3)',
     );
   }
+  // §8.1 유입 경로. 가를 근거는 원장에 있었고 **읽는 코드가 0줄이었다** — 그동안 이 표의 모든
+  // 수치는 인바운드 문의·아웃바운드 캠페인·§5.2 전환 유입을 한 덩어리로 센 값이다. 이제 사실을
+  // 적되, **가르지 못한 범위도 함께 적는다**: 모르는 것을 한 경로에 몰아 넣으면 그 경로가
+  // 가장 큰 유입원으로 보이고, 그 왜곡은 장애가 아니라 그럴듯한 숫자로 나타난다(§13-3).
+  if (total.sessionsMissingEntryPoint > 0) {
+    limitsKo.push(
+      `시작 세션 ${total.sessionsMissingEntryPoint}건에 §8.1 유입 경로 선언이 없습니다 — 유입 경로별 ` +
+      '집계에서 제외했고 어느 경로에도 넣지 않았습니다. 선언은 채널 어댑터가 세션을 열 때 넣습니다 ' +
+      '(설계서 §8.1·§13-3)',
+    );
+  }
+  if (total.sessionsEndedWithUnknownEntryPoint > 0) {
+    limitsKo.push(
+      `종료 세션 ${total.sessionsEndedWithUnknownEntryPoint}건은 짝지을 시작 이벤트가 이 범위에 없어 ` +
+      '유입 경로별 Outcome 에서 제외했습니다 — `session.ended` 에는 유입 경로 칸이 없어 시작 이벤트와 ' +
+      '짝지어야 하고, 기간 경계에 걸친 통화는 그 짝이 범위 밖입니다. 추가 전용 이벤트에 칸을 더하는 ' +
+      '것은 **[승인 필요]** 입니다 (설계서 §8.1)',
+    );
+  }
   if (rates.autoResolvedReContacted > 0) {
     // 기록과 계약이 어긋난 상태다. 집계가 조용히 고쳐 세면 같은 원장이 화면마다 다른 값을 낸다(§2).
     incompletenessKo.push(

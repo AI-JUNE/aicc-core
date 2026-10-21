@@ -31,6 +31,58 @@ export const ADAPTER_CHANNEL: Record<ChannelAdapterId, ChannelKind> = {
   dars: 'visual',
 };
 
+/**
+ * 언어 중립 브리지(JSONL)의 op 목록 — **이 계약의 와이어 형태**다.
+ *
+ * 선언이 여기 있는 이유: 종전에는 세 모듈이 각자 목록을 들고 있었다(브리지 디스패치·
+ * 전사 판정기·관측 분류기). 그 상태에서 op 가 하나 늘면 **늘어난 것을 모르는 쪽만 틀린다** —
+ * 전사 판정기는 그 줄을 `opCounts` 에 세지 않고(적합성 전사가 "그 op 는 오지 않았다"로 읽힌다),
+ * 관측 분류기는 `op` 를 임의 문자열로 보아 로그 필드에서 빼므로 **그 op 의 경계 실패만
+ * 어느 줄에 붙은 실패인지 알 수 없는 상태로 남는다**. 둘 다 예외가 아니다.
+ *
+ * - `hello`·`start`·`send`·`end`·`health` — 통화 경로.
+ * - 나머지는 **유지 루프**다(§9.3·§2). Core 는 타이머를 돌리지 않으므로 호스트가 부르는데,
+ *   브리지에 자리가 없던 동안 비-Node 호스트에는 **부를 길이 아예 없었다**.
+ */
+export type BridgeOp =
+  | 'hello'
+  | 'start'
+  | 'send'
+  | 'end'
+  | 'health'
+  /** 등록 시점 계약 경고 전문(§9.3·§10.1). `hello` 는 싣지 않는다 — 경고는 등록 뒤에 확정된다. */
+  | 'warnings'
+  /** §9.3 폴백 상태를 포함한 readiness. 호스트 `/health` 가 이 값을 합쳐 쓴다. */
+  | 'readiness'
+  /** §9.3 복구 확인 1회. 부르지 않으면 한 번 내려간 채널이 영구히 폴백에 남는다. */
+  | 'recoveryProbe'
+  /** 배정 오퍼 만료 수렴 1회. 부르지 않으면 만료분이 열린 채 쌓인다. */
+  | 'offerExpiry'
+  /** 상담사 수락·거절·취소 반영. 올리지 않으면 재배정도 소진 수렴도 일어나지 않는다. */
+  | 'settleOffer';
+
+const BRIDGE_OP_TUPLE = [
+  'hello', 'start', 'send', 'end', 'health',
+  'warnings', 'readiness', 'recoveryProbe', 'offerExpiry', 'settleOffer',
+] as const;
+
+/** 없는 op·오타를 막는다. */
+export const BRIDGE_OPS: readonly BridgeOp[] = BRIDGE_OP_TUPLE;
+
+/** 목록이 `BridgeOp` 를 **전부** 덮는지 — 빠뜨리면 이 대입이 컴파일 오류가 된다. */
+const _bridgeOpsCover: Exclude<BridgeOp, typeof BRIDGE_OP_TUPLE[number]> extends never
+  ? true : never = true;
+void _bridgeOpsCover;
+
+/**
+ * 통화 경로가 아닌 op — **유지 루프**다. 요청 한도·전사 판정에서 통화 경로와 다르게 다룬다.
+ * (한도: 유지 루프를 제한기로 막으면 만료 수렴·복구 확인이 멈추고, 그 상태는 "상담사가 안 받는다"·
+ * "엔진이 안 돌아온다"와 구분되지 않는다. 제한은 고객 트래픽 경로에만 건다.)
+ */
+export const BRIDGE_MAINTENANCE_OPS: readonly BridgeOp[] = [
+  'warnings', 'readiness', 'recoveryProbe', 'offerExpiry', 'settleOffer',
+];
+
 /** 세션 시작 시 채널이 Core에 넘기는 최소 정보. 개인정보(발신번호 등)는 여기서 다루지 않는다(§10.3). */
 export interface ChannelSessionRequest {
   scope: TenantScope;                 // §11.1 — 스코프 없는 진입 경로를 만들지 않는다

@@ -21,11 +21,15 @@
 //
 // 이 모듈은 순수하다 — 시각·난수·I/O 가 없고, 엔진·채널을 부르지 않는다. 금액을 모르고 단가도 모른다.
 import type { InteractionEvent, TurnCompletedEvent, UsageMetrics } from '../events/schema.ts';
+import { USAGE_METRIC_KEYS } from '../events/schema.ts';
 
-/** §11.2 사용량 항목. 이 목록 밖의 키는 정체불명 항목이므로 집계에 쌓지 않는다. */
-export const USAGE_UNITS: readonly (keyof UsageMetrics)[] = [
-  'llm_prompt_tokens', 'llm_completion_tokens', 'stt_audio_ms', 'tts_audio_ms',
-];
+/**
+ * §11.2 사용량 항목. 이 목록 밖의 키는 정체불명 항목이므로 집계에 쌓지 않는다.
+ *
+ * 선언은 `USAGE_METRIC_KEYS`(타입 옆) 하나다 — 이 파일 머리말이 "경로가 둘이면 검사도 둘이어야
+ * 하는 것이 아니라, 검사가 한 곳이어야 한다(§2)"고 적어 두었는데 **목록 자체는 세 벌**이었다.
+ */
+export const USAGE_UNITS: readonly (keyof UsageMetrics)[] = USAGE_METRIC_KEYS;
 
 /** 개수로만 성립하는 항목 — 소수 토큰은 실측이 아니라 환산 실수의 신호다. */
 const COUNT_UNITS: readonly (keyof UsageMetrics)[] = ['llm_prompt_tokens', 'llm_completion_tokens'];

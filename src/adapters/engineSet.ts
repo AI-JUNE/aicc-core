@@ -33,6 +33,7 @@ import type { Activation } from './http.ts';
 import { EngineError } from './http.ts';
 import { widestResidency } from './resilience.ts';
 import type { UsageMetrics } from '../events/schema.ts';
+import { USAGE_METRIC_KEYS } from '../events/schema.ts';
 import { maskPii } from '../core/policyGuard.ts';
 
 export type EngineSlot = 'stt' | 'tts' | 'llm' | 'embedding';
@@ -113,9 +114,9 @@ export interface UsageCollection {
   rejected: { key: string; source: string; reasonKo: string }[];
 }
 
-const USAGE_KEYS: readonly (keyof UsageMetrics)[] = Object.freeze([
-  'llm_prompt_tokens', 'llm_completion_tokens', 'stt_audio_ms', 'tts_audio_ms',
-]);
+// §11.2 항목 목록은 `USAGE_METRIC_KEYS`(타입 옆) 하나다 — 종전에 이 자리에 있던 사본은
+// 브리지·턴 귀속의 사본과 어긋날 수 있었고, 어긋나면 그 항목이 수집에서 조용히 빠진다.
+const USAGE_KEYS: readonly (keyof UsageMetrics)[] = USAGE_METRIC_KEYS;
 
 function fail(message: string, detail: Record<string, unknown> = {}): never {
   // 조각 이름·엔진 이름은 설정에서 온 문자열이다. 저장·로그 경로로 그대로 흐르므로 한 번 거른다(§10.3).

@@ -19,6 +19,7 @@
 //  - 상한을 주지 않으면 그 검사를 **건너뛰고, 건너뛴 사실을 판정보류로 남긴다** — 통과로 적지 않는다.
 import { maskPii } from '../core/policyGuard.ts';
 import type { ChannelAdapterId } from './contract.ts';
+import { BRIDGE_OPS } from './contract.ts';
 import type { HarnessVerdict } from './harness.ts';
 import { HARNESS_EXIT_CODE } from './harness.ts';
 import { BRIDGE_PROTOCOL_VERSION } from './bridge.ts';
@@ -88,7 +89,9 @@ export interface TranscriptReport {
   reasonsKo: readonly string[];
 }
 
-const OPS: ReadonlySet<string> = new Set(['hello', 'start', 'send', 'end', 'health']);
+// op 목록은 채널 계약(`contract.ts`) 하나다 — 여기 사본을 두었던 동안, op 가 하나 늘면
+// 그 줄은 "모르는 op" 로 판정되어 `opCounts` 에 세어지지 않았다(전사가 "그 op 는 오지 않았다"로 읽힌다).
+const OPS: ReadonlySet<string> = new Set<string>(BRIDGE_OPS);
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);

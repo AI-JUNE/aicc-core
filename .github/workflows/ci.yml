@@ -72,6 +72,25 @@ jobs:
           grep -q '"id":"2","ok":true' /tmp/bridge.out
           grep -q 'E_BAD_JSON' /tmp/bridge.out
 
+      # 유지 루프(§9.3·§2)가 비-Node 호스트에 **실제로 닿는지** 확인한다. Core 는 타이머를 돌리지
+      # 않으므로 만료 수렴·복구 확인·readiness 는 호스트가 불러야 하는데, 실행기가 모듈의
+      # `maintenance` 배선을 넘기지 않으면 그 op 들은 조용히 `E_NOT_WIRED` 로만 끝난다.
+      # 두 가지를 본다: (1) 배선한 픽스처에서는 열려 있고 실제로 돌며, (2) 배선하지 않은
+      # 픽스처에서는 **0건이 아니라 거절**로 끝난다 — 0 으로 새면 수렴이 돈 적 없다는 사실이 사라진다.
+      - name: channel bridge maintenance ops (self-check)
+        run: |
+          printf '%s\n' \
+            '{"id":"1","op":"hello"}' \
+            '{"id":"2","op":"offerExpiry"}' \
+            '{"id":"3","op":"recoveryProbe"}' \
+            | node scripts/channel-bridge.mjs --core ./fixtures/reference-core-maintained.mjs --adapter callbot > /tmp/maint.out
+          grep -q '"maintenanceOps":\["warnings","readiness","recoveryProbe","offerExpiry","settleOffer"\]' /tmp/maint.out
+          grep -q '"id":"2","ok":true' /tmp/maint.out
+          grep -q '"id":"3","ok":true' /tmp/maint.out
+          printf '%s\n' '{"id":"1","op":"offerExpiry"}' \
+            | node scripts/channel-bridge.mjs --core ./fixtures/reference-core.mjs --adapter callbot > /tmp/maint-off.out
+          grep -q 'E_NOT_WIRED' /tmp/maint-off.out
+
       # 파이썬 참조 클라이언트가 실제로 브리지를 소비하는지 확인한다. Callbot 이 붙을 경로라서,
       # "Core 쪽은 맞는데 클라이언트가 틀린" 상황을 여기서 잡는다. 판정은 자기 채점이 되지 않게
       # 별도 실행기(bridge-transcript)가 하며, 기대(--adapter·--max-line-bytes)를 빼면 판정보류(2)다.

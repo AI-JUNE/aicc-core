@@ -14,7 +14,11 @@ import type {
   SessionEndedEvent,
   TurnCompletedEvent,
   HandoffRequestedEvent,
+  SessionStartedEvent,
+  EntryPoint,
+  LatencyMs,
 } from '../events/schema.ts';
+import { ENTRY_POINTS } from '../events/schema.ts';
 import { assertTenantScope, type TenantScope } from '../core/tenancy.ts';
 import { isZonedIso } from '../events/periodLedger.ts';
 
@@ -144,6 +148,34 @@ export interface ReportBucket {
   /** 관측된 최대 재시도 회차. 시나리오의 `maxRetry` 설정과 비교할 수 있는 유일한 실측이다. */
   maxRetryObserved: number;
   /**
+   * §8.1 유입 경로별 **시작 세션 수**(실측).
+   *
+   * 왜 세는가: `entry_point` 는 세션 시작 이벤트에 실려 원장에 쌓이는데 **저장소 어디에도 그
+   * 값을 읽는 코드가 없었다**. 그 결과 이 리포트의 모든 수치는 인바운드 문의·아웃바운드 캠페인·
+   * §5.2 전환 링크 유입을 **한 덩어리로** 센 값이다. 아웃바운드 비중이 바뀌는 달마다 자동완결률·
+   * 이관율이 함께 움직이는데, 그 움직임은 장애가 아니라 **그럴듯한 숫자**로 나타난다 —
+   * 원장에는 가를 근거가 있었고 읽지 않은 것뿐이다(§13-3·§4.1).
+   */
+  entryPoints: Record<EntryPoint, number>;
+  /**
+   * 시작 이벤트인데 유입 경로가 없거나 계약 밖 값이던 세션 수.
+   * 어느 경로에도 넣지 않는다 — `channelsUnknown` 과 같은 이유다(모르는 것을 한 칸에 몰아 넣으면
+   * 그 칸이 "가장 많은 유입 경로"가 된다).
+   */
+  sessionsMissingEntryPoint: number;
+  /**
+   * 유입 경로별 Outcome. **같은 원장의 시작 이벤트와 짝지어** 가른 것이다 —
+   * `session.ended` 에는 `entry_point` 가 없고, 추가 전용 계약에 칸을 더하는 것은 사람이
+   * 정할 일이다(§8.1 — `workspace_id` 선례와 같다) **[승인 필요]**.
+   */
+  outcomesByEntryPoint: Record<EntryPoint, OutcomeCounts>;
+  /**
+   * 짝지을 시작 이벤트가 **이 집계 범위 안에 없어** 유입 경로를 모르는 종료 수
+   * (기간 경계에서 잘린 세션·시작 이벤트 유실). 어느 경로에도 넣지 않는다 —
+   * 넣으면 월초의 통화가 전부 한 경로의 실적으로 적힌다.
+   */
+  sessionsEndedWithUnknownEntryPoint: number;
+  /**
    * 쓸 수 없는 `retry_count`(정수 아님·음수·NaN)로 세지 못한 턴 수.
    * 0 으로도 그대로도 세지 않는다 — `channelsUnknown` 과 같은 이유다(NaN 하나가 최댓값
    * 비교를 전부 거짓으로 만들고, 그러면 화면에는 "재시도 없음"으로 보인다).
@@ -178,7 +210,24 @@ function newBucket(bucket: string): ReportBucket {
     customerTurnsAfterRetry: 0,
     maxRetryObserved: 0,
     retryValuesRejected: 0,
+    entryPoints: emptyEntryPoints(),
+    sessionsMissingEntryPoint: 0,
+    outcomesByEntryPoint: emptyOutcomesByEntryPoint(),
+    sessionsEndedWithUnknownEntryPoint: 0,
   };
+}
+
+/**
+ * 열거값 목록을 **다시 적지 않는다**(§2). `ENTRY_POINTS`(§8.1 타입 옆) 하나에서 만들므로
+ * 유입 경로가 하나 늘면 빈 버킷의 키도 함께 늘고, `bump` 규칙에 따라 자동으로 집계된다 —
+ * 손으로 적었다면 그 경로만 `sessionsMissingEntryPoint` 로 떨어져 "선언 안 한 통화"로 보인다.
+ */
+function emptyEntryPoints(): Record<EntryPoint, number> {
+  return Object.fromEntries(ENTRY_POINTS.map((p) => [p, 0])) as Record<EntryPoint, number>;
+}
+
+function emptyOutcomesByEntryPoint(): Record<EntryPoint, OutcomeCounts> {
+  return Object.fromEntries(ENTRY_POINTS.map((p) => [p, emptyOutcomes()])) as Record<EntryPoint, OutcomeCounts>;
 }
 
 /**
@@ -244,13 +293,28 @@ function dedupe(events: InteractionEvent[]): InteractionEvent[] {
   return out;
 }
 
+/**
+ * §8.1 지연 키 → 표본 버킷. **`Record<keyof LatencyMs, …>` 로 받는 것이 요점이다** —
+ * 손으로 쓴 네 갈래 분기였던 동안, 타입에 키가 하나 늘어도 이 함수는 조용히 그 키를 지나쳤다.
+ * 그 턴은 `missing` 으로도 세어지지 않고(다른 키가 있으면) 표본에도 들어가지 않아,
+ * §13 지표에서는 **없었던 측정**이 된다. 지금은 키를 더하면 이 대입이 컴파일 오류가 된다.
+ */
+const LATENCY_BUCKET: Record<keyof LatencyMs, Exclude<keyof LatencySamples, 'missing'>> = {
+  total_ms: 'totalMs',
+  stt_ms: 'sttMs',
+  llm_ttft_ms: 'llmTtftMs',
+  tts_ttfb_ms: 'ttsTtfbMs',
+};
+
 function pushLatency(b: ReportBucket, e: InteractionEvent): void {
   const l = e.latency_ms ?? {};
   let any = false;
-  if (typeof l.total_ms === 'number') { b.latency.totalMs.push(l.total_ms); any = true; }
-  if (typeof l.stt_ms === 'number') { b.latency.sttMs.push(l.stt_ms); any = true; }
-  if (typeof l.llm_ttft_ms === 'number') { b.latency.llmTtftMs.push(l.llm_ttft_ms); any = true; }
-  if (typeof l.tts_ttfb_ms === 'number') { b.latency.ttsTtfbMs.push(l.tts_ttfb_ms); any = true; }
+  for (const [key, bucket] of Object.entries(LATENCY_BUCKET) as [keyof LatencyMs, Exclude<keyof LatencySamples, 'missing'>][]) {
+    const v = l[key];
+    if (typeof v !== 'number') continue;
+    b.latency[bucket].push(v);
+    any = true;
+  }
   if (!any) b.latency.missing += 1;
 }
 
@@ -271,13 +335,22 @@ function pushRetry(b: ReportBucket, t: TurnCompletedEvent): void {
   if (r > b.maxRetryObserved) b.maxRetryObserved = r;
 }
 
-function accumulate(b: ReportBucket, e: InteractionEvent): void {
+/**
+ * 종료 이벤트의 유입 경로를 찾는 수단. **같은 집계 범위의 시작 이벤트에서만** 가져온다 —
+ * 범위 밖을 뒤지면 기간 필터가 지표마다 다르게 적용되고, 만들어 넣으면 §13-3 위반이다.
+ */
+type EntryPointLookup = (interactionId: string) => EntryPoint | undefined;
+
+function accumulate(b: ReportBucket, e: InteractionEvent, entryPointOf: EntryPointLookup): void {
   if (!bump(b.channels as unknown as Record<string, number>, e.channel)) b.channelsUnknown += 1;
 
   switch (e.type) {
-    case 'session.started':
+    case 'session.started': {
       b.sessionsStarted += 1;
+      const ep = (e as SessionStartedEvent).entry_point;
+      if (!bump(b.entryPoints as unknown as Record<string, number>, ep)) b.sessionsMissingEntryPoint += 1;
       break;
+    }
     case 'turn.completed': {
       const t = e as TurnCompletedEvent;
       b.turns += 1;
@@ -310,6 +383,13 @@ function accumulate(b: ReportBucket, e: InteractionEvent): void {
       }
       if (typeof s.duration_ms === 'number') b.durationMs.push(s.duration_ms);
       else b.sessionsMissingDuration += 1;
+      // 유입 경로별 Outcome. 종료 자체에는 경로가 없으므로 시작 이벤트와 짝짓는다(위 필드 주석).
+      // 짝을 못 찾았거나 그 시작이 경로를 선언하지 않았으면 **어느 경로에도 넣지 않는다**.
+      const ep = entryPointOf(e.interaction_id);
+      if (ep === undefined) b.sessionsEndedWithUnknownEntryPoint += 1;
+      else if (!bump(b.outcomesByEntryPoint[ep] as unknown as Record<string, number>, s.outcome)) {
+        // 계약 밖 Outcome 은 `outcomesUnknown` 이 이미 셌다 — 같은 사실을 두 번 세지 않는다.
+      }
       break;
     }
   }
@@ -365,6 +445,23 @@ export function aggregateReport(events: InteractionEvent[], opts: ReportOptions)
   });
   const outOfRangeDropped = unique.length - inRange.length - timestampsRejected;
 
+  // 유입 경로 맵을 **버킷을 돌기 전에** 만든다 — 종료가 시작보다 먼저 오는 원장(추가 전용
+  // 원장은 시각 순서를 보장하지 않는다)에서도 같은 답이 나와야 한다. 한 상호작용에 시작이
+  // 둘이면(재전송이 아닌 중복 시작) **첫 선언을 쓰지 않고 그 상호작용을 모름으로 둔다**:
+  // 어느 쪽이 맞는지 Core 는 고를 수 없고, 골라 주면 그 규칙이 조용히 실적을 한쪽으로 옮긴다(§2).
+  const entryPointByInteraction = new Map<string, EntryPoint | null>();
+  for (const e of inRange) {
+    if (e.type !== 'session.started') continue;
+    const ep = (e as SessionStartedEvent).entry_point;
+    const known = ep !== undefined && (ENTRY_POINTS as readonly string[]).includes(ep) ? ep : null;
+    const prev = entryPointByInteraction.get(e.interaction_id);
+    entryPointByInteraction.set(
+      e.interaction_id,
+      prev === undefined ? known : (prev === known ? known : null),
+    );
+  }
+  const entryPointOf: EntryPointLookup = (id) => entryPointByInteraction.get(id) ?? undefined;
+
   const map = new Map<string, ReportBucket>();
   const total = newBucket('total');
 
@@ -375,8 +472,8 @@ export function aggregateReport(events: InteractionEvent[], opts: ReportOptions)
       b = newBucket(key);
       map.set(key, b);
     }
-    accumulate(b, e);
-    accumulate(total, e);
+    accumulate(b, e, entryPointOf);
+    accumulate(total, e, entryPointOf);
   }
 
   return {

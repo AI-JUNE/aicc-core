@@ -69,6 +69,7 @@ import type { LogContext, LogLevel, Logger } from './logger.ts';
 import type { CaptureContext, ErrorMonitor, ErrorReport } from './errorMonitor.ts';
 import { normalizeError } from './errorMonitor.ts';
 import type { ChannelAdapterId, ChannelTurnResult } from '../channels/contract.ts';
+import { BRIDGE_OPS } from '../channels/contract.ts';
 import type { HealthSample, HealthState } from '../ops/fallback.ts';
 
 export const OBSERVABILITY_CONTRACT_VERSION = 1;
@@ -407,8 +408,14 @@ export const REJECTION_EVENT = 'core.bridge.rejected';
 /** 계약 경고 이벤트. */
 export const WARNING_EVENT = 'core.contract.warning';
 
-/** 관측에 실어도 되는 브리지 op. 모르는 op 는 **임의 문자열**이라 값을 싣지 않는다(발화가 들어올 수 있다). */
-const KNOWN_BRIDGE_OPS: readonly string[] = ['hello', 'start', 'send', 'end', 'health'];
+/**
+ * 관측에 실어도 되는 브리지 op. 모르는 op 는 **임의 문자열**이라 값을 싣지 않는다(발화가 들어올 수 있다).
+ *
+ * 목록은 채널 계약(`channels/contract.ts`) 하나다 — 여기 사본을 두었던 동안, op 가 하나 늘면
+ * 그 op 의 경계 실패는 로그에서 `op` 필드가 빠진 채 남았다. 즉 **어느 줄에 붙은 실패인지
+ * 알 수 없는 상태**이고, 그것이 하필 "그 채널만 통화가 안 된다"를 조사하는 자리다.
+ */
+const KNOWN_BRIDGE_OPS: readonly string[] = BRIDGE_OPS;
 
 /**
  * 고정 필드(`code`)에 실어도 되는 열거값 형태.
