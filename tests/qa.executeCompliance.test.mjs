@@ -70,7 +70,9 @@ test('규칙은 복사된다 — 호스트가 나중에 배열을 고쳐 점검 
   input.forbiddenPhrases.push({ id: 'f2', phrase: '원금 보장', severity: 'critical', reasonKo: 'x' });
   input.disclosureMarkers.push('딴것');
   assert.equal(rules.forbiddenPhrases.length, 1);
-  assert.equal(rules.disclosureMarkers.length, 1);
+  assert.equal(rules.disclosureMarkers.includes('딴것'), false);
+  // 표식은 테넌트 선언 + 설정에서 뽑은 전문이다(아래 "고지 문구가 곧 표식" 참조).
+  assert.equal(rules.disclosureMarkers[0], 'AI 상담');
 });
 
 // ── 수집: 잘라낸 범위를 "위반 0건"으로 적지 않는다 ───────────────────────────
@@ -228,8 +230,14 @@ test('고지 설정·표식·금칙어 미등록은 막지 않고 경고로 드�
   assert.deepEqual(noDisc.errorsKo, []);
   assert.ok(noDisc.warningsKo.some((w) => /출처는 AiDisclosureConfig 하나/.test(w)));
 
+  // 표식을 등록하지 않아도 **배선된 고지 설정의 문구**가 표식이 되므로 점검은 돈다(§2) —
+  // 경고는 그 설정에서도 뽑을 문구가 없을 때만 나온다(미설정·끔·공백).
   const noMarker = X.validateComplianceBinding(RULE_INPUT({ disclosureMarkers: [] }));
-  assert.ok(noMarker.warningsKo.some((w) => /표식이 없어/.test(w)));
+  assert.equal(noMarker.warningsKo.some((w) => /표식이 없어/.test(w)), false);
+  const noText = X.validateComplianceBinding(RULE_INPUT({
+    disclosureMarkers: [], disclosure: DISC({ channels: {} }),
+  }));
+  assert.ok(noText.warningsKo.some((w) => /표식이 없어/.test(w)));
 
   const noPhrase = X.validateComplianceBinding(RULE_INPUT({ forbiddenPhrases: [] }));
   assert.ok(noPhrase.warningsKo.some((w) => /skipped/.test(w)));

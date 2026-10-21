@@ -38,6 +38,7 @@
 import type { ChannelKind } from '../domain/types.ts';
 import type { InteractionEvent } from '../events/schema.ts';
 import type { TenantScope } from '../core/tenancy.ts';
+import { maskPii } from '../core/policyGuard.ts';
 import type { AiDisclosureConfig } from '../portal/aiDisclosure.ts';
 import { resolveDisclosure } from '../portal/aiDisclosure.ts';
 import type { ForbiddenPhraseRule, QaReport, QaRuleId, QaRuleSet, QaSeverity } from './compliance.ts';
@@ -92,8 +93,12 @@ export function appendForReview(
 export interface ComplianceRuleInput {
   scope: TenantScope;
   /**
-   * 고지 발화 판별용 표식(§10.1). 테넌트가 등록한 핵심 어구이며 Core 가 만들지 않는다(§13-3) —
-   * 문구는 업권·약관·감독기관에 따라 다르다 **[승인 필요]**.
+   * 고지 발화 판별용 **추가** 표식(§10.1). 테넌트가 등록한 핵심 어구이며 Core 가 만들지
+   * 않는다(§13-3) — 문구는 업권·약관·감독기관에 따라 다르다 **[승인 필요]**.
+   *
+   * 배선된 고지 설정의 문구는 `derivedDisclosureMarkers` 가 **자동으로** 표식이 되므로,
+   * 여기에 적어야 하는 것은 그 설정 밖의 문구뿐이다(지난 문구로 기록된 통화를 함께 점검하거나,
+   * 포털·IVR 메뉴 등 다른 경로로 나간 고지를 함께 보려는 경우). 비워 두어도 고지 점검은 돈다.
    */
   disclosureMarkers: readonly string[];
   /** 금칙어 규칙. 문구와 사유는 테넌트 법무·컴플라이언스가 등록한다(§13-3). */
@@ -105,6 +110,59 @@ export interface ComplianceRuleInput {
   disclosure?: AiDisclosureConfig;
   /** 실제로 등록된 채널만. 붙지도 않은 채널의 고지 요구를 만들어 내지 않는다. */
   channels: readonly ChannelKind[];
+}
+
+/**
+ * 배선된 고지 설정에서 **Core 가 실제로 내보내는 문구**를 표식으로 뽑는다(§2·§10.1).
+ *
+ * 왜 뽑는가: 고지 필수 여부는 `AiDisclosureConfig` 하나를 출처로 삼았는데(위 머리말) **문구는
+ * 그러지 않았다** — 같은 문장을 고지 설정과 QA 표식에 **두 번** 선언하게 두었고, 어긋남의
+ * 방향이 둘 다 조용하다.
+ *  - **문구를 고치고 표식을 그대로 두면** 그날부터 모든 세션이 `disclosure_missing`(critical) 로
+ *    잡혀 리뷰 큐가 통째로 잠긴다 — 진짜 위반이 그 안에 묻힌다.
+ *  - **표식을 등록하지 않으면** 고지 점검이 통째로 건너뛰어지고(`skipped`), 그 상태는 운영
+ *    화면에서 "위반 0건"과 거의 같게 보인다. 고지는 나가는데 아무도 점검하지 않는 셈이다.
+ * 설정을 읽으면 두 방향이 같이 사라진다. **문구를 만들어 내지는 않는다**(§13-3) — 설정에
+ * 문구가 없으면 뽑히는 표식도 없다.
+ *
+ * **전문을 그대로 쓴다.** `QaRuleSet.disclosureMarkers` 주석은 "전문 비교는 TTS 치환·띄어쓰기로
+ * 쉽게 깨진다"고 적어 두었지만, 그 위험은 **고객이 들은 소리**와 비교할 때의 이야기다. 점검은
+ * §8.1 원장의 `utterance_masked` 를 보고, 그 값은 **Core 가 이 설정에서 그대로 만든 문자열**이다
+ * (`planDisclosure` → `turnCompleted`). 그래서 전문이 가장 정확한 표식이다.
+ *
+ * 다만 `maskPii` 를 **같이 통과시킨다** — 고지 문구에 대표번호가 들어 있으면 원장에는 마스킹된
+ * 형태로 남으므로, 설정 원문을 그대로 표식으로 쓰면 그 테넌트만 전 세션이 고지 누락으로 잡힌다.
+ * (마스킹이 멱등이 아니므로 **한 번만** 통과시킨다.)
+ */
+export function derivedDisclosureMarkers(
+  cfg: AiDisclosureConfig,
+  channels: readonly ChannelKind[],
+): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const ch of channels) {
+    const d = resolveDisclosure(cfg, ch);
+    if (!d.show) continue;
+    const text = maskPii(d.disclosure.text).text;
+    const n = normalizeForMatch(text);
+    if (n === '' || seen.has(n)) continue;   // 비교할 수 없는 문구·채널 간 같은 문구
+    seen.add(n);
+    out.push(text);
+  }
+  return out;
+}
+
+/** 정규화 기준으로 같은 표식을 한 번만 남긴다 — 같은 발화가 두 표식에 걸려도 판정은 하나다. */
+function dedupeMarkers(markers: readonly string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const m of markers) {
+    const n = normalizeForMatch(typeof m === 'string' ? m : '');
+    if (n === '' || seen.has(n)) continue;
+    seen.add(n);
+    out.push(m);
+  }
+  return out;
 }
 
 /**
@@ -135,7 +193,12 @@ export function buildQaRuleSet(input: ComplianceRuleInput): QaRuleSet {
   return {
     tenantId: input.scope.tenantId,
     disclosureRequired,
-    disclosureMarkers: [...input.disclosureMarkers],
+    // 테넌트가 적은 표식을 **먼저** 둔다(명시적 선언이 먼저 걸리는 쪽이 사후 추적에 낫다).
+    // 설정에서 뽑은 전문은 뒤에 붙는다 — 둘 중 하나라도 걸리면 고지로 본다.
+    disclosureMarkers: dedupeMarkers([
+      ...input.disclosureMarkers,
+      ...(cfg !== undefined ? derivedDisclosureMarkers(cfg, input.channels) : []),
+    ]),
     forbiddenPhrases: input.forbiddenPhrases.map((r) => ({ ...r, ...(r.channels ? { channels: [...r.channels] } : {}) })),
   };
 }
@@ -316,14 +379,38 @@ export function validateComplianceBinding(input: ComplianceRuleInput & { maxEven
   }
 
   const markers = input.disclosureMarkers.filter((m) => normalizeForMatch(m) !== '');
+  const derived = input.disclosure === undefined
+    ? []
+    : derivedDisclosureMarkers(input.disclosure, input.channels);
   if (input.disclosure === undefined) {
     warningsKo.push('고지 설정(disclosure)이 배선되지 않아 §10.1 고지 점검을 수행하지 않습니다 — '
       + '고지 필수 여부의 출처는 AiDisclosureConfig 하나입니다(§2).');
-  } else if (markers.length === 0) {
+  } else if (markers.length === 0 && derived.length === 0) {
+    // 설정은 있는데 뽑을 문구가 없다(전 채널이 미설정·끔·공백). 그 채널들은 고지 필수도 아니므로
+    // 점검은 `skipped` 로 남는다 — 막지 않되 "위반 0건"으로 읽히지 않게 적는다.
     warningsKo.push('고지 발화를 판별할 표식이 없어 §10.1 고지 점검을 수행하지 않습니다 — '
-      + '문구 전문 비교는 TTS 치환·띄어쓰기로 깨지므로 테넌트가 핵심 어구를 등록해야 합니다 [승인 필요].');
-  } else if (markers.length < input.disclosureMarkers.length) {
+      + '배선된 고지 설정에서 뽑을 문구가 없고(미설정·끔·공백) 테넌트가 등록한 표식도 없습니다.');
+  }
+  if (markers.length < input.disclosureMarkers.length) {
     warningsKo.push('비교할 수 없는 고지 표식(공백·문장부호만)이 섞여 있습니다 — 그 표식은 어떤 발화와도 일치하지 않습니다.');
+  }
+  // **낡은 표식**: 지금 설정된 어떤 고지 문구에도 들어 있지 않은 표식. 문구를 고치고 표식을
+  // 그대로 둔 상태가 바로 이 모양이고, 그 상태의 증상은 "그날부터 전 세션이 고지 누락"이었다.
+  // 지금은 설정 문구가 자동으로 표식이 되므로 그 사고는 일어나지 않지만, **표식이 가리키는
+  // 문구가 더는 나가지 않는다는 사실**은 운영이 알아야 한다(지난 원장을 함께 점검하려는
+  // 의도일 수도 있어 막지 않는다).
+  if (derived.length > 0) {
+    const stale = markers.filter((m) => {
+      const n = normalizeForMatch(m);
+      return !derived.some((d) => normalizeForMatch(d).includes(n));
+    });
+    if (stale.length > 0) {
+      warningsKo.push(
+        `지금 설정된 고지 문구에 없는 표식이 ${stale.length}건 있습니다: ${stale.join(', ')} — `
+        + '문구를 고치고 표식을 그대로 둔 상태일 수 있습니다(지난 문구로 기록된 통화를 함께 '
+        + '점검하려는 것이면 의도된 상태입니다). 지금 나가는 고지는 설정 문구로 판별합니다(§2).',
+      );
+    }
   }
   if (input.forbiddenPhrases.length === 0) {
     warningsKo.push('등록된 금칙어 규칙이 없어 금칙 표현 점검을 수행하지 않습니다 — '

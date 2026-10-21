@@ -2796,14 +2796,16 @@ test('경고: 고지 설정이 없으면 고지 점검을 하지 않는다는 �
   assert.ok(r.compliance.skipped.some((s) => s.ruleId === 'disclosure_missing'));
 });
 
-test('경고: 표식·금칙어 미등록은 막지 않되 그 항목이 합격이 아님을 드러낸다', b, () => {
+test('경고: 금칙어 미등록은 막지 않되 그 항목이 합격이 아님을 드러낸다', b, () => {
   const { core } = build({
     disclosure: DISC(),
     qa: qaWiring({ disclosureMarkers: [], forbiddenPhrases: [] }).binding,
   });
   const w = core.warnings().filter((i) => i.code === 'W_QA').map((x) => x.messageKo);
-  assert.ok(w.some((m) => /표식이 없어/.test(m)));
   assert.ok(w.some((m) => /skipped/.test(m)));
+  // 표식을 등록하지 않아도 **배선된 고지 설정의 문구**가 표식이 되므로 고지 점검은 돈다(§2) —
+  // 이 경고는 설정에서도 뽑을 문구가 없을 때만 나온다.
+  assert.equal(w.some((m) => /표식이 없어/.test(m)), false);
 });
 
 test('호스트가 넘긴 동의 컨텍스트는 덮어쓰지 않는다 — 그 경로는 종전과 같다', b, async () => {
