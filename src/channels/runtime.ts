@@ -3140,6 +3140,26 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     }
     rec.state.channel = channel;
     if (!rec.channels.includes(channel)) rec.channels.push(channel);
+
+    // §9.3 판정은 **네 진입점에서 같아야 한다**. 아래 `stampOutage` 는 축소 지시(저하된 TTS 등)를
+    // 찍으면서 "경로마다 따로 판단하지 않는다"고 적어 두었는데, 정작 그 **한 층 위의 모드**
+    // (`unavailable`·`legacy_ivr`·`agent_only`)는 합류에서만 보지 않았다 — `start`·`send` 는 둘 다 본다.
+    //
+    // 빠뜨린 쪽의 증상이 둘 다 조용하다:
+    //  - 매체 계층이 죽은 상태의 합류(`unavailable`)는 **죽은 매체로 present 를 부르고 끝난다**.
+    //    고객이 보는 것은 빈 화면이고, 세션은 `running` 으로 남는다. 고객은 그 화면에 아무것도
+    //    입력할 수 없으므로 `send` 가 영영 오지 않고 — `send` 가 §9.3 을 보는 유일한 다음 기회다 —
+    //    그 통화는 `session.ended` 없이 끝난다(§7 5.2 점검도 §4.1 Outcome 도 없다).
+    //  - 인지 계층이 죽은 상태의 합류(`agent_only`·`legacy_ivr`)는 **AI 가 죽은 매체에서 §10.1
+    //    AI 고지를 내보낸 뒤** 다음 입력에서야 상담사로 간다. 고객은 한 턴을 헛되게 쓰고,
+    //    그 고지는 추가 전용 원장에 남는다.
+    // 토큰 검증 **뒤에** 본다 — 순서를 바꾸면 남의 손에 남은 낡은 링크 하나가 진행 중인 상담을
+    // 종료시킬 수 있다(§5.2·§10.3). 판정은 이 턴에서 한 번만 하고 아래 `stampOutage` 가 같은
+    // 값을 쓴다(한 턴에 두 판정이 돌면 무엇을 보고 보냈는지가 사라진다, §2).
+    const decision = health(channel);
+    const outage = await applyOutage(rec, decision, reg);
+    if (outage) return outage;
+
     // 같은 Interaction·같은 노드를 새 채널 렌더러로 다시 그린다. 새 발화가 아니므로 턴 이벤트를 만들지 않는다(§8.1).
     const node = rec.state.currentNodeId === null ? undefined : rec.flow.nodes[rec.state.currentNodeId];
     const steps = node ? [renderNode(node, channel)] : [];
@@ -3154,7 +3174,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     // 합류한 매체에도 §9.3 축소 지시를 찍는다. 지금 열 수 있는 목적지(화면·채팅)는 STT·TTS 에
     // 의존하지 않아 대개 빈 목록이지만, **경로마다 따로 판단하지 않는다** — 빠뜨린 경로는
     // "그 채널에서만 안 꺼진다"로 나타나고 그건 재현이 가장 어려운 종류의 결함이다(§2).
-    stampOutage(steps, health(channel));
+    stampOutage(steps, decision);
     recordTurns(rec, events);
     const result: ChannelTurnResult = {
       interactionId: rec.interactionId, state: rec.state, steps, status: rec.state.status, events,
