@@ -8,7 +8,7 @@ import { decideFallback, type FallbackAction } from '../core/session.ts';
 import { buildReprompt, classifyFailure, type FailureSignal, type RepromptPolicy, type RepromptReason } from './reprompt.ts';
 import { resolveTurnTiming, type TurnTimingPolicy } from './timing.ts';
 import {
-  sessionStarted, turnCompleted, handoffRequested, sessionEnded,
+  measuredDurationMs, sessionStarted, turnCompleted, handoffRequested, sessionEnded,
   type EntryPoint, type EventMeta, type InteractionEvent, type LatencyMs,
 } from '../events/schema.ts';
 
@@ -65,6 +65,16 @@ export interface RunnerContext {
   /** 신뢰도 임계값. 테넌트 설정값이며 미지정 시 신뢰도 게이팅을 하지 않는다(임의 수치 금지 §13-3). */
   minConfidence?: number;
   entryPoint?: EntryPoint;
+  /**
+   * 이 세션이 시작된 시각(ISO8601). 주면 종료 이벤트에 **세션 길이 실측**이 실린다
+   * (`session.ended.duration_ms`, §8.1). 주지 않으면 종전과 완전히 같다(§13-3) —
+   * 그 통화는 리포트·상호작용 조회에서 `sessionsMissingDuration` 으로 세어진다.
+   *
+   * Runner 가 스스로 시작 시각을 들고 있지 않은 이유: `FlowState` 는 턴마다 복제되는 순수 상태이고
+   * 세션의 시작은 그보다 위(채널 런타임의 세션 레코드)에서 정해진다. 거기서 받은 값을 쓰면
+   * §4.1 `resolveOutcome` 이 보는 `startedAt` 과 **같은 값**이 되어 길이와 Outcome 이 같은 구간을 본다.
+   */
+  startedAt?: string;
   /**
    * 재프롬프트 정책(§5.1). 주지 않으면 종전대로 노드 원문을 그대로 재생한다 —
    * Core 가 기본 문안을 지어내지 않기 때문이다(§13-3).
@@ -150,7 +160,15 @@ function confidenceOk(input: FlowInput, ctx: RunnerContext): boolean {
 function terminate(s: FlowState, ctx: RunnerContext, events: InteractionEvent[], status: RunStatus, outcome: Outcome): void {
   s.status = status;
   s.currentNodeId = null;
-  events.push(sessionEnded(meta(s, ctx), { outcome, turnCount: s.turnCount }));
+  // 길이는 **이 이벤트의 시각까지**로 잰다 — 종료 뒤에 다시 시계를 읽으면 그 사이의 발행·전송
+  // 시간이 통화 길이로 들어가고, 그러면 원장의 `occurred_at - session.started` 와 어긋난다.
+  const m = meta(s, ctx);
+  const durationMs = measuredDurationMs(ctx.startedAt, m.occurredAt);
+  events.push(sessionEnded(m, {
+    outcome,
+    turnCount: s.turnCount,
+    ...(durationMs !== undefined ? { durationMs } : {}),
+  }));
 }
 
 /** 입력이 필요 없는 노드(Say)를 연속 실행하고, 입력 대기 노드나 종료에서 멈춘다. */

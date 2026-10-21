@@ -28,7 +28,7 @@ import { assertTenantScope } from '../core/tenancy.ts';
 import type { DataClass, RetentionPolicy } from '../core/retention.ts';
 import { canStore } from '../core/retention.ts';
 import type { EventMeta, InteractionEvent, LatencyMs, TurnCompletedEvent, HandoffRequestedEvent, UsageMetrics } from '../events/schema.ts';
-import { sessionStarted, sessionEnded, handoffRequested, turnCompleted } from '../events/schema.ts';
+import { measuredDurationMs, sessionStarted, sessionEnded, handoffRequested, turnCompleted } from '../events/schema.ts';
 import type { EventBus, PublishResult } from '../events/bus.ts';
 import type { ComponentId, FallbackDecision, FallbackPolicy, HealthRegistry, HealthSample } from '../ops/fallback.ts';
 import { decideFallbackMode, mediaDisabledBy } from '../ops/fallback.ts';
@@ -1955,6 +1955,22 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     };
   }
 
+  /**
+   * 이 세션의 길이 실측(§8.1 `duration_ms`). 산출 규칙은 `measuredDurationMs` 하나다(§2) —
+   * Runner 의 종료 경로도 같은 함수를 쓴다.
+   *
+   * **끝나는 길이 네 갈래라 한 자리에 모았다**: 정상 종료·§9.3 폴백 중단·폴백 이관·커넥터 순회
+   * 상한. 자리마다 적으면 빠지는 쪽이 생기고, 빠진 쪽은 "그 종류로 끝난 통화만 길이가 없다"로
+   * 나타나 평균이 조용히 한쪽으로 쏠린다(폴백으로 끝난 통화가 대개 가장 짧다).
+   *
+   * 값을 못 만들면 필드를 만들지 않는다 — 그 통화는 리포트·조회에서 `sessionsMissingDuration`
+   * 으로 세어지고, 그것이 "재지 못했다"의 유일한 정직한 신호다(§13-3).
+   */
+  function sessionDuration(rec: SessionRecord, endedAtIso: string): { durationMs?: number } {
+    const durationMs = measuredDurationMs(rec.startedAt, endedAtIso);
+    return durationMs === undefined ? {} : { durationMs };
+  }
+
   async function publish(events: InteractionEvent[]): Promise<void> {
     if (!opts.bus || events.length === 0) return;
     const results = await opts.bus.publishAll(events);
@@ -2237,6 +2253,10 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       // 전환이 배선되면 링크를 실제로 보낼 수 있는지까지 본다 — 사다리가 전환을 고른 뒤에
       // 발급이 막히면 고객은 통화 중인데 화면용 단계를 듣게 된다(switchFeasible 주석 참조).
       visualAvailable: caps.channel === 'visual' || switchFeasible(rec, caps),
+      // Runner 가 끝내는 세션(End 노드 도달·순회 상한·재시도 소진 이관)의 길이도 **여기서 받은
+      // 같은 시작 시각**으로 잰다. 넘기지 않으면 그 종료들만 `duration_ms` 가 비고, 증상은
+      // "자동완결된 통화만 길이가 없다"가 된다 — 하필 가장 많은 종료 경로다(§8.1·§13-3).
+      startedAt: rec.startedAt,
       now,
     };
     if (opts.minConfidence !== undefined) ctx.minConfidence = opts.minConfidence;
@@ -2288,7 +2308,10 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     if (decision.mode === 'unavailable') {
       rec.state.status = 'failed';
       rec.state.currentNodeId = null;
-      events.push(sessionEnded(meta(rec), { outcome: 'FAILED', turnCount: rec.state.turnCount }));
+      const mFailed = meta(rec);
+      events.push(sessionEnded(mFailed, {
+        outcome: 'FAILED', turnCount: rec.state.turnCount, ...sessionDuration(rec, mFailed.occurredAt),
+      }));
       rec.ended = true;
       await publish(events);
       // 폴백으로 끝난 통화도 점검한다 — `end()` 에만 걸면 이 통화는 영영 점검되지 않는다(§7 5.2).
@@ -2307,7 +2330,10 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     rec.state.currentNodeId = null;
     rec.state.handoff = { reason: 'error', ...(queue !== undefined ? { queue } : {}) };
     events.push(handoffRequested(meta(rec), { reason: 'error', ...(queue !== undefined ? { toQueue: queue } : {}) }));
-    events.push(sessionEnded(meta(rec), { outcome: 'TRANSFERRED', turnCount: rec.state.turnCount }));
+    const mTransferred = meta(rec);
+    events.push(sessionEnded(mTransferred, {
+      outcome: 'TRANSFERRED', turnCount: rec.state.turnCount, ...sessionDuration(rec, mTransferred.occurredAt),
+    }));
     const summaryMasked = attachSummary(rec, events);
     rec.ended = true;
     await publish(events);
@@ -2440,7 +2466,10 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
           rec.state.status = 'failed';
           rec.state.currentNodeId = null;
           rec.state.error = 'Api 노드 순회 상한 초과(커넥터 순환 의심)';
-          events.push(sessionEnded(meta(rec), { outcome: 'FAILED', turnCount: rec.state.turnCount }));
+          const mHopLimit = meta(rec);
+          events.push(sessionEnded(mHopLimit, {
+            outcome: 'FAILED', turnCount: rec.state.turnCount, ...sessionDuration(rec, mHopLimit.occurredAt),
+          }));
           rec.ended = true;
           sessions.put(rec);
           return { steps, events, presented, endReasonKo: rec.state.error };
@@ -3457,8 +3486,13 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
         id: rec.interactionId, tenantId: rec.scope.tenantId, startedAt: rec.startedAt, endedAt: now(),
         channels: [...rec.channels], turns: rec.turns, entities: { ...rec.state.slots },
       });
-      const events: InteractionEvent[] = [sessionEnded(meta(rec), {
+      const mEnded = meta(rec);
+      const events: InteractionEvent[] = [sessionEnded(mEnded, {
         outcome, turnCount: rec.state.turnCount,
+        // 세션 전체 길이와 **과금 구간은 다른 값이다**(§11.2): 전자는 Core 가 재고, 후자는
+        // 대기·호 설정을 포함할지가 계약 사항이라 채널이 선언한다. 길이로 과금 구간을 대신
+        // 채우지 않는다 — 그 한 줄이 통화 요금의 근거를 추정으로 바꾼다(§13-3).
+        ...sessionDuration(rec, mEnded.occurredAt),
         ...(check?.ok ? { billableMs: check.billableMs } : {}),
       })];
       rec.state.status = 'completed';

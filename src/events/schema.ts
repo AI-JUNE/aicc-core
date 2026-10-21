@@ -185,6 +185,27 @@ export function handoffRequested(
   };
 }
 
+/**
+ * 세션 길이 실측(ms) — `session.ended.duration_ms` 의 **유일한 산출 규칙**이다(§2·§13-3).
+ *
+ * 규칙을 여기 한 곳에 두는 이유: 이 값을 만드는 자리가 다섯이다(Runner 의 종료 네 갈래와
+ * 채널 런타임의 폴백·커넥터 상한·정상 종료). 자리마다 각자 재면 같은 통화가 경로에 따라 다른
+ * 길이로 적히고, 그 차이는 예외가 아니라 **리포트와 상호작용 조회의 숫자가 갈리는 것**으로만
+ * 나타난다(두 화면 모두 이 필드만 읽고 이벤트 시각으로 다시 계산하지 않는다).
+ *
+ * 읽을 수 없는 시각·거꾸로 간 시계는 **값을 만들지 않는다**(§13-3). 0 으로 적으면 "0초 통화를
+ * 실측했다"가 되고, 음수를 그대로 적으면 소비자가 그 값을 거부로 센다 — 둘 다 "재지 못했다"와
+ * 다른 사실이다. 없을 때의 정직한 신호는 소비자의 `sessionsMissingDuration` 하나다.
+ * 두 시각이 같으면 `0` 이다 — 그것은 누락이 아니라 같은 시점을 가리키는 실측이다.
+ */
+export function measuredDurationMs(startedAtIso: string | undefined, endedAtIso: string): number | undefined {
+  if (startedAtIso === undefined) return undefined;
+  const started = Date.parse(startedAtIso);
+  const ended = Date.parse(endedAtIso);
+  if (Number.isNaN(started) || Number.isNaN(ended) || ended < started) return undefined;
+  return ended - started;
+}
+
 export function sessionEnded(
   m: EventMeta,
   p: {
