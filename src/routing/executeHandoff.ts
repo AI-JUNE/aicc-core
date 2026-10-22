@@ -50,6 +50,7 @@ import type {
   RoutingConfig,
 } from './agentQueue.ts';
 import {
+  admissionIssues,
   admitToQueue,
   exhaustedAction,
   selectQueue,
@@ -248,7 +249,9 @@ export function executeHandoff(cfg: RoutingConfig, req: HandoffRequest): Handoff
     warnings,
   });
 
-  const configIssues = validateRoutingConfig(cfg);
+  // 운영값도 **설정**이다 — 큐 선언만 검증하고 수용 판정의 값을 통과시키면, 틀린 값은 설정
+  // 오류가 아니라 "이관이 전부 콜백으로 끝난다"·"낡은 스냅샷이 영원히 신선하다"로 나타난다.
+  const configIssues = [...validateRoutingConfig(cfg), ...admissionIssues(req.admission)];
   if (configIssues.length > 0) {
     // 설정이 깨진 채로 큐를 고르면 "갈 곳 없는 이관"이 통화 중에 터진다.
     // 대안 행동도 만들지 않는다 — 어느 큐의 선언을 쓸지 정할 근거가 없다(§13-3).

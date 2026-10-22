@@ -424,6 +424,21 @@ test('스냅샷 조회 없이 배선하면 거부한다 — 대기 인원을 추
   assert.throws(() => build({ flows: [flowHandoff], routing: ROUTING({ snapshots: undefined }) }), /스냅샷/);
 });
 
+test('수용 판정의 운영값도 등록 시점에 거부된다 — 통화 중에는 되돌릴 수 없다', b, () => {
+  // 큐 선언은 멀쩡하므로 `validateRoutingConfig` 는 통과한다. 이 두 값만 어디서도 안 걸렸고,
+  // 틀린 채 돌면 "모든 이관이 콜백"(0·음수) 또는 "낡은 스냅샷이 영원히 신선"(NaN)이 된다.
+  for (const admission of [{ staleAfterMs: 0 }, { staleAfterMs: Number.NaN }, { admitWithNoAgents: 'false' }]) {
+    assert.throws(
+      () => build({ flows: [flowHandoff], routing: ROUTING({ admission }) }),
+      /라우팅 배선 거부/,
+      `통과했다: ${JSON.stringify(admission)}`,
+    );
+  }
+  // 주지 않거나 올바르면 종전과 완전히 같다.
+  assert.doesNotThrow(() => build({ flows: [flowHandoff], routing: ROUTING() }));
+  assert.doesNotThrow(() => build({ flows: [flowHandoff], routing: ROUTING({ admission: { staleAfterMs: 60_000 } }) }));
+});
+
 test('§9.3 장애 폴백 큐는 라우팅 규칙으로 다시 고르지 않는다', b, async () => {
   // 폴백 경로가 라우팅 설정에 의존하면 설정이 깨졌을 때 폴백까지 같이 죽는다.
   const { core, port } = build({

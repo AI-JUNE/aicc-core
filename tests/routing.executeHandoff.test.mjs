@@ -142,6 +142,44 @@ test('상담사 0명은 기본적으로 수용하지 않지만 테넌트가 선�
   assert.equal(p.placement, 'queued');
 });
 
+// ── 수용 판정의 운영값 ───────────────────────────────────────────────────────
+// 스냅샷과 설정은 걸러지는데 이 두 값만 어디서도 검사되지 않았다. 둘이 어긋나는 방식은
+// 전부 조용하고, 하필 서로 반대 방향으로 틀린다.
+
+test('staleAfterMs 가 NaN·무한이면 신선도 검사가 조용히 꺼지는 대신 설정 오류가 된다', b, () => {
+  const old = snap('q_general', 0, 3, '2026-03-02T00:00:00.000Z'); // 1시간 전
+  for (const bad of [Number.NaN, Infinity, -1, 0, 1.5, '60000']) {
+    const p = rt.executeHandoff(cfg(), req({ snapshots: [old], admission: { staleAfterMs: bad } }));
+    assert.equal(p.placement, 'unavailable', `통과했다: ${String(bad)}`);
+    assert.equal(p.code, 'E_CONFIG_INVALID');
+    assert.ok(p.issues.some((i) => /staleAfterMs/.test(i)));
+    assert.equal('queueId' in p, false, '설정이 틀린 채로 놓을 큐를 만들면 안 된다');
+  }
+  // 검사를 붙이지 않았을 때 실제로 일어나는 일을 고정해 둔다 — 1시간 전 관측이 "신선"하다.
+  assert.equal(aq.admitToQueue(cfg(), 'q_general', [old], NOW, { staleAfterMs: Number.NaN }).status, 'accepted');
+});
+
+test("admitWithNoAgents 가 문자열 'false' 면 상담사 0명 큐에 넣는 대신 설정 오류가 된다", b, () => {
+  const none = [snap('q_general', 0, 0)];
+  const p = rt.executeHandoff(cfg(), req({ snapshots: none, admission: { admitWithNoAgents: 'false' } }));
+  assert.equal(p.placement, 'unavailable');
+  assert.equal(p.code, 'E_CONFIG_INVALID');
+  assert.ok(p.issues.some((i) => /admitWithNoAgents/.test(i)));
+  // 검사가 없을 때의 결과: 'false' 가 참으로 읽혀 아무도 없는 큐가 열린다.
+  assert.equal(aq.admitToQueue(cfg(), 'q_general', none, NOW, { admitWithNoAgents: 'false' }).status, 'accepted');
+});
+
+test('운영값 판정은 한 곳이다 — 주지 않거나 올바르면 종전과 완전히 같다(§13-3)', b, () => {
+  assert.deepEqual(aq.admissionIssues(undefined), []);
+  assert.deepEqual(aq.admissionIssues({}), []);
+  assert.deepEqual(aq.admissionIssues({ staleAfterMs: 60_000, admitWithNoAgents: false }), []);
+  assert.equal(aq.admissionIssues({ staleAfterMs: 0 }).length, 1);
+  assert.equal(aq.admissionIssues({ staleAfterMs: -1, admitWithNoAgents: 1 }).length, 2);
+  // 설정이 멀쩡하면 판정 결과도 종전 그대로다.
+  const p = rt.executeHandoff(cfg(), req({ admission: { staleAfterMs: 60_000 } }));
+  assert.equal(p.placement, 'queued');
+});
+
 test('오버플로 순환은 통화 중 거절이 아니라 설정 오류로 먼저 걸린다', b, () => {
   const c = cfg({
     queues: [

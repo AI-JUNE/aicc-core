@@ -159,6 +159,47 @@ test('사람용 출력: 실측치와 판정이 보이고 미측정이면 수치�
   assert.ok(!/%/.test(none));
 });
 
+// ── 경로 구분자 (계측이 Windows 에서 한 번도 성립하지 않았다) ─────────────────
+
+test('정상: 역슬래시 경로도 같은 상대경로로 줄어든다 — 구분자를 먼저 통일한다', () => {
+  const r = summarizeCoverage({ files: [
+    { ...file('D:\\repo\\src\\a.ts', 90, 100, 5, 10, 2, 2) },
+    { ...file('D:\\repo\\tests\\a.test.mjs', 10, 10, 1, 1, 1, 1) },
+  ] }, { rootDir: 'D:\\repo' });
+  assert.equal(r.measured, true, '루트를 떼어내지 못하면 계측 대상이 0개가 된다');
+  assert.deepEqual(r.files.map((f) => f.path), ['src/a.ts']);
+  assert.equal(r.excludedCount, 1);
+});
+
+test('실패: 루트가 다르면 상대경로로 줄지 않으므로 계측 대상에서 빠진다', () => {
+  const r = summarizeCoverage({ files: [file('D:\\other\\src\\a.ts', 9, 10, 1, 2, 1, 1)] }, { rootDir: 'D:\\repo' });
+  assert.equal(r.measured, false);
+  assert.ok(r.notesKo.some((n) => /대상 경로/.test(n)));
+});
+
+// ── 실행 사실 (실행기와 판정이 어긋나지 않게) ────────────────────────────────
+
+test('실패: 실행이 성립하지 않았으면 수치가 있어도 실패이며 임계값과 견주지 않는다', () => {
+  const ev = evaluateCoverage(measured(), { lines: 75 }, { issuesKo: ['테스트 3건이 실패했습니다.'] });
+  assert.equal(ev.verdict, 'failed');
+  assert.equal(ev.exitCode, COVERAGE_EXIT_CODE.failed);
+  assert.deepEqual(ev.shortfalls, [], '깨진 실행의 수치를 임계값과 견주면 "통과"가 나온다');
+  assert.ok(ev.reasonsKo.some((r) => /테스트 3건/.test(r)));
+  assert.ok(ev.reasonsKo.some((r) => /근거로 쓰지 않습니다/.test(r)));
+});
+
+test('실패: 텍스트·JSON·종료코드가 같은 말을 한다 — JSON 만 "측정 완료"로 남지 않는다', () => {
+  const run = { issuesKo: ['테스트 실행기가 종료코드 7 로 끝났습니다: 로더가 거부했습니다'] };
+  const ev = evaluateCoverage(measured(), {}, run);
+  assert.match(formatCoverageReport(ev), /실패/);
+  const j = JSON.parse(coverageToJson(ev));
+  assert.equal(j.verdict, 'failed');
+  assert.equal(j.exitCode, COVERAGE_EXIT_CODE.failed);
+  assert.ok(j.reasonsKo.some((r) => /종료코드 7/.test(r)), '원인을 지우면 추측만 남는다');
+  // 같은 리포트를 실행 사실 없이 판정하면 종전과 완전히 같다.
+  assert.equal(evaluateCoverage(measured(), {}).verdict, 'measured');
+});
+
 test('JSON 출력: 분모 0은 null 이고 등급·점수를 만들지 않는다(§13-3)', () => {
   const r = summarizeCoverage({ files: [file('/repo/src/a.ts', 10, 10, 0, 0, 1, 1)] }, { rootDir: ROOT });
   const j = JSON.parse(coverageToJson(evaluateCoverage(r, { lines: 50 })));

@@ -124,6 +124,79 @@ test('STT·TTS 왕복과 base64 정합', b, async () => {
   assert.deepEqual(e.lastUsage(), { tts_audio_ms: 900 });
 });
 
+// ── TTS 응답 판정(중립 JSON 경로) ────────────────────────────────────────────
+// 여기서 막는 것은 전부 예외가 아니라 **조용한 오답**이다 — 통화는 이어지고 고객만 무음·잡음을
+// 듣는다. 같은 검사가 규격 어댑터(openaiAudio)에는 있었고 이 경로에만 없었다.
+
+const ttsSet = (payload) => {
+  const f = fakeFetch(() => jsonRes(payload));
+  return h.createHttpEngineSet({ ...BASE, activation: 'live', approvalRef: 'T', fetchImpl: f, resolveSecret: () => 'k' });
+};
+const drainTts = async (e) => { for await (const _ of e.tts.synthesize('안내드립니다')) { /* noop */ } };
+
+test('오디오가 아닌 mime 은 거절한다 — 200 으로 싸인 오류 JSON 을 재생하지 않는다(§9.3)', b, async () => {
+  const errorBody = h.toBase64(new TextEncoder().encode('{"error":"quota exceeded"}'));
+  assert.throws(() => h.parseTtsResponse({ audio_base64: errorBody, mime: 'application/json' }), (err) => {
+    assert.equal(err.code, 'E_PROTOCOL');
+    assert.equal(err.component, 'tts');
+    assert.match(err.message, /오디오가 아닌 응답 형식: application\/json/);
+    return true;
+  });
+  assert.throws(() => h.parseTtsResponse({ audio_base64: errorBody, mime: 'text/html; charset=utf-8' }),
+    (err) => err.code === 'E_PROTOCOL');
+  // 어댑터 경로에서도 같은 판정이다 — 파서만 고치고 어댑터가 비껴가면 의미가 없다.
+  await assert.rejects(() => drainTts(ttsSet({ audio_base64: errorBody, mime: 'application/json' })),
+    (err) => err.code === 'E_PROTOCOL');
+});
+
+test('빈 오디오는 거절한다 — 0바이트를 내려보내면 고객에게는 무음이고 장애로 잡히지 않는다', b, async () => {
+  for (const empty of ['', '  \n ']) {
+    assert.throws(() => h.parseTtsResponse({ audio_base64: empty, mime: 'audio/wav' }), (err) => {
+      assert.equal(err.code, 'E_PROTOCOL');
+      assert.match(err.message, /비어 있습니다/);
+      return true;
+    });
+  }
+  await assert.rejects(() => drainTts(ttsSet({ audio_base64: '', mime: 'audio/mpeg' })),
+    (err) => err.code === 'E_PROTOCOL');
+});
+
+test('base64 가 아닌 본문은 거절한다 — 디코더가 알파벳 밖 문자를 지우고 그럴듯한 바이트를 만든다', b, () => {
+  // 디코더의 관용함을 그대로 확인해 둔다. 이것이 바로 호출 전에 걸러야 하는 이유다.
+  assert.ok(h.fromBase64('{"error":"nope"}').length > 0);
+  for (const bad of ['{"error":"nope"}', 'YWJj!', 'YWJ', '####']) {
+    assert.throws(() => h.parseTtsResponse({ audio_base64: bad, mime: 'audio/wav' }), (err) => {
+      assert.equal(err.code, 'E_PROTOCOL');
+      assert.match(err.message, /base64 형태가 아닙니다/);
+      return true;
+    }, `거절되지 않았다: ${bad}`);
+  }
+});
+
+test('정상 경로: 줄바꿈이 섞인 base64·매개변수가 붙은 mime 은 통과하고 mime 은 정규화된다', b, async () => {
+  const raw = h.toBase64(new TextEncoder().encode('음성 바이트'));
+  const wrapped = `${raw.slice(0, 4)}\n  ${raw.slice(4)}\n`;   // 일부 서버가 줄을 끊어 보낸다
+  const r = h.parseTtsResponse({ audio_base64: wrapped, mime: 'Audio/MPEG; charset=utf-8' });
+  assert.equal(new TextDecoder().decode(r.chunk.data), '음성 바이트');
+  assert.equal(r.chunk.mime, 'audio/mpeg');
+  assert.equal(r.usage, undefined);                            // 안 준 사용량을 만들지 않는다(§13-3)
+  // 형식을 밝히지 않은 바이트는 실제 TTS 서버가 흔히 쓴다 — 막으면 정상 엔진이 붙지 못한다.
+  assert.equal(h.parseTtsResponse({ audio_base64: raw, mime: 'application/octet-stream' }).chunk.mime,
+    'application/octet-stream');
+});
+
+test('mime 판정은 한 곳이다 — 중립 경로와 규격 어댑터가 같은 함수를 쓴다(§2)', b, () => {
+  assert.equal(h.isAudioMime('audio/wav'), true);
+  assert.equal(h.isAudioMime('AUDIO/WAV; rate=8000'), true);
+  assert.equal(h.isAudioMime('application/octet-stream'), true);
+  assert.equal(h.isAudioMime('application/json'), false);
+  assert.equal(h.isAudioMime(''), false);
+  assert.equal(h.normalizeMime('  Audio/Wav ; x=1'), 'audio/wav');
+  assert.deepEqual(h.base64Shape('YW Jj\n'), { ok: true, clean: 'YWJj' });
+  assert.equal(h.base64Shape('YWJ').ok, false);
+  assert.equal(h.base64Shape('').ok, false);
+});
+
 test('응답 형식 위반은 조용히 넘기지 않는다', b, async () => {
   const f = fakeFetch(() => jsonRes({ embeddings: [[0.1, 0.2]] }));
   const e = h.createHttpEngineSet({ ...BASE, activation: 'live', approvalRef: 'T', fetchImpl: f, resolveSecret: () => 'k' });

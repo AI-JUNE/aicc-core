@@ -3093,6 +3093,95 @@
         (`entryPoints`·`outcomesByEntryPoint`·`sessionsEndedWithUnknownEntryPoint`) ·
         `src/reports/executeReport.ts`(한계 문구) · `tests/portal.entryPoint.test.mjs`(21건 신규) ·
         `API.md` 반영
+      · Core 측 완료(64): **TTS 응답 판정이 한 경로에만 있었다 — 중립 JSON 경로는 오류 본문을
+        소리로 내보냈다(2026-10-22)** — (11)이 OpenAI 호환 음성 규격을 붙일 때 적어 둔 사고
+        목록("빈 응답을 재생", "200 으로 싸인 오류 JSON 을 오디오로 재생")은 그 경로에서만 막혀
+        있었다. 같은 질문을 받는 자리가 둘이고(`openaiAudio` 의 전송 계층 바이너리 보장 +
+        content-type 검사, 그리고 중립 JSON 규약의 `parseTtsResponse`) **뒤쪽에는 검사가 하나도
+        없었다** — mime 은 무엇이든 통과했고 `audio_base64` 는 형태를 보지 않았다.
+        여기서 막는 것은 전부 예외가 아니라 **조용한 오답**이다. 통화는 끊기지 않고 고객만
+        무음이나 잡음을 듣는다 — 장애로 잡히지 않으므로 더 나쁘다.
+        - **mime**: `application/json`·`text/html` 응답이 그대로 오디오 청크가 됐다. 엔진이 200 으로
+          감싼 오류(`{"error":"quota exceeded"}`)는 base64 로 와서 **소리로 재생**된다.
+        - **빈 오디오**: `audio_base64: ''` 가 0바이트 청크로 내려갔다. 고객에게는 무음이고,
+          `collectAudio` 가 빈 오디오를 STT 로 보내지 않는 것과 같은 규칙이 반대 방향에만 없었다.
+        - **base64 형태**: `fromBase64` 는 **알파벳 밖 문자를 조용히 지운다**. 그래서 오류 본문·HTML
+          조각도 그럴듯한 바이트 열이 된다 — 디코더를 고치는 대신(컴포넌트를 몰라 오류에 실을 수
+          없다) 형태 판정(`base64Shape`)을 호출 전에 두었다. 줄바꿈은 데이터가 아니라 지우지만,
+          그 밖의 한 글자는 대개 오류 본문의 흔적이므로 거절한다. 길이가 4의 배수가 아닌 것도
+          잘린 응답이다.
+        **판정을 복사하지 않았다(§2)**: `isAudioMime`·`normalizeMime` 을 `http.ts` 한 곳에 두고
+        규격 어댑터가 자기 인라인 검사를 버리고 그 함수를 쓴다(`audioExtensionOf` 의 정규화도 같은
+        함수로 모았다 — 종전에는 같은 `split(';')` 이 세 벌이었다). 고친 쪽은 **중립 경로의 누락**이고
+        규격 경로의 판정은 바뀌지 않는다. `application/octet-stream` 은 통과시킨다 — 형식을 밝히지
+        않은 바이트는 실제 TTS 서버가 흔히 쓰고, 막으면 멀쩡한 엔진이 붙지 못한다.
+        **변이 검증(도구 출력 그대로)**: mime 검사를 빼면 3건 실패 · 빈 오디오·base64 형태 검사를
+        빼면 2건 실패 — 전부 원본에서는 통과한다.
+        실호출 없음(가짜 fetch 로만 검증). 실엔진 연결은 여전히 **[승인 필요]**.
+        근거: `src/adapters/http.ts`(`isAudioMime`·`normalizeMime`·`base64Shape`·`parseTtsResponse`) ·
+        `src/adapters/openaiAudio.ts`(인라인 검사 제거) · `tests/adapters.http.test.mjs`(5건 추가) ·
+        `API.md` 반영
+      · Core 측 완료(65): **수용 판정의 운영값을 아무도 검증하지 않았다 — 두 값이 서로 반대
+        방향으로 조용하다(2026-10-22)** — 큐 설정은 `validateRoutingConfig` 가, 스냅샷은
+        `sanitizeSnapshots` 가, 오퍼 정책은 `offerPolicyIssues` 가 각각 배포 시점에 거른다.
+        그 사이에서 `AdmissionOptions` 두 값만 **어느 경로에서도 검사되지 않았고**, 호출자가 준
+        값이 그대로 `admitToQueue` 의 비교식에 들어갔다((54)가 말한 "다른 경로에는 다 있는 검사가
+        한 곳에만 없었다"와 같은 모양이다).
+        - `staleAfterMs` 가 NaN·무한이면 `age > staleAfterMs` 가 **항상 false** 가 되어 신선도 검사가
+          통째로 꺼진다. 어제 관측한 "대기 0명"이 영원히 신선해 보이고 고객은 아무도 없는 큐에
+          놓인다 — `sanitizeSnapshots` 가 미래 관측을 경고하는 이유와 **같은 고장이고 원인만
+          다르다**(그쪽은 음수 나이, 이쪽은 임계값).
+        - 반대로 0·음수면 **모든 스냅샷이 즉시 낡은 값**이 되어 전 큐가 영구히 닫힌다. 통화는
+          끊기지 않고 모든 이관이 콜백·음성사서함으로만 끝나므로 역시 장애로 보이지 않는다.
+        - `admitWithNoAgents` 는 `!opts.admitWithNoAgents` 로만 읽히므로 **문자열 `'false'` 가 참**이다.
+          환경변수·JSON 설정에서 그대로 들어오는 가장 흔한 값이고, 들어오면 상담사 0명인 큐에
+          사람을 넣는 쪽으로 틀린다.
+        **판정은 `admissionIssues` 하나다(§2)** — `channels/runtime.ts` 는 **등록 시점에** 거부하고
+        (통화 중에는 되돌릴 수 없고, 거절은 되돌릴 수 있다) `executeHandoff` 는 호출자가 직접 주는
+        경로이므로 `E_CONFIG_INVALID` 로 끝낸다(대안 행동도 만들지 않는다 — 어느 큐의 선언을 쓸지
+        정할 근거가 없다). 숫자를 고쳐 쓰거나 기본값을 만들지 않는다(§13-3) — 어느 쪽이 의도였는지
+        Core 가 알 방법이 없다. **주지 않거나 올바르면 동작은 종전과 완전히 같다.**
+        **변이 검증(도구 출력 그대로)**: 검증을 통째로 빼면 4건 실패 · `staleAfterMs` 만 빼면 3건 실패 ·
+        `admitWithNoAgents` 만 빼면 3건 실패 · 등록 시점 거절만 빼면 1건 실패 · 실행기 판정만 빼면
+        2건 실패 — 전부 원본에서는 통과한다. 검사가 없을 때 실제로 일어나는 일(1시간 전 관측이
+        `accepted`, `'false'` 가 빈 큐를 연다)도 같은 검사에 함께 고정했다.
+        **남은 것은 사람이 정하는 값이다**: `staleAfterMs`·`admitWithNoAgents` 자체는 운영 합의값이고
+        Core 가 기본값을 만들지 않는다(§13-3 — 주지 않으면 신선도를 검사하지 않는 종전 동작이다).
+        근거: `src/routing/agentQueue.ts`(`admissionIssues`) · `src/routing/executeHandoff.ts` ·
+        `src/channels/runtime.ts`(등록 거절) · `tests/routing.executeHandoff.test.mjs`(3건 추가) ·
+        `tests/channels.runtime.test.mjs`(1건 추가) · `API.md` 반영
+      · Core 측 완료(66): **커버리지는 한 번도 측정된 적이 없었다 — 판정 함수만 전부 초록이었다
+        (2026-10-22)** — `src/ops/coverage.ts` 는 테스트 19건으로 덮여 있고 CI 에도 단계가 있는데,
+        이 저장소의 주 개발 플랫폼(Windows)에서 `npm run coverage` 는 **언제나 판정보류**였다.
+        순수 함수 검사로는 잡히지 않는 자리가 둘이었고, 둘 다 실행 경로에 있었다.
+        - **리포터를 경로로 넘겼다.** `--test-reporter=D:\…\coverage-reporter.mjs` 는 ESM 로더가
+          `d:` 를 스킴으로 읽어 거부한다(`ERR_UNSUPPORTED_ESM_URL_SCHEME`) — 계측은 시작조차 못
+          한다. 저장소의 다른 실행기(`channel-conformance`·`channel-bridge`·`engine-plan`)는 전부
+          `pathToFileURL` 을 쓰고 있었고 이 한 곳만 `join()` 이었다.
+        - **구분자를 루트 제거 뒤에 통일했다.** `toRelative` 가 `D:\…\Core\src\x.ts` 와
+          `D:\…\Core/` 를 비교하므로 접두사가 영영 맞지 않고, **계측 대상 파일이 0개**가 된다.
+        그리고 실행기 쪽에 **판정이 두 벌**이었다: 종료코드만 따로 덮어썼기 때문에 같은 실행이
+        텍스트로는 "측정 완료", 종료코드로는 실패, `--json` 으로는 **수치까지 붙은 측정 완료**였다.
+        대시보드가 읽는 쪽은 JSON 이므로 깨진 실행의 수치가 그대로 기록된다 — 실행 사실
+        (`CoverageRunFacts.issuesKo`)을 판정에 넘겨 세 출력이 같은 말을 하게 했고, 그 경우
+        임계값과 **견주지도 않는다**(깨진 실행의 수치로 "통과"가 나온다). 자식 프로세스의 표준오류를
+        **읽지도 않았던** 것도 함께 고쳤다 — 종전에는 "계측이 꺼졌을 수 있습니다"라는 추측만 남고
+        실제 원인은 통째로 사라졌다(오류 문구는 `safeReasonText` 를 지나 경로·자격증명을 지운다, §10.3).
+        **첫 실측(도구 출력 그대로)**: `커버리지 계측: 측정 완료(게이트 아님)` ·
+        `대상 파일 95개 (제외 13개)` · `라인 98.87% (35542/35948)` · `분기 92.51% (8360/9037)` ·
+        `함수 97.09% (1569/1616)` · 라인이 가장 낮은 파일은 `src/core/session.ts 83.87% (26/31)` ·
+        `src/adapters/sim.ts 90.70% (39/43)` · `src/ops/executeHealth.ts 91.70% (442/482)`.
+        임계값은 주지 않았으므로 게이트가 아니다 — **목표치를 여기서 정하지 않는다**(§13-3).
+        **변이 검증(도구 출력 그대로)**: 구분자 통일을 루트 제거 뒤로 되돌리면 2건 실패 ·
+        실행 사실을 판정에 넘기지 않으면 2건 실패 — 전부 원본에서는 통과한다.
+        검사는 순수 함수만 보지 않는다 — **실제 프로세스**를 띄워 마커까지 받아 계측이 성립함을
+        확인한다(그 검사 자체도 `NODE_TEST_CONTEXT` 를 지운다: 남겨 두면 자식이 IPC 리포터를 쓰면서
+        `--test-reporter` 를 무시하고 **종료코드 0 으로 끝나** "리포터가 붙지 않았다"가 통과로 보인다).
+        **남은 것은 사람이 정하는 값이다**: 임계값(`AICC_COVERAGE_MIN_*`)은 실측 추이를 보고 조직이
+        정한다 — 지금 수치를 그대로 임계값으로 박으면 그게 곧 근거 없는 KPI 다(§13-3).
+        근거: `scripts/coverage.mjs`(리포터 URL·표준오류 수집·판정 단일화) ·
+        `src/ops/coverage.ts`(`toRelative`·`CoverageRunFacts`) · `tests/ops.coverage.test.mjs`(4건 추가) ·
+        `tests/ops.coverageRunner.test.mjs`(3건 신규) · CI `coverage (measure)` 단계 · `API.md` 반영
       · 남은 것: **Callbot 저장소 쪽 배선** — 코드는 훅마다 한 줄(README 참조)이며 더 쓸 것이 없다.
         남은 것은 저장소 결정 사항이다: 현행 LLM 툴(welfare_apply 등)과 Core 시나리오의 역할 분담
         (어느 쪽이 화면 노드를 밀 것인가)·실운영 Core 모듈·Flow id 를 **사람이 정해야 한다**,

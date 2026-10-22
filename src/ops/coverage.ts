@@ -60,13 +60,22 @@ export interface SummarizeOptions {
 
 const DEFAULT_INCLUDE = ['src/'] as const;
 
+/**
+ * 절대경로 → 저장소 루트 기준 상대경로.
+ *
+ * **구분자를 먼저 통일한다.** 종전에는 루트를 떼어 낸 **뒤에** `\` → `/` 를 바꿨고, 그래서
+ * Windows 에서는 경로(`D:\…\Core\src\x.ts`)와 접두사(`D:\…\Core/`)가 영영 일치하지 않아
+ * **계측 대상 파일이 0개**가 됐다 — 수치가 틀리게 나오는 쪽이 아니라 판정보류로 끝나는 쪽이라
+ * 조용하지는 않았지만, 계측은 이 플랫폼에서 한 번도 성립한 적이 없었다.
+ */
 function toRelative(p: string, rootDir?: string): string {
-  let rel = p;
+  let rel = p.replace(/\\/g, '/');
   if (rootDir !== undefined && rootDir !== '') {
-    const base = rootDir.endsWith('/') ? rootDir : `${rootDir}/`;
+    const root = rootDir.replace(/\\/g, '/');
+    const base = root.endsWith('/') ? root : `${root}/`;
     if (rel.startsWith(base)) rel = rel.slice(base.length);
   }
-  return rel.replace(/\\/g, '/');
+  return rel;
 }
 
 function zero(): CoverageCounts {
@@ -158,13 +167,36 @@ export interface CoverageEvaluation {
 const METRIC_KO: Record<CoverageMetric, string> = { lines: '라인', branches: '분기', functions: '함수' };
 
 /**
+ * 실행 자체에 대한 사실. 계측기가 못 돌았는지·테스트가 깨졌는지는 **실행기만 아는 사실**이고,
+ * 판정은 여기 한 곳에서 한다 — 종전에는 실행기가 종료코드만 따로 덮어썼고, 그래서 같은 실행이
+ * 텍스트로는 "측정 완료", 종료코드로는 실패, `--json` 으로는 **수치까지 붙은 측정 완료**였다.
+ * 대시보드가 읽는 쪽은 JSON 이므로, 깨진 실행의 수치가 그대로 기록된다(§2·§13-3).
+ */
+export interface CoverageRunFacts {
+  /** 실행이 성립하지 않은 이유. 비어 있으면 실행은 정상이었다는 뜻이다. */
+  issuesKo: readonly string[];
+}
+
+/**
  * 판정. 임계값이 하나도 없으면 `measured` — "쟀다"까지만 말하고 통과를 주장하지 않는다.
  * 계측 실패는 `inconclusive` 이며, 절대 `passed` 로 바뀌지 않는다.
+ * 실행이 성립하지 않았으면(`run.issuesKo`) 수치와 무관하게 `failed` 다 — 깨진 실행의
+ * 수치는 근거가 아니므로 임계값과 견주지도 않는다.
  */
-export function evaluateCoverage(report: CoverageReport, thresholds: CoverageThresholds = {}): CoverageEvaluation {
+export function evaluateCoverage(
+  report: CoverageReport,
+  thresholds: CoverageThresholds = {},
+  run: CoverageRunFacts = { issuesKo: [] },
+): CoverageEvaluation {
   const reasonsKo = [...report.notesKo];
   const entries = (Object.keys(thresholds) as CoverageMetric[])
     .filter((m) => typeof thresholds[m] === 'number' && Number.isFinite(thresholds[m] as number));
+
+  if (run.issuesKo.length > 0) {
+    reasonsKo.push(...run.issuesKo);
+    reasonsKo.push('실행이 성립하지 않았으므로 이 수치를 근거로 쓰지 않습니다(§13-3).');
+    return { verdict: 'failed', exitCode: COVERAGE_EXIT_CODE.failed, report, thresholds, shortfalls: [], reasonsKo };
+  }
 
   if (!report.measured) {
     reasonsKo.push('실측치가 없으므로 수치를 적지 않습니다(§13-3).');

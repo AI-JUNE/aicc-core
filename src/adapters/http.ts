@@ -156,6 +156,11 @@ export function toBase64(bytes: Uint8Array): string {
   return out;
 }
 
+/**
+ * 디코더는 **관용하다** — 알파벳 밖 문자를 지우고 남은 것으로 바이트를 만든다.
+ * 그 관용함이 곧 사고이므로(오류 본문도 그럴듯한 바이트 열이 된다) **형태 판정은 호출 전에**
+ * `base64Shape` 로 한다. 여기서 던지지 않는 이유는 컴포넌트를 모르기 때문이다(오류에 실을 수 없다).
+ */
 export function fromBase64(s: string): Uint8Array {
   const clean = s.replace(/[^A-Za-z0-9+/]/g, '');
   const out = new Uint8Array(Math.floor((clean.length * 3) / 4));
@@ -168,6 +173,34 @@ export function fromBase64(s: string): Uint8Array {
     if (i + 3 < clean.length && o < out.length) out[o++] = v & 255;
   }
   return out.subarray(0, o);
+}
+
+/**
+ * base64 문자열의 **형태** 판정. 데이터가 아닌 공백·줄바꿈은 지우고(일부 서버가 줄을 끊어 보낸다),
+ * 그 밖의 문자가 하나라도 있으면 base64 가 아니라고 본다 — 그 한 글자는 대개 오류 본문의 흔적이다.
+ * 길이가 4의 배수가 아닌 것도 잘린 응답이므로 거절한다.
+ */
+export function base64Shape(raw: string): { ok: boolean; clean: string } {
+  const clean = raw.replace(/[\s]/g, '');
+  const ok = clean.length > 0 && clean.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(clean);
+  return { ok, clean };
+}
+
+// ── 응답 mime 판정 (TTS 오디오 — 경로가 둘이므로 판정은 한 곳이다, §2) ─────────
+/** `audio/mpeg; charset=utf-8` 처럼 매개변수가 붙어 오므로 앞부분만 소문자로 본다. */
+export function normalizeMime(raw: string): string {
+  return raw.split(';')[0]?.trim().toLowerCase() ?? '';
+}
+
+/**
+ * TTS 응답을 오디오로 볼 수 있는가. **중립 JSON 규약(`parseTtsResponse`)과 규격 어댑터
+ * (`openaiAudio`)가 같은 함수를 쓴다** — 둘 중 한쪽에만 검사가 있으면, 그 경로에서는 200 으로
+ * 싸인 오류 JSON이 그대로 오디오로 재생된다(고객에게는 잡음이거나 무음이고 장애로 보이지 않는다).
+ * `application/octet-stream` 은 형식을 밝히지 않은 바이트이며 실제 TTS 서버가 흔히 쓴다 — 통과시킨다.
+ */
+export function isAudioMime(raw: string): boolean {
+  const mime = normalizeMime(raw);
+  return mime.startsWith('audio/') || mime === 'application/octet-stream';
 }
 
 // ── 응답 파서 (순수 함수 — 형식 위반은 조용히 넘기지 않는다) ──────────────────
@@ -220,8 +253,26 @@ export function parseTtsResponse(raw: unknown): { chunk: AudioChunk; usage?: Usa
   if (typeof b64 !== 'string' || typeof mime !== 'string') {
     throw new EngineError('E_PROTOCOL', 'tts', 'TTS 응답에 audio_base64·mime 이 없습니다.');
   }
+  // 아래 셋은 전부 **예외가 아니라 조용한 오답**을 막는다. 규격 어댑터(openaiAudio)는 전송 계층의
+  // 바이너리 보장 + mime 검사로 같은 셋을 이미 막고 있었고, 중립 JSON 경로에만 없었다.
+  if (!isAudioMime(mime)) {
+    // 200 으로 싸인 오류 JSON·HTML 을 base64 로 받아 그대로 재생하는 자리다.
+    throw new EngineError('E_PROTOCOL', 'tts', `오디오가 아닌 응답 형식: ${normalizeMime(mime)}`);
+  }
+  const shape = base64Shape(b64);
+  if (shape.clean === '') {
+    // 0바이트를 내려보내면 채널은 그것을 재생하고 고객에게는 **무음**이 된다 — 통화는 이어지므로
+    // 장애로 잡히지 않는다. `collectAudio` 가 빈 오디오를 STT 로 보내지 않는 것과 같은 규칙이다.
+    throw new EngineError('E_PROTOCOL', 'tts', 'TTS 응답 오디오가 비어 있습니다 — 무음을 재생하지 않습니다.');
+  }
+  if (!shape.ok) {
+    // 디코더가 알파벳 밖 문자를 지우므로, 거르지 않으면 오류 본문이 **그럴듯한 바이트 열**이 된다.
+    throw new EngineError('E_PROTOCOL', 'tts', 'TTS 응답의 audio_base64 가 base64 형태가 아닙니다.');
+  }
+  // 형태가 성립하면(4의 배수·알파벳 한 글자 이상) 디코드 결과는 반드시 1바이트 이상이다.
+  const data = fromBase64(shape.clean);
   const usage = toUsageMetrics(o['usage']);
-  const chunk: AudioChunk = { data: fromBase64(b64), mime };
+  const chunk: AudioChunk = { data, mime: normalizeMime(mime) };
   return usage === undefined ? { chunk } : { chunk, usage };
 }
 

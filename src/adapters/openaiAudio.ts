@@ -21,7 +21,7 @@ import type { AudioChunk, SttAdapter, SttResult, TtsAdapter } from './index.ts';
 import type { UsageMetrics } from '../events/schema.ts';
 import { maskPii } from '../core/policyGuard.ts';
 import {
-  EngineError, collectAudio, createEngineTransport,
+  EngineError, collectAudio, createEngineTransport, isAudioMime, normalizeMime,
   type Activation, type EngineTransportConfig, type RequestPlan,
 } from './http.ts';
 
@@ -83,7 +83,7 @@ const MIME_EXT: Readonly<Record<string, string>> = Object.freeze({
 });
 
 export function audioExtensionOf(mime: string): string | undefined {
-  return MIME_EXT[mime.split(';')[0]?.trim().toLowerCase() ?? ''];
+  return MIME_EXT[normalizeMime(mime)];
 }
 
 // ── 멀티파트 조립 (외부 의존 없이, 순수 함수) ─────────────────────────────────
@@ -237,8 +237,9 @@ export function createOpenAiAudioEngines(cfg: OpenAiAudioConfig): OpenAiAudioEng
           { contentType: 'application/json', body: JSON.stringify(body), accept: 'binary' }, body);
         // send 가 binary 를 보장한다(빈 본문·JSON/텍스트 응답·content-type 부재는 E_PROTOCOL).
         const bytes = r.bytes as Uint8Array;
-        const mime = (r.contentType as string).split(';')[0]?.trim().toLowerCase() ?? '';
-        if (!mime.startsWith('audio/') && mime !== 'application/octet-stream') {
+        // 판정은 `isAudioMime` 하나다(§2) — 중립 JSON 경로(`parseTtsResponse`)와 같은 함수를 쓴다.
+        const mime = normalizeMime(r.contentType as string);
+        if (!isAudioMime(mime)) {
           throw new EngineError('E_PROTOCOL', 'tts', `오디오가 아닌 응답 형식: ${mime}`);
         }
         yield { data: bytes, mime };

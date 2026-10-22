@@ -40,7 +40,7 @@ import { createRecoveryProbeRunner } from '../ops/recoveryProbe.ts';
 import type { SummaryOptions } from '../core/handoffSummary.ts';
 import { buildHandoffSummary, requiredSlotsOf } from '../core/handoffSummary.ts';
 import type { AdmissionOptions, AssignmentOffer, OfferEvent, QueueSnapshot, RoutingConfig } from '../routing/agentQueue.ts';
-import { reachableQueues, validateRoutingConfig } from '../routing/agentQueue.ts';
+import { admissionIssues, reachableQueues, validateRoutingConfig } from '../routing/agentQueue.ts';
 import type { HandoffPlacement } from '../routing/executeHandoff.ts';
 import { executeHandoff } from '../routing/executeHandoff.ts';
 import type { OfferLedger, OfferPolicy, OfferStep } from '../routing/executeOffer.ts';
@@ -1196,6 +1196,14 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     const rIssues = validateRoutingConfig(opts.routing.config);
     if (rIssues.length > 0) {
       throw new Error(`라우팅 설정 거부: ${rIssues.join(' / ')}`);
+    }
+    // 수용 판정의 운영값도 **등록 시점에** 거른다. 판정은 `admissionIssues` 하나이고(§2 —
+    // `executeHandoff` 도 같은 함수를 쓴다), 여기서 막는 이유는 통화 중에는 되돌릴 수 없기
+    // 때문이다: 틀린 값은 예외가 아니라 "모든 이관이 콜백으로 끝난다"(0·음수) 또는 "낡은
+    // 스냅샷이 영원히 신선하다"(NaN·무한)로 조용히 나타난다.
+    const aIssues = admissionIssues(opts.routing.admission);
+    if (aIssues.length > 0) {
+      throw new Error(`라우팅 배선 거부: ${aIssues.join(' / ')} (설계서 §13-3)`);
     }
     // 큐에 선언된 §9.3 대안이 **그 채널에서 수행 불가**한 조합을 등록 시점에 적는다.
     // 큐가 닫히면 고객이 가는 곳은 `closedAction` 이고, 그중 채널 계약에 대응하는 능력이 있는

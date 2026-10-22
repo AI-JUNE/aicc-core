@@ -324,6 +324,36 @@ export interface AdmissionOptions {
 }
 
 /**
+ * 수용 판정의 **운영값** 검증. 스냅샷(`sanitizeSnapshots`)과 설정(`validateRoutingConfig`)은
+ * 이미 걸러지는데 이 두 값만 어느 경로에서도 검사되지 않았다 — 그리고 두 값이 어긋나는 방식은
+ * 전부 **예외가 아니라 조용한 오답**이며, 하필 서로 반대 방향으로 틀린다.
+ *
+ *  - `staleAfterMs` 가 NaN·무한이면 `age > staleAfterMs` 가 **항상 false** 가 되어 신선도 검사가
+ *    통째로 꺼진다. 어제 관측한 "대기 0명"이 영원히 신선해 보이고, 고객은 아무도 없는 큐에 놓인다
+ *    (`sanitizeSnapshots` 가 미래 관측을 경고하는 이유와 같은 고장이고, 원인만 다르다).
+ *  - 반대로 0·음수면 **모든 스냅샷이 즉시 낡은 값**이 되어 전 큐가 영구히 닫힌다. 통화는 끊기지
+ *    않고 모든 이관이 콜백·음성사서함으로만 끝나므로 역시 장애로 보이지 않는다.
+ *  - `admitWithNoAgents` 는 `!opts.admitWithNoAgents` 로만 읽히므로 **문자열 `'false'` 가 참**이다.
+ *    환경변수·JSON 설정에서 그대로 들어오는 가장 흔한 값이고, 들어오면 상담사 0명인 큐에 사람을
+ *    넣는 쪽으로 틀린다.
+ *
+ * 숫자를 고쳐 쓰거나 기본값을 만들지 않는다(§13-3) — 어느 쪽이 의도였는지 Core 가 알 방법이 없다.
+ * 거절은 **배포·호출 시점**이라 되돌릴 수 있고, 통과시킨 쪽은 통화 중에만 드러난다.
+ */
+export function admissionIssues(opts: AdmissionOptions | undefined): string[] {
+  if (opts === undefined) return [];
+  const errors: string[] = [];
+  if (opts.staleAfterMs !== undefined
+    && (!Number.isInteger(opts.staleAfterMs) || (opts.staleAfterMs as number) <= 0)) {
+    errors.push('admission.staleAfterMs 는 1 이상의 정수(ms)여야 한다 — 0·음수는 전 큐를 영구히 닫고, NaN·무한은 신선도 검사를 통째로 끈다');
+  }
+  if (opts.admitWithNoAgents !== undefined && typeof opts.admitWithNoAgents !== 'boolean') {
+    errors.push("admission.admitWithNoAgents 는 boolean 이어야 한다 — 문자열 'false' 는 참으로 읽혀 상담사 0명인 큐에 사람을 넣는다");
+  }
+  return errors;
+}
+
+/**
  * 수용 판정. 오버플로를 따라가되 순환·과도한 연쇄는 끊는다.
  * 어떤 경우에도 status만 던지지 않고 action(대안)을 함께 낸다 — §9.3.
  */
