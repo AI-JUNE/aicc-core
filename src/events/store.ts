@@ -61,6 +61,31 @@ export interface EventLog {
   has(key: string): boolean;
 }
 
+/**
+ * 읽기가 잘렸는가 — **투영은 이 사실을 스스로 절대 알 수 없다**(읽힌 줄만 손에 들어온다).
+ *
+ * 왜 이 판정이 원장 옆에 한 곳으로 있어야 하는가: 종전에 이 한 줄은
+ * `projectLedgerPeriodFromLog` **한 곳에만** 있었고, 같은 원장을 읽는 나머지 두 투영
+ * (`projectRetainedRecordsFromLog`·`projectFromLog`)은 묻지 않았다. 증상은 둘 다 조용하다 —
+ * 보존 스윕(§8.2)은 `--limit` 로 읽은 목록을 **온전한 것으로** 보아 기한이 지난 개인정보를
+ * 남긴 채 "완료"로 끝나고(그 세션의 마지막 이벤트를 못 봤으므로 기산 시점조차 틀리다),
+ * 포털 조회(§7)는 운영자에게 "그 통화는 없다"를 띄운 뒤 감사로그에 **정상 조회**로 남는다.
+ *
+ * 판정은 **오프셋 하나**다: 마지막으로 읽은 줄의 오프셋이 원장의 마지막 오프셋보다 작으면
+ * 못 본 이벤트가 있다. 한 건도 읽지 못했으면 기준은 `afterOffset`(없으면 -1)이다 — 그래서
+ * **빈 원장은 잘린 것이 아니다**(lastOffset = -1).
+ *
+ * **검사하지 못하는 범위**(§13-3): 필터(`types`·`interactionId`)로 걸러 읽었는데 **통과한
+ * 마지막 줄이 원장의 마지막 줄**이면 오프셋만으로는 구분되지 않는다 — 그 경우를 아는 것은
+ * 필터를 건 호출자뿐이므로 투영 옵션의 `readTruncated` 로 직접 선언한다. 여기서 추측해
+ * 잘림으로 적지 않는다: 상세 화면의 단건 조회가 전부 "잘렸다"로 표시되면 그 표시는 곧
+ * 무시되고, 그러면 진짜 잘림도 함께 무시된다.
+ */
+export function readWasTruncated(log: EventLog, rows: readonly StoredEvent[], read?: ReadOptions): boolean {
+  const lastSeen = rows.length > 0 ? rows[rows.length - 1].offset : (read?.afterOffset ?? -1);
+  return lastSeen < log.lastOffset();
+}
+
 export type LogRejectReason = 'no_tenant' | 'foreign_tenant' | 'no_event_id';
 
 export class EventLogRejected extends Error {

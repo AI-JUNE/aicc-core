@@ -71,6 +71,9 @@ jobs:
           grep -q '"id":"1","ok":true' /tmp/bridge.out
           grep -q '"id":"2","ok":true' /tmp/bridge.out
           grep -q 'E_BAD_JSON' /tmp/bridge.out
+          # §5.2 전환 토큰 노출은 **기본 꺼짐**이다(§10.3). 기본이 조용히 뒤집히면 1회용 합류
+          # 토큰이 호스트 로그로 흐르므로, 와이어에 적힌 기본값을 여기서 고정한다.
+          grep -q '"includesSwitchTicket":false' /tmp/bridge.out
 
       # 유지 루프(§9.3·§2)가 비-Node 호스트에 **실제로 닿는지** 확인한다. Core 는 타이머를 돌리지
       # 않으므로 만료 수렴·복구 확인·readiness 는 호스트가 불러야 하는데, 실행기가 모듈의

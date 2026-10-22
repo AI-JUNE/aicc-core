@@ -22,9 +22,11 @@
 //     주장하면 조용히 덮어쓰지 않고 거부한다 — 덮어쓰면 호스트는 자기가 무엇을 열었는지 모른다.
 //  2) **어댑터도 고정이다.** 브리지 하나가 채널 하나다. 한 프로세스가 세 채널을 흉내 내면
 //     능력 선언(§5.3 사전검증)이 무의미해진다.
-//  3) **슬롯 원문과 이관 요약은 기본적으로 나가지 않는다.** 슬롯은 키 목록만, 상담사용 요약은
-//     `includeHandoffSummary` 를 켠 소비자에게만 준다(§2·§10.3). 고객 노출 경로가 이 값을 받으면
-//     언젠가 화면에 뜬다.
+//  3) **슬롯 원문·이관 요약·전환 토큰은 기본적으로 나가지 않는다.** 슬롯은 키 목록만, 상담사용
+//     요약은 `includeHandoffSummary`, §5.2 전환 토큰은 `includeSwitchTicket` 를 켠 소비자에게만
+//     준다(§2·§10.3). 고객 노출 경로가 이 값을 받으면 언젠가 화면에 뜨고, 전환 토큰은 그 자체로
+//     진행 중인 상담의 열쇠다. **사실은 언제나 나간다** — 감추면 호스트는 전환이 일어난 것도,
+//     링크를 보낼 수 없는 상태인 것도 알 수 없다.
 //  4) **어떤 잘못된 줄도 프로세스를 죽이지 않는다.** 빈 줄·깨진 JSON·모르는 op 는 오류 응답이지
 //     예외가 아니다. 회선 하나가 이상한 바이트를 보냈다고 통화 전체가 끊기면 안 된다.
 //
@@ -135,6 +137,31 @@ export interface BridgePlacementPayload {
   issues?: string[];
 }
 
+/**
+ * §5.2 전환 초대의 전송용 투영.
+ *
+ * **이것이 비-Node 호스트에 전환이 도착하는 유일한 경로다.** Node 호스트는 `port.invite` 로
+ * 같은 지시를 받지만 파이썬·자바 호스트에는 그 자리가 없어, 이 값이 없던 동안 전환은
+ * **조용히 반쪽만** 일어났다: `state.channel` 은 화면으로 바뀌어 이후 단계가 화면용으로
+ * 렌더되는데(통화 중인 고객이 그것을 듣는다) 링크는 아무도 보내지 않는다. 고객은 오지 않는
+ * 화면을 기다리고 — §5.1 사다리는 이미 전환을 골랐으므로 상담사로 내려가지도 않는다.
+ *
+ * `token` 은 `includeSwitchTicket` 를 켠 소비자에게만 실린다(§10.3). 나머지 필드에는
+ * 개인정보도 열쇠도 없다 — 감추면 호스트는 "링크를 보낼 차례"와 "보낼 수 없는 상태"를
+ * 구분할 수 없다.
+ */
+export interface BridgeSwitchInvitePayload {
+  fromChannel: string;
+  toChannel: string;
+  ticketIssued: boolean;
+  /** 토큰을 실제로 실었는가. `ticketIssued` 와 **다른 질문**이다(노출 스위치가 끄면 false). */
+  tokenIncluded: boolean;
+  expiresAt?: string;
+  tokenless?: boolean;
+  notIssuedKo?: string;
+  token?: string;
+}
+
 /** 호스트에게 돌려주는 턴 결과의 **전송용 투영**. Core 내부 타입을 그대로 흘리지 않는다. */
 export interface BridgeTurnPayload {
   interactionId: string;
@@ -178,6 +205,8 @@ export interface BridgeTurnPayload {
      */
     placement?: BridgePlacementPayload;
   };
+  /** §5.2 전환 초대(`BridgeSwitchInvitePayload` 주석). 전환이 없던 턴에는 실리지 않는다. */
+  switchInvite?: BridgeSwitchInvitePayload;
   /**
    * 이번 턴에 AI 고지를 냈다는 사실(§10.1). 문구는 `steps` 맨 앞 단계에 실려 있으므로 여기서
    * 되풀이하지 않고 **감사 근거**(어느 매체에 어떤 버전으로)만 내보낸다 — 호스트가 steps 를
@@ -237,6 +266,17 @@ export interface BridgeOptions {
   includeHandoffSummary?: boolean;
   /** 슬롯 값을 응답에 실을지. 기본 false — 키 목록만 나간다. */
   includeSlots?: boolean;
+  /**
+   * §5.2 전환 초대의 **1회용 토큰**을 응답에 실을지. 기본 false(상담사용 요약과 같은 규칙,
+   * §2·§10.3) — 전환 **사실**(목적지·발급 여부·만료·사유)은 스위치와 무관하게 언제나 나간다.
+   *
+   * 켜야 하는 경우: 링크(SMS·알림톡·푸시)를 **이 호스트가 직접 만들어 보낸다**. 그때 토큰이
+   * 없으면 호스트는 Interaction id 로 링크를 만들 수밖에 없고, 그 순간 1회용·만료·회수가
+   * 전부 무의미해진다(`core/executeSwitch.ts` 가 막겠다고 적어 둔 바로 그 사고다).
+   * 끄는 쪽이 기본인 이유: 이 토큰은 진행 중인 상담의 열쇠이고, 응답 줄은 호스트 로그에
+   * 그대로 남는 경우가 많다.
+   */
+  includeSwitchTicket?: boolean;
   /** 한 줄 바이트 상한. 미지정 시 상한 검사를 하지 않는다(§13-3). */
   maxLineBytes?: number;
   /** 실측 소요 계산용 시계(ms). 미주입 시 durationMs 를 기록하지 않는다. */
@@ -486,7 +526,9 @@ function toSessionRequest(body: Record<string, unknown>, opts: BridgeOptions): C
   if (nonEmptyString(req.joinInteractionId)) out.joinInteractionId = req.joinInteractionId;
   // 합류 자격 토큰(§5.2). 통과시키지 않으면 전환 배선을 켜는 순간 비-Node 호스트만 합류하지 못한다 —
   // 그 비대칭은 "특정 채널에서만 화면 전환이 안 된다"로 나타나 원인을 한참 뒤에 찾게 된다.
-  // 토큰은 Core 가 발급해 채널에 준 값이므로 **들어오는 방향만** 열려 있다(응답에 싣지 않는다, §10.3).
+  // 토큰은 Core 가 발급해 채널에 준 값이다. **되돌려 적지 않는다** — 발급 시점의 응답
+  // (`switchInvite.token`, 노출 스위치를 켠 경우)이 호스트가 토큰을 받는 유일한 자리이고,
+  // 합류 요청에 실린 값을 응답에 되싣는 것은 로그에 열쇠를 한 번 더 남기는 일이다(§10.3).
   if (nonEmptyString(req.joinToken)) out.joinToken = req.joinToken;
   if (nonEmptyString(req.correlationId)) out.correlationId = req.correlationId;
   return out;
@@ -721,6 +763,22 @@ function projectTurn(r: ChannelTurnResult, opts: BridgeOptions): BridgeTurnPaylo
     if (r.handoff.placement !== undefined) handoff.placement = projectPlacement(r.handoff.placement);
     payload.handoff = handoff;
   }
+  // §5.2 전환 초대도 **필드별로 다시 적는다**(이관 판정과 같은 규칙) — 토큰이 노출 스위치를
+  // 건너뛰어 나가는 경로를 만들지 않는다. 사실·만료·사유는 스위치와 무관하게 나간다.
+  if (r.switchInvite !== undefined) {
+    const s = r.switchInvite;
+    const tokenIncluded = opts.includeSwitchTicket === true && s.token !== undefined;
+    payload.switchInvite = {
+      fromChannel: s.fromChannel,
+      toChannel: s.toChannel,
+      ticketIssued: s.ticketIssued,
+      tokenIncluded,
+      ...(s.expiresAt !== undefined ? { expiresAt: s.expiresAt } : {}),
+      ...(s.tokenless === true ? { tokenless: true } : {}),
+      ...(s.notIssuedKo !== undefined ? { notIssuedKo: s.notIssuedKo } : {}),
+      ...(tokenIncluded ? { token: s.token } : {}),
+    };
+  }
   // 고지 사실은 어떤 노출 스위치와도 무관하게 나간다 — 슬롯 값·상담사용 요약과 달리
   // 여기에는 개인정보가 없고, 감추면 "고지했다"를 증명할 길이 호스트에 남지 않는다(§10.1).
   if (r.disclosure !== undefined) payload.disclosure = { ...r.disclosure };
@@ -897,6 +955,9 @@ export function createBridge(opts: BridgeOptions): Bridge {
           activation,
           includesHandoffSummary: opts.includeHandoffSummary === true,
           includesSlots: opts.includeSlots === true,
+          // 전환 링크를 **이 호스트가 만들 수 있는지**를 알려 준다. 끈 상태에서 링크를 만들려
+          // 하면 호스트는 id 로 링크를 만들 수밖에 없고, 그 순간 1회용·만료가 무의미해진다(§5.2).
+          includesSwitchTicket: opts.includeSwitchTicket === true,
           /**
            * **열려 있는 유지 루프를 알려준다.** 호스트가 op 를 하나씩 찔러 보고 알아내게 두면
            * 세 저장소가 각자 다르게 알아내고(§2), 더 나쁜 것은 **아무도 찔러 보지 않는 것**이다 —
@@ -938,9 +999,27 @@ export function createBridge(opts: BridgeOptions): Bridge {
       case 'health': {
         const { samples, observedAt } = toHealthSamples(body);
         span.entered = true;
-        opts.core.reportHealth({ adapter: opts.adapter, samples, observedAt });
+        const receipt = opts.core.reportHealth({ adapter: opts.adapter, samples, observedAt });
         span.returned = true;
-        return { accepted: samples.length };
+        /**
+         * **해석한 줄 수를 `accepted` 로 적지 않는다**(§13-3). 종전에는 `samples.length` 를
+         * 그대로 `accepted` 로 돌려줬는데 그것은 Core 가 접수한 수가 아니라 브리지가 **파싱한**
+         * 수다. Core 는 등록되지 않은 어댑터의 보고와 선언하지 않은 컴포넌트의 샘플을 무시하므로
+         * (§9.3), 그 상태의 비-Node 호스트는 `{"accepted":3}` 을 받으며 **한 건도 전달되지 않는
+         * 채로** 영구히 운영된다. 증상은 조용하다: 엔진이 전부 죽어도 판정은 `normal` 이고,
+         * 한 번 내려간 테넌트는 샘플이 갱신되지 않아 폴백에서 돌아오지 못한다.
+         *
+         * 접수 범위를 돌려주지 않는 구현(`ConversationCorePort` 만 주어진 경우)에서는
+         * **`accepted` 를 아예 싣지 않는다** — 모르는 것을 숫자로 적는 쪽이 더 나쁘다.
+         */
+        if (receipt === undefined) {
+          return {
+            offered: samples.length,
+            acceptedKnown: false,
+            reasonKo: 'Core 구현이 접수 범위를 돌려주지 않습니다 — 이 샘플이 §9.3 판정에 닿았는지 알 수 없습니다.',
+          };
+        }
+        return { ...receipt, declared: [...receipt.declared], acceptedKnown: true };
       }
 
       // ── 유지 루프(§9.3·§2) ─────────────────────────────────────────────────

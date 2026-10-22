@@ -318,3 +318,37 @@ test('publishAll 은 이벤트 하나가 rejected 여도 나머지 이벤트는 
   assert.deepEqual(results.map((r) => r.status), ['delivered', 'rejected', 'delivered']);
   assert.equal(log.size(), 2, '거절된 한 건 때문에 나머지 배치가 막히면 안 된다');
 });
+
+// ── 읽기 절단 판정(§8.2·§7 2.2·§11.2) ────────────────────────────────────────
+// 투영은 읽힌 줄만 손에 든다 — 읽기가 잘린 사실을 **스스로는 절대 알 수 없다**.
+// 종전에 이 판정은 기간 투영 한 곳에만 있었고, 같은 원장을 읽는 보존 목록·조회 투영은
+// 묻지 않았다(각각 §8.2 미파기와 "그 통화는 없다"로 나타난다). 판정은 이제 여기 하나다(§2).
+
+test('읽기 절단: 마지막으로 읽은 오프셋이 원장의 마지막보다 작으면 잘린 것이다', b, () => {
+  const log = m.createMemoryEventLog(scope);
+  log.appendAll([started(1), ended(2), started(3, { eventId: 'e3', interactionId: 'i2' })]);
+
+  const cut = log.read({ limit: 2 });
+  assert.equal(m.readWasTruncated(log, cut, { limit: 2 }), true);
+  assert.equal(m.readWasTruncated(log, log.read()), false);
+});
+
+test('읽기 절단: 한 건도 못 읽은 경우의 기준은 afterOffset 이다 — 빈 원장은 잘린 것이 아니다', b, () => {
+  const empty = m.createMemoryEventLog(scope);
+  assert.equal(m.readWasTruncated(empty, empty.read()), false, '빈 원장(lastOffset=-1)은 잘림이 아니다');
+
+  const log = m.createMemoryEventLog(scope);
+  log.appendAll([started(1), ended(2)]);
+  // 끝까지 따라잡은 커서는 0건을 읽는다 — 그것은 잘림이 아니다.
+  assert.equal(m.readWasTruncated(log, log.read({ afterOffset: 1 }), { afterOffset: 1 }), false);
+  // 뒤가 남은 커서는 0건을 읽어도 잘림이다(필터와 겹치면 이 경우가 생긴다).
+  assert.equal(m.readWasTruncated(log, [], { afterOffset: 0 }), true);
+});
+
+test('읽기 절단: 걸러 읽어 마지막 줄을 못 본 경우도 잡는다', b, () => {
+  const log = m.createMemoryEventLog(scope);
+  log.appendAll([started(1), ended(2)]);
+  const only = log.read({ types: ['session.started'] });
+  assert.equal(only.length, 1);
+  assert.equal(m.readWasTruncated(log, only, { types: ['session.started'] }), true);
+});

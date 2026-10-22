@@ -136,6 +136,12 @@ export interface ChannelTurnResult {
    */
   handoff?: { queue?: string; summaryMasked?: string; placement?: HandoffPlacement };
   /**
+   * §5.2 채널 전환 초대가 이번 턴에 일어났다는 사실(`SwitchInviteNote` 주석).
+   * Node 호스트는 `port.invite` 로 이미 같은 지시를 받으므로 **되풀이가 아니라 근거**이고,
+   * 브리지(비-Node 호스트)에는 **이것이 유일한 경로**다.
+   */
+  switchInvite?: SwitchInviteNote;
+  /**
    * 이번 턴에 AI 고지를 냈다는 사실(§10.1). 고지 문구 자체는 `steps` 맨 앞 단계에 실려 나간다 —
    * 여기 있는 것은 **감사 근거**(어느 매체에 어떤 버전으로 고지했는가)다. 호스트가 steps 를
    * 뒤져 찾아내게 두면 세 저장소가 각자 다르게 찾는다(§2).
@@ -179,6 +185,44 @@ export interface ChannelTurnResult {
    * 같은 이유로 `skipped` 가 비어 있지 않은 규칙은 합격이 아니다.
    */
   compliance?: ComplianceTurnNote;
+}
+
+/**
+ * §5.2 채널 전환 초대가 **이번 턴에 일어났다는 사실**. 전환이 없던 턴에는 실리지 않는다.
+ *
+ * 왜 결과에도 실어야 하는가: Core 는 전환을 감지하면 `port.invite` 로 채널에게 링크 발송을
+ * 시킨다 — 그 경로는 **Node 호스트에만 있다**. 비-Node 호스트(Callbot 파이썬 에이전트)가
+ * Core 에 닿는 길은 JSONL 브리지뿐이고, 브리지에는 이 사실을 실어 보낼 자리가 없었다.
+ * 그래서 그 배치에서는 전환이 **조용히 반쪽만** 일어났다: `state.channel` 은 화면으로 바뀌어
+ * 이후 단계가 화면용으로 렌더되는데(고객은 통화 중이라 그것을 듣는다), **링크는 아무도 보내지
+ * 않는다**. 고객은 오지 않는 화면을 기다리고 통화는 그대로 끝나며 — §5.1 사다리는 이미 전환을
+ * 골랐으므로 상담사로 내려가지도 않는다. 어디에서도 예외가 나지 않는다.
+ *
+ * **토큰은 기본적으로 나가지 않는다**(§10.3): 1회용 합류 토큰은 진행 중인 세션의 열쇠이므로
+ * 상담사용 요약과 같은 규칙으로 다룬다 — 링크를 직접 만들어야 하는 소비자만 받는다
+ * (브리지의 `includeSwitchTicket`). 사실·만료·사유는 개인정보가 아니므로 그대로 나간다:
+ * 감추면 호스트는 "링크를 보낼 차례인지"도, "보낼 수 없는 상태인지"도 알 수 없다.
+ */
+export interface SwitchInviteNote {
+  fromChannel: ChannelKind;
+  toChannel: ChannelKind;
+  /** 1회용·만료 토큰이 발급됐는가. false 면 **링크의 열쇠가 없다**(사유는 `notIssuedKo`). */
+  ticketIssued: boolean;
+  /** 발급된 티켓의 만료(ISO8601). 채널이 "이 링크는 N분 뒤 만료"를 안내할 수 있게 함께 준다. */
+  expiresAt?: string;
+  /**
+   * 토큰 없이 초대한 **종전 경로**(Core 에 채널 전환 배선이 없다). 링크에 실릴 값이
+   * Interaction id 뿐이라 1회용·만료·회수가 없다 — 등록 시 경고로도 남아 있다.
+   */
+  tokenless?: boolean;
+  /** 티켓이 없는 사유(운영·감사용). 고객 문안이 아니며 토큰은 실리지 않는다(§10.3). */
+  notIssuedKo?: string;
+  /**
+   * 1회용 합류 토큰. **Core 내부·Node 포트 경로에서만 채워진다** — 와이어로 내보내는 쪽은
+   * 노출 스위치를 지나야 한다(§10.3). 세션에 보관되는 복사본에서는 제거된다(재발급 없이
+   * 같은 토큰이 다음 응답에 다시 실리면 1회용이 무의미해진다).
+   */
+  token?: string;
 }
 
 /**
@@ -227,6 +271,33 @@ export interface ChannelHealthReport {
 }
 
 /**
+ * 헬스 보고가 **실제로 접수된 범위**(§9.3·§13-3).
+ *
+ * 왜 돌려주는가: Core 는 등록되지 않은 채널의 보고와 **선언하지 않은 컴포넌트**의 샘플을
+ * 무시한다(아무 채널이나 전체 폴백을 유발할 수 없게 하는 §9.3 의 규칙이다). 그런데 그
+ * 사실이 호출자에게 돌아가지 않던 동안, 샘플을 성실히 올리는 채널과 **한 건도 전달되지
+ * 않는 채널이 바깥에서 구분되지 않았다**. 증상은 전부 조용하다 — 엔진이 전부 죽어도
+ * §9.3 판정은 `normal` 이고(고객은 "말을 못 알아듣는다"로 겪는다), 한 번 내려간 테넌트는
+ * 샘플이 갱신되지 않아 **영구히** 폴백에 남는다. 어느 쪽도 예외를 던지지 않는다.
+ *
+ * 되돌려 적지 않는 것: **호스트가 보낸 컴포넌트 이름**이다(§10.3 — 그 자리에는 임의
+ * 문자열이 들어올 수 있다). 대신 Core 가 가진 선언 목록(`declared`)을 주어 오타를 호스트가
+ * 스스로 맞춰 볼 수 있게 한다.
+ */
+export interface HealthIntakeReceipt {
+  /** 이 어댑터가 Core 에 등록돼 있는가. false 면 **한 건도** 기록되지 않았다. */
+  registered: boolean;
+  /** 올린 샘플 수(실측). */
+  offered: number;
+  /** §9.3 헬스 레지스트리에 실제로 기록된 샘플 수. */
+  accepted: number;
+  /** 선언되지 않은 컴포넌트라 무시한 샘플 수. */
+  ignored: number;
+  /** 이 채널이 올릴 수 있다고 **등록 시 선언한** 컴포넌트(Core 가 가진 값). */
+  declared: ComponentId[];
+}
+
+/**
  * 채널 저장소가 구현하는 아웃바운드 포트 — Core가 채널에게 시키는 일.
  * 반환값은 "지시를 접수했다"까지만 뜻한다. 실제 매체 동작 결과는 헬스·이벤트로 돌아온다.
  */
@@ -268,8 +339,14 @@ export interface ConversationCorePort {
    * 결과의 `billing` 에 사실대로 적힌다(무효값은 종료를 막지 않는다 — 막으면 세션이 샌다).
    */
   end(interactionId: string, reasonKo: string, input?: ChannelEndInput): Promise<ChannelTurnResult>;
-  /** 헬스 보고 — 채널이 주기적으로 올린다(§9.3). */
-  reportHealth(report: ChannelHealthReport): void;
+  /**
+   * 헬스 보고 — 채널이 주기적으로 올린다(§9.3).
+   *
+   * 반환값은 **접수 범위**(`HealthIntakeReceipt`)다. 종전 구현처럼 `void` 를 돌려줘도
+   * 계약 위반이 아니다 — 다만 그 구현을 쓰는 호스트는 자기 샘플이 §9.3 판정에 닿았는지
+   * 알 길이 없고, 그 상태를 "접수됨"으로 **적어서는 안 된다**(§13-3, `HealthIntakeReceipt` 주석).
+   */
+  reportHealth(report: ChannelHealthReport): HealthIntakeReceipt | void;
 }
 
 /** 채널이 Core에 등록될 때 넘기는 묶음. Core는 이 값만 보고 채널을 다룬다. */

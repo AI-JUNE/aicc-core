@@ -32,7 +32,10 @@
 //  3) **잘린 투영으로 파기를 돌리는 것.** 수집 상한·기간 경계에 걸려 **그 세션의 마지막
 //     이벤트를 못 본** 투영은 (2)의 기산 시점을 실제보다 이르게 계산한다 — 아직 끝나지도 않은
 //     통화가 만료로 잡힌다. 파기는 되돌릴 수 없으므로(QUALITY_BAR §3) 상한에 걸린 투영은
-//     **레코드를 만들지 않고**(`usable: false`) 그 사실을 적는다. 기간을 잘라 읽는 경우에는
+//     **레코드를 만들지 않고**(`usable: false`) 그 사실을 적는다. 절단은 두 곳에서 온다 —
+//     수집 상한(`maxEvents`)과 **원장 읽기**(`read.limit`·필터)다. 뒤쪽은 투영이 스스로 알 수
+//     없어 `projectRetainedRecordsFromLog` 가 `readWasTruncated` 로 묻는다(그 자리가 없던
+//     동안 `--limit` 하나로 이 보호가 통째로 비껴갔다). 기간을 잘라 읽는 경우에는
 //     호스트가 `observedThrough`(관측 종료 경계)를 선언하면 경계에 닿은 세션만 빼고 나머지는
 //     그대로 돈다 — 선언이 없으면 검사하지 않고(§13-3) 그 사실을 경고로 드러낸다.
 //
@@ -64,6 +67,7 @@
 import type { ChannelKind } from '../domain/types.ts';
 import type { InteractionEvent, TurnCompletedEvent } from '../events/schema.ts';
 import type { EventLog, ReadOptions } from '../events/store.ts';
+import { readWasTruncated } from '../events/store.ts';
 import { isZonedIso } from '../events/periodLedger.ts';
 import { assertTenantScope, type TenantScope } from './tenancy.ts';
 import { maskPii } from './policyGuard.ts';
@@ -142,6 +146,18 @@ export interface RetentionInventoryOptions {
    */
   maxEvents?: number;
   /**
+   * **원장 읽기 자체가 잘렸는가**(§8.2). 투영은 읽힌 줄만 손에 들고 있으므로 이 사실을
+   * 스스로는 절대 알 수 없다 — `projectRetainedRecordsFromLog` 가 `readWasTruncated` 로
+   * 판정해 넣는다. 직접 부르는 호스트가 선언하지 않으면 검사하지 않는다(§13-3: 종전과
+   * 완전히 같다).
+   *
+   * 선언이 없던 동안 `--limit` 로 읽은 원장은 **온전한 목록으로** 보였다: 위 3번이 막겠다고
+   * 적어 둔 "잘린 투영으로 파기를 돌리는 것"이 `usable: true` 로 통과했고, 스윕은 그 조각만
+   * 지운 뒤 "완료"로 끝난다. 못 본 세션의 개인정보는 기한이 지나도 남고(다음 조각을 아무도
+   * 읽지 않으면 영구히), 하필 **그 세션의 마지막 이벤트를 못 봤으므로 기산 시점도 틀리다**.
+   */
+  readTruncated?: boolean;
+  /**
    * 관측 종료 경계(ISO8601, 오프셋 명시). 이 시각 이후 이벤트가 더 올 수 있다는 뜻이므로,
    * 마지막 관측 시각이 경계에 닿은 세션은 목록에 넣지 않는다. 미선언 시 검사하지 않는다(§13-3).
    */
@@ -169,6 +185,12 @@ export interface RetentionInventoryCounters {
   eventsSkipped: number;
   /** 상한에 걸려 잘렸는가. true 면 레코드를 만들지 않는다(위 3번). */
   truncated: boolean;
+  /**
+   * 잘린 사유가 **원장 읽기**인가(`eventsSkipped` 는 0 이다). `truncated` 와 따로 적는 이유:
+   * 둘을 같게 적으면 사유 문구가 "수집 상한에 걸려 0건을 보지 않았다"가 되어, 고쳐야 할 곳
+   * (`maxEvents` 가 아니라 `read.limit`·필터)을 운영이 영영 찾지 못한다.
+   */
+  readTruncated: boolean;
   /** 투영에서 본 세션 수(레코드를 만들지 못한 세션 포함). */
   sessionsSeen: number;
   /** `session.ended` 를 못 본 세션. 빼지 않고 건수로만 적는다(위 6번). */
@@ -225,6 +247,7 @@ function newCounters(): RetentionInventoryCounters {
     timestampsRejected: 0,
     eventsSkipped: 0,
     truncated: false,
+    readTruncated: false,
     sessionsSeen: 0,
     sessionsWithoutEnd: 0,
     sessionsWithoutUsableTime: 0,
@@ -278,6 +301,12 @@ export function projectRetainedRecords(
   }
 
   const counters = newCounters();
+  // 읽기 절단은 **순회 전에** 확정한다. `truncated` 하나로 모으므로 아래 레코드 생성 가드와
+  // `usable` 이 자동으로 같은 판정을 쓴다 — 조건을 두 벌로 적으면 한쪽만 고치는 날이 온다(§2).
+  if (opts.readTruncated === true) {
+    counters.truncated = true;
+    counters.readTruncated = true;
+  }
   const seenEvents = new Set<string>();
   const byId = new Map<string, SessionAcc>();
   const boundaryMs = opts.observedThrough === undefined ? undefined : Date.parse(opts.observedThrough);
@@ -482,7 +511,13 @@ export function declaredRecordDefect(d: DeclaredRetainedRecord): string | undefi
 /** 투영에서 숨기면 안 되는 사실만 한 줄로. 판정·점수는 만들지 않는다(§13-3). */
 export function inventoryNoteKo(c: RetentionInventoryCounters): string | undefined {
   const parts: string[] = [];
-  if (c.truncated) {
+  if (c.readTruncated) {
+    // 고쳐야 할 곳이 `maxEvents` 가 아니라 읽기 쪽이므로 사유를 뭉개지 않는다.
+    parts.push('원장 읽기가 잘렸다 — 못 본 이벤트가 있어(읽기 상한·필터) 레코드를 만들지 않았다');
+  }
+  // 두 절단은 **함께 일어날 수 있다**(읽기 상한 + 수집 상한). 하나만 적으면 남은 하나를
+  // 고친 뒤에도 목록이 계속 비어, 고친 쪽이 틀렸다고 읽힌다.
+  if (c.eventsSkipped > 0) {
     parts.push(`수집 상한에 걸려 ${c.eventsSkipped}건을 보지 않았다 — 기산 시점을 보장할 수 없어 레코드를 만들지 않았다`);
   }
   if (c.foreignTenantDropped > 0) parts.push(`다른 테넌트 이벤트 ${c.foreignTenantDropped}건 제외(§11.1 — 전달 경로를 점검하라)`);
@@ -504,13 +539,22 @@ export function inventoryNoteKo(c: RetentionInventoryCounters): string | undefin
 /**
  * 원장에서 바로 투영한다. 스코프는 **원장이 가진 것**을 쓴다 —
  * 호스트가 테넌트를 주장하지 못하게 하는 것은 브리지와 같은 규칙이다(§11.1).
+ *
+ * **읽기가 잘렸는지도 여기서 묻는다**(`readWasTruncated`, §2). 종전에는 묻지 않았고,
+ * 그래서 이 함수에 `read.limit` 를 주면 위 3번의 보호가 통째로 비껴갔다 — 조각만 담긴
+ * 목록이 `usable: true` 로 나가고 스윕은 "완료"로 끝난다. 파기는 되돌릴 수 없고
+ * **지워지지 않은 개인정보는 다음 스윕에도 같은 이유로 지워지지 않는다**.
+ * 호스트가 `readTruncated` 를 직접 선언했으면 그 선언이 우선이다(관측값이 둘이면 Core 가
+ * 고르지 않는다 — 다만 읽기가 잘린 것을 "안 잘렸다"로 덮을 수는 없다).
  */
 export function projectRetainedRecordsFromLog(
   log: EventLog,
   opts: Omit<RetentionInventoryOptions, 'scope'> = {},
   read?: ReadOptions,
 ): RetentionInventoryResult {
-  return projectRetainedRecords(log.read(read).map((r) => r.event), { ...opts, scope: log.scope });
+  const rows = log.read(read);
+  const readTruncated = readWasTruncated(log, rows, read) || opts.readTruncated === true;
+  return projectRetainedRecords(rows.map((r) => r.event), { ...opts, scope: log.scope, readTruncated });
 }
 
 // ── 스윕(투영 → 계획 → 실행) ───────────────────────────────────────────────────

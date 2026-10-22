@@ -235,6 +235,39 @@ test('선언하지 않은 컴포넌트의 헬스 보고는 무시한다(§9.3)',
   assert.equal(health.latest('messaging'), undefined);
 });
 
+test('헬스 보고는 **접수 범위**를 돌려준다 — 버려진 사실이 호출자에게 닿는다(§9.3·§13-3)', b, async () => {
+  const { core } = build({ components: ['telephony'] });
+
+  const ok = core.reportHealth({ adapter: 'callbot', observedAt: NOW, samples: [
+    { component: 'telephony', state: 'degraded', observedAt: NOW },
+    { component: 'llm', state: 'down', observedAt: NOW },
+  ] });
+  assert.equal(ok.registered, true);
+  assert.equal(ok.offered, 2);
+  assert.equal(ok.accepted, 1);
+  assert.equal(ok.ignored, 1);
+  assert.deepEqual(ok.declared, ['telephony']);
+
+  // 등록되지 않은 채널: **한 건도** 기록되지 않았다는 사실이 수치로 돌아온다.
+  const none = core.reportHealth({ adapter: 'chatbot', observedAt: NOW, samples: [
+    { component: 'messaging', state: 'down', observedAt: NOW },
+  ] });
+  assert.equal(none.registered, false);
+  assert.equal(none.offered, 1);
+  assert.equal(none.accepted, 0);
+  assert.deepEqual(none.declared, []);
+
+  // 빈 보고는 "버려졌다"가 아니다 — 0 과 0 을 구분해 적는다.
+  const empty = core.reportHealth({ adapter: 'callbot', observedAt: NOW, samples: [] });
+  assert.equal(empty.registered, true);
+  assert.equal(empty.offered, 0);
+  assert.equal(empty.ignored, 0);
+
+  // 선언 목록을 고쳐도 Core 가 가진 선언은 바뀌지 않는다(복사본이다).
+  ok.declared.push('llm');
+  assert.deepEqual(core.reportHealth({ adapter: 'callbot', observedAt: NOW, samples: [] }).declared, ['telephony']);
+});
+
 test('시나리오 레지스트리는 버전을 지정하지 않으면 최신을 준다', b, () => {
   const reg = R.createMemoryFlowRegistry([flowBilling, { ...flowBilling, version: 5 }]);
   assert.equal(reg.get('billing').version, 5);
@@ -1129,6 +1162,89 @@ test('배선 있음: 전환 초대에 1회용 티켓이 실리고 토큰은 id �
   assert.ok(inv[3].expiresAt > NOW);
   // 티켓에 슬롯 값이 실리지 않는다(§10.3).
   assert.equal(JSON.stringify(inv[3]).includes('customer_name'), false);
+});
+
+// 전환 사실이 **턴 결과에도** 실리는지. 종전에는 `port.invite` 한 곳에만 있었고,
+// 그 경로는 Node 호스트에만 있다 — 비-Node 호스트에서는 전환이 조용히 반쪽만 일어났다.
+
+test('전환 초대 사실이 턴 결과에 실린다 — 토큰·만료까지(§5.2)', b, async () => {
+  const sw = switchWiring();
+  const port = fakePort();
+  const { core } = build({ flows: [flowRetry], ports: [port, darsPort()], channelSwitch: sw.binding });
+  await core.start(req({ flowId: 'retry' }));
+  await core.send('i_test1', { input: { kind: 'timeout' } });
+  const r = await core.send('i_test1', { input: { kind: 'timeout' } });
+
+  assert.equal(r.switchInvite.fromChannel, 'voice');
+  assert.equal(r.switchInvite.toChannel, 'visual');
+  assert.equal(r.switchInvite.ticketIssued, true);
+  assert.equal(r.switchInvite.token, 'tk_switch_1');
+  const inv = port.log.find((l) => l[0] === 'invite');
+  assert.equal(r.switchInvite.expiresAt, inv[3].expiresAt, '포트와 결과가 같은 티켓을 본다(§2)');
+  // 슬롯 값은 어느 쪽에도 실리지 않는다(§10.3).
+  assert.equal(JSON.stringify(r.switchInvite).includes('customer_name'), false);
+
+  // 전환이 없는 턴에는 실리지 않는다 — 매 턴 반복되면 호스트가 링크를 다시 보낸다.
+  const again = await core.send('i_test1', { input: { kind: 'timeout' } });
+  assert.equal(again.switchInvite, undefined);
+});
+
+test('보관되는 세션 복사본에는 토큰이 남지 않는다 — 1회용 열쇠가 다음 응답에 다시 실리면 안 된다(§10.3)', b, async () => {
+  const sw = switchWiring();
+  const { core } = build({ flows: [flowRetry], ports: [fakePort(), darsPort()], channelSwitch: sw.binding });
+  await core.start(req({ flowId: 'retry' }));
+  await core.send('i_test1', { input: { kind: 'timeout' } });
+  await core.send('i_test1', { input: { kind: 'timeout' } });
+
+  const stored = core.sessions.get('i_test1').lastResult;
+  assert.equal(stored.switchInvite.ticketIssued, true, '사실은 남는다');
+  assert.equal(stored.switchInvite.token, undefined, '열쇠는 남지 않는다');
+  assert.equal(JSON.stringify(stored).includes('tk_switch_1'), false);
+});
+
+test('발급이 막힌 전환은 결과에 사유가 적힌다 — 링크를 보낼 수 없다는 사실이 호스트에 닿는다', b, async () => {
+  const sw = switchWiring({ newToken: () => 'tk_i_test1' });   // id 와 얽힌 토큰 → 발급 거절
+  const port = fakePort();
+  const { core } = build({ flows: [flowRetry], ports: [port, darsPort()], channelSwitch: sw.binding });
+  await core.start(req({ flowId: 'retry' }));
+  await core.send('i_test1', { input: { kind: 'timeout' } });
+  const r = await core.send('i_test1', { input: { kind: 'timeout' } });
+
+  assert.equal(r.switchInvite.ticketIssued, false);
+  assert.equal(r.switchInvite.token, undefined);
+  assert.match(r.switchInvite.notIssuedKo, /E_TOKEN_WEAK/);
+  assert.equal(port.log.some((l) => l[0] === 'invite'), false, '매체 전달은 종전과 같이 하지 않는다');
+});
+
+test('전환 배선이 없으면 토큰 없는 초대라는 사실을 결과에 적는다(§5.2·§10.3)', b, async () => {
+  const { core, port } = build({ flows: [flowRetry] });
+  await core.start(req({ flowId: 'retry' }));
+  await core.send('i_test1', { input: { kind: 'timeout' } });
+  const r = await core.send('i_test1', { input: { kind: 'timeout' } });
+
+  assert.equal(r.switchInvite.tokenless, true);
+  assert.equal(r.switchInvite.ticketIssued, false);
+  assert.match(r.switchInvite.notIssuedKo, /세션의 열쇠/);
+  // 매체 전달은 종전과 완전히 같다 — 티켓 없이 invite 를 부른다.
+  assert.deepEqual(port.log.find((l) => l[0] === 'invite'), ['invite', 'i_test1', 'visual', undefined]);
+});
+
+test('초대를 수행할 수 없는 채널은 전환 자체가 선택되지 않는다 — 결과에도 실리지 않는다(§5.2)', b, async () => {
+  // 교차채널 초대를 선언하지 않은 채널(챗봇)은 §5.1 사다리에서 전환을 고르지 않고 상담사로 간다.
+  // 능력을 선언했는데 invite 가 없으면 **등록 자체가** 거부되므로, "링크를 못 보내는 전환"은 없다.
+  const port = fakePort('chatbot');
+  const { core } = build({ flows: [flowRetry], ports: [port], newId: () => 'i_chat1' });
+  await core.start(req({ flowId: 'retry', adapter: 'chatbot', entryPoint: 'chat_widget' }));
+  await core.send('i_chat1', { input: { kind: 'timeout' } });
+  const r = await core.send('i_chat1', { input: { kind: 'timeout' } });
+
+  assert.equal(r.switchInvite, undefined);
+  assert.equal(r.state.channel, 'chat');
+  assert.equal(r.status, 'transferred');
+
+  const bad = fakePort('callbot');
+  delete bad.invite;
+  assert.throws(() => build({ flows: [flowRetry], ports: [bad] }), /invite 구현이 없습니다/);
 });
 
 test('배선 있음: 고객 단말 수신이 확인되지 않으면 전환하지 않고 §5.1 사다리를 따른다', b, async () => {

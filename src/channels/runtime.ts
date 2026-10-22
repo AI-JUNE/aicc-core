@@ -49,6 +49,7 @@ import {
 } from '../routing/executeOffer.ts';
 import type { InviteDeliveryKind, InviteRegistry, SlotCarryPolicy, SwitchReason, SwitchTargetChannel } from '../core/channelSwitch.ts';
 import { issueSwitch, redeemSwitch } from '../core/executeSwitch.ts';
+import type { SwitchTicket } from '../core/executeSwitch.ts';
 import type { AiDisclosureConfig } from '../portal/aiDisclosure.ts';
 import { DISCLOSURE_NODE_ID, planDisclosure, validateDisclosureBinding } from '../core/executeDisclosure.ts';
 import type { ConnectorPumpBinding } from '../integration/connectorPump.ts';
@@ -94,6 +95,7 @@ import {
 import type {
   ChannelAdapterId, ChannelEndInput, ChannelHealthReport, ChannelRegistration, ChannelSessionRequest,
   ChannelTurnInput, ChannelTurnResult, ConversationCorePort, ContractIssue, ChannelCapabilities,
+  HealthIntakeReceipt, SwitchInviteNote,
 } from './contract.ts';
 import { ADAPTER_CHANNEL, CHANNEL_CONTRACT_VERSION, checkFlowSupported, registrationOk, validateRegistration } from './contract.ts';
 
@@ -389,6 +391,26 @@ export interface ChannelSwitchBinding {
   delivery?: InviteDeliveryKind;
   /** 전환 사유 기록값(§7 7.6 전환 품질 축). 미지정 시 §5.1 사다리에서 온 전환으로 적는다. */
   reason?: SwitchReason;
+}
+
+/** 전환 초대의 판정 결과. `planSwitchInvite` → 턴 결과 + `deliverSwitchInvite` 로 갈린다. */
+interface SwitchInvitePlan {
+  /** 턴 결과에 그대로 실린다(토큰은 세션 보관 복사본에서 제거된다). */
+  note: SwitchInviteNote;
+  /** 매체에 초대를 넘겨야 하는가. 발급 실패·미지원이면 false 다. */
+  deliver: boolean;
+  ticket?: SwitchTicket;
+}
+
+/**
+ * 세션에 보관할 복사본에서 토큰을 걷어낸다. 보관하면 `end` 재호출·사용량 없는 `send` 가
+ * **같은 1회용 토큰을 다시 내보낸다**(그 경로들은 `lastResult` 를 그대로 돌려준다) —
+ * 이미 상환됐거나 만료된 열쇠가 응답에 계속 실리는 것은 1회용을 무의미하게 만든다(§10.3).
+ */
+function withoutSwitchToken(result: ChannelTurnResult): ChannelTurnResult {
+  if (result.switchInvite?.token === undefined) return result;
+  const { token: _dropped, ...rest } = result.switchInvite;
+  return { ...result, switchInvite: rest };
 }
 
 /**
@@ -2905,16 +2927,34 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     }
   }
 
-  async function inviteIfSwitched(prev: ChannelKind, next: ChannelKind, rec: SessionRecord, reg: ChannelRegistration): Promise<void> {
-    if (prev === next) return;
+  /**
+   * 전환 초대의 **판정·발급**. 포트를 부르지 않는다 — 부작용과 판정을 한 함수에 묶으면
+   * 실패했을 때 무엇이 남았는지 알 수 없고, 무엇보다 **결과에 실을 사실을 턴 결과가 만들어지기
+   * 전에** 손에 쥐어야 한다(그 사실이 비-Node 호스트에 닿는 유일한 경로다, `SwitchInviteNote`).
+   */
+  function planSwitchInvite(
+    prev: ChannelKind, next: ChannelKind, rec: SessionRecord, reg: ChannelRegistration,
+  ): SwitchInvitePlan | undefined {
+    if (prev === next) return undefined;
     if (!rec.channels.includes(next)) rec.channels.push(next);
-    if (!reg.port.capabilities.crossChannelInvite || typeof reg.port.invite !== 'function') return;
+    // 초대를 수행할 수 없는 채널은 **여기 오지 않는다**: §5.1 사다리가 전환을 고르는 조건이
+    // `crossChannelInvite` 이고(`switchFeasible`), 그 능력을 선언했는데 `invite` 가 없으면
+    // 등록 자체가 거부된다(`E_MISSING_CAPABILITY_IMPL`). 그래도 종전과 같이 조용히 끝낸다 —
+    // 닿을 수 없는 분기에 사실 문구를 만들어 두면 검사할 수 없는 약속이 된다.
+    if (!reg.port.capabilities.crossChannelInvite || typeof reg.port.invite !== 'function') return undefined;
 
+    const base = { fromChannel: prev, toChannel: next };
     const cs = opts.channelSwitch;
     if (cs === undefined || (next !== 'visual' && next !== 'chat')) {
       // 종전 경로 — 토큰 없는 초대. 링크에 실릴 값이 Interaction id 뿐이라는 사실은 등록 시 경고로 남았다.
-      await reg.port.invite(rec.interactionId, next);
-      return;
+      return {
+        deliver: true,
+        note: {
+          ...base, ticketIssued: false, tokenless: true,
+          notIssuedKo: '채널 전환 배선(channelSwitch)이 없어 토큰 없이 초대했습니다'
+            + ' — 링크에 실리는 값이 곧 진행 중인 세션의 열쇠입니다 (설계서 §10.3)',
+        },
+      };
     }
 
     const issued = issueSwitch({
@@ -2939,9 +2979,21 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       // **토큰 없는 링크를 만들게 두지 않는다.** invite 를 부르면 채널은 id 로 링크를 만들 수밖에 없고,
       // 그 링크는 1회용도 만료도 없다. 전환을 못 했다는 사실은 경고로 드러낸다(조용히 삼키지 않는다).
       warnOnce('W_CHANNEL_SWITCH_UNBOUND', `채널 전환 초대를 발급하지 못해 링크를 보내지 않았습니다: ${issued.code} ${issued.reasonKo}`);
-      return;
+      return { deliver: false, note: { ...base, ticketIssued: false, notIssuedKo: `${issued.code} ${issued.reasonKo}` } };
     }
-    await reg.port.invite(rec.interactionId, next, issued.ticket);
+    return {
+      deliver: true,
+      ticket: issued.ticket,
+      note: { ...base, ticketIssued: true, expiresAt: issued.ticket.expiresAt, token: issued.ticket.token },
+    };
+  }
+
+  /** 발급된 초대를 매체에 넘긴다. 순서는 종전과 같다(이벤트 발행 뒤, 단계 렌더 전). */
+  async function deliverSwitchInvite(plan: SwitchInvitePlan, rec: SessionRecord, reg: ChannelRegistration): Promise<void> {
+    if (!plan.deliver) return;
+    const invite = reg.port.invite;
+    if (typeof invite !== 'function') return;
+    await invite(rec.interactionId, plan.note.toChannel, plan.ticket);
   }
 
   /**
@@ -3466,6 +3518,10 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       if (!rec.state.handoff) recordTurns(rec, events);
       rec.ended = rec.state.status !== 'running';
 
+      // §5.2 전환 초대는 **턴 결과를 만들기 전에** 판정·발급한다 — 그 사실이 비-Node
+      // 호스트에 닿는 유일한 경로가 이 결과이기 때문이다(`SwitchInviteNote`). 매체 전달은
+      // 종전 자리(이벤트 발행 뒤)에서 한다.
+      const invitePlan = planSwitchInvite(prevChannel, rec.state.channel, rec, reg);
       const result: ChannelTurnResult = {
         interactionId, state: rec.state, steps: drained.steps, status: rec.state.status, events,
         ...(decision.mode === 'degraded_ai' ? { fallback: decision } : {}),
@@ -3473,12 +3529,13 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
         ...(consent !== undefined ? { consent } : {}),
         ...(rec.state.handoff ? { handoff: { ...(rec.state.handoff.queue !== undefined ? { queue: rec.state.handoff.queue } : {}), ...(summaryMasked !== undefined ? { summaryMasked } : {}) } } : {}),
         ...(billing !== undefined ? { billing } : {}),
+        ...(invitePlan !== undefined ? { switchInvite: invitePlan.note } : {}),
         ...complianceSlot(rec, events),
       };
-      rec.lastResult = result;
+      rec.lastResult = withoutSwitchToken(result);
       sessions.put(rec);
       await publish(events);
-      await inviteIfSwitched(prevChannel, rec.state.channel, rec, reg);
+      if (invitePlan !== undefined) await deliverSwitchInvite(invitePlan, rec, reg);
       const shown = visibleSteps(drained.steps.slice(drained.presented));
       if (shown.length > 0) await reg.port.present(interactionId, shown);
       await deliverHandoff(reg, rec, summaryMasked, result);
@@ -3623,7 +3680,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     send: (interactionId, turn) => observe('send', { interactionId }, () => impl.send(interactionId, turn)),
     end: (interactionId, reasonKo, input) => observe('end', { interactionId }, () => impl.end(interactionId, reasonKo, input)),
 
-    reportHealth(report: ChannelHealthReport): void {
+    reportHealth(report: ChannelHealthReport): HealthIntakeReceipt {
       const allowed = declared.get(report.adapter);
       const accepted: HealthSample[] = [];
       let ignored = 0;
@@ -3638,6 +3695,9 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
           }
         }
       }
+      // 등록되지 않은 채널의 보고는 순회하지 않으므로(종전 동작) 개수만 센다 —
+      // 배열이 아닌 값을 0 으로 적지 않기 위해 형태를 확인한다.
+      const offered = Array.isArray(report.samples) ? report.samples.length : 0;
       // 버려진 보고를 관측에 남긴다. 이 자리는 **조용한 실패의 전형**이었다 — 등록되지 않은
       // 채널이나 선언하지 않은 컴포넌트의 샘플은 통째로 사라지는데, 헬스를 성실히 올리는 채널과
       // 아무 신호도 전달되지 않는 채널이 바깥에서 구분되지 않았다(§9.3).
@@ -3648,13 +3708,22 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
         health: {
           ...(isKnownAdapter(report.adapter) ? { adapter: report.adapter } : {}),
           registered: allowed !== undefined,
-          // 등록되지 않은 채널의 보고는 순회하지 않으므로(종전 동작) 개수만 센다 —
-          // 배열이 아닌 값을 0 으로 적지 않기 위해 형태를 확인한다.
-          offered: Array.isArray(report.samples) ? report.samples.length : 0,
+          offered,
           accepted,
           ignored,
         },
       });
+      // **접수 범위를 호출자에게도 돌려준다.** 관측 배선은 Node 쪽에만 있으므로, 이 값이
+      // 없는 동안 비-Node 호스트(브리지)는 자기 샘플이 §9.3 에 닿았는지 알 길이 아예 없었고
+      // 브리지는 "해석한 줄 수"를 `accepted` 로 적어 보냈다 — 실측이 아닌 수치다(§13-3).
+      // 수치는 관측 보고와 **같은 계산 하나**에서 나온다(§2).
+      return {
+        registered: allowed !== undefined,
+        offered,
+        accepted: accepted.length,
+        ignored,
+        declared: allowed === undefined ? [] : [...allowed],
+      };
     },
   };
 

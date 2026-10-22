@@ -3182,6 +3182,107 @@
         근거: `scripts/coverage.mjs`(리포터 URL·표준오류 수집·판정 단일화) ·
         `src/ops/coverage.ts`(`toRelative`·`CoverageRunFacts`) · `tests/ops.coverage.test.mjs`(4건 추가) ·
         `tests/ops.coverageRunner.test.mjs`(3건 신규) · CI `coverage (measure)` 단계 · `API.md` 반영
+      · Core 측 완료(67): **§5.2 전환이 비-Node 호스트에서는 반쪽만 일어났다(2026-10-22)** —
+        (27)~(62)가 통화 경로·유지 루프·판정을 전부 브리지로 꿰었는데, **채널 전환 하나만
+        `port.invite` 에 남아 있었다**. 그 경로는 Node 호스트에만 있다: 브리지는 호스트가
+        `ConversationCorePort` 를 JSONL 로 소비하는 길이고, Core 가 포트로 거는 전화는 그 프로세스
+        바깥으로 나가지 않는다. 그래서 파이썬 에이전트로 운영하는 Callbot 배치에서 §5.1 사다리가
+        화면 전환을 고르면 **다음 일이 전부 조용히** 일어난다:
+        - `state.channel` 이 `visual` 로 바뀌어 **이후 단계가 화면용으로 렌더된다** — 통화 중인
+          고객은 버튼·폼용으로 만든 문구를 듣는다(`runtime.ts` 의 `switchFeasible` 주석이 발급
+          실패를 막아야 하는 이유로 적어 둔 바로 그 상태인데, 원인이 발급이 아니라 **전달**이다).
+        - **링크는 아무도 보내지 않는다.** 고객은 오지 않는 화면을 기다린다.
+        - 사다리는 이미 전환을 골랐으므로 **상담사로도 내려가지 않는다**(§5.1 의 다음 칸은 3회
+          실패인데, 고객은 화면을 기다리다 끊는다).
+        어디에서도 예외가 나지 않고, 리포트에는 "화면 전환 1건"으로 남는다.
+        그래서 전환 사실을 **턴 결과**에 실었다(`ChannelTurnResult.switchInvite`) — Node 호스트에는
+        `port.invite` 와 겹치는 근거이고, 비-Node 호스트에는 **유일한 경로**다.
+        - **토큰과 사실을 갈랐다(§10.3).** 목적지·발급 여부·만료·사유는 개인정보도 열쇠도 아니므로
+          언제나 나간다(감추면 호스트는 "링크를 보낼 차례"와 "보낼 수 없는 상태"를 구분할 수 없다).
+          1회용 합류 토큰은 **상담사용 요약과 같은 규칙**으로 `includeSwitchTicket` 를 켠 소비자에게만
+          가고, `hello` 의 `includesSwitchTicket` 가 그 사실을 알려 준다 — 끈 상태에서 링크를 만들면
+          호스트는 Interaction id 로 만들 수밖에 없고 그 순간 1회용·만료·회수가 전부 무의미해진다
+          (`core/executeSwitch.ts` (1)이 막겠다고 적어 둔 사고다).
+        - **보관 복사본에서 토큰을 걷어낸다.** `end` 재호출·사용량 없는 `send` 는 `lastResult` 를
+          그대로 돌려주므로, 그냥 두면 **이미 상환됐거나 만료된 열쇠가 응답에 계속 실린다**.
+        - **판정과 부작용을 나눴다.** `planSwitchInvite` 가 턴 결과 **전에** 판정·발급하고
+          매체 전달(`deliverSwitchInvite`)은 종전 자리(이벤트 발행 뒤)에서 한다 — 순서를 바꾸지
+          않았으므로 Node 호스트 동작은 종전과 완전히 같다.
+        - **닿을 수 없는 분기에 문구를 만들지 않았다.** "초대를 수행할 수 없는 채널"은 여기 오지
+          않는다(사다리가 전환을 고르는 조건이 `crossChannelInvite` 이고, 그 능력을 선언했는데
+          `invite` 가 없으면 등록 자체가 거부된다) — 검사가 그 사실까지 고정한다.
+        **변이 검증(도구 출력 그대로)**: 사실을 결과에 싣지 않으면 7건 실패 · 보관 복사본에서
+        토큰을 걷어내지 않으면 1건 실패 · 브리지 노출 스위치를 비껴가면 1건 실패 — 전부 원본에서는
+        통과한다. 실발송 없음(가짜 포트·드라이런 브리지로만 검증). SMS·알림톡·푸시 발신은 **[승인 필요]**.
+        근거: `src/channels/contract.ts`(`SwitchInviteNote`·`ChannelTurnResult.switchInvite`) ·
+        `src/channels/runtime.ts`(`planSwitchInvite`·`deliverSwitchInvite`·`withoutSwitchToken`) ·
+        `src/channels/bridge.ts`(`BridgeSwitchInvitePayload`·`includeSwitchTicket`) ·
+        `scripts/channel-bridge.mjs`(`--include-switch-ticket`) ·
+        `tests/channels.runtime.test.mjs`(5건 추가) · `tests/channels.bridge.test.mjs`(4건 추가) ·
+        CI `channel bridge runner` 단계(기본 꺼짐 고정) · `API.md` 반영
+      · Core 측 완료(68): **헬스는 "올렸다"만 있고 "닿았다"가 없었다 — 브리지는 파싱한 줄 수를
+        접수로 적어 보냈다(2026-10-22, 2)** — Core 는 등록되지 않은 채널의 보고와 **선언하지 않은
+        컴포넌트**의 샘플을 무시한다(아무 채널이나 전체 폴백을 유발할 수 없게 하는 §9.3 의 규칙이다).
+        그 사실은 (36)이 관측에 남기도록 고쳤지만 **관측 배선은 Node 쪽에만 있다** — 호출자에게는
+        아무것도 돌아가지 않았고, 브리지는 `samples.length` 를 그대로 `accepted` 로 돌려줬다.
+        즉 컴포넌트 이름 오타 하나(`stt_v2`)나 어댑터 미등록으로 **한 건도 전달되지 않는 배치**가
+        `{"accepted":3,"ok":true}` 를 받으며 영구히 운영된다. 증상은 전부 조용하다: 엔진이 전부
+        죽어도 §9.3 판정은 `normal` 이고(고객은 "말을 못 알아듣는다"로 겪는다), 한 번 `degraded_ai`
+        로 내려간 테넌트는 샘플이 갱신되지 않아 **복구 프로브가 돌아도 영구히** 폴백에 남는다.
+        `reportHealth` 가 접수 범위(`HealthIntakeReceipt`)를 돌려준다 — 등록 여부·올린 수·기록된
+        수·무시된 수, 그리고 **Core 가 가진 선언 목록**이다.
+        - **호스트가 보낸 컴포넌트 이름은 되돌려 적지 않는다**(§10.3 — 그 자리에는 임의 문자열이
+          온다). 대신 `declared` 를 주어 오타를 호스트가 스스로 맞춰 보게 한다(복사본이므로 호스트가
+          고쳐도 Core 의 선언은 바뀌지 않는다).
+        - **수치는 관측 보고와 같은 계산 하나에서 나온다**(§2) — 두 벌로 세면 로그와 응답이 갈린다.
+        - **모르는 것을 숫자로 적지 않는다**(§13-3). 포트만 구현해 `void` 를 돌려주는 호스트에서는
+          브리지가 `accepted` 를 **아예 싣지 않고** `acceptedKnown:false` + 사유를 준다.
+          계약은 `HealthIntakeReceipt | void` 이므로 종전 구현도 깨지지 않는다.
+        **변이 검증(도구 출력 그대로)**: 브리지를 종전(`accepted: samples.length`)으로 되돌리면
+        4건 실패 · 접수 수를 올린 수로 적으면 3건 실패 — 전부 원본에서는 통과한다.
+        근거: `src/channels/contract.ts`(`HealthIntakeReceipt`·`reportHealth` 반환) ·
+        `src/channels/runtime.ts` · `src/channels/bridge.ts`(`health` op) ·
+        `tests/channels.runtime.test.mjs`(1건 추가) · `tests/channels.bridge.test.mjs`(3건 추가) ·
+        `API.md` 반영
+      · Core 측 완료(69): **원장 읽기가 잘렸는지를 세 투영 중 한 곳만 물었다(2026-10-22, 3)** —
+        (32)가 기간 투영을 만들 때 적어 둔 사고 (나)("상한으로 잘라 읽으면 집계가 작게 나오고 작은
+        쪽은 차단을 비껴간다")의 방어는 `projectLedgerPeriodFromLog` **한 곳에만** 있었다. 같은 원장을
+        같은 `ReadOptions` 로 읽는 나머지 두 투영은 묻지 않았고, **투영은 이 사실을 스스로 절대 알 수
+        없다**(읽힌 줄만 손에 들어온다). 두 자리의 결말이 다 조용하다.
+        - **보존 목록(§8.2)**: `retentionInventory.ts` 머리말 3번은 "잘린 투영으로 파기를 돌리는 것"을
+          막는다고 적어 두고 `usable:false` 로 거부하는데, 그 판정은 **수집 상한에만** 걸려 있었다.
+          즉 `projectRetainedRecordsFromLog(log, {}, { limit: 500 })` — 이 함수가 제공하는 바로 그
+          편의 — 로 읽으면 보호가 통째로 비껴간다. 조각만 담긴 목록이 `usable:true` 로 나가고
+          스윕은 그 조각만 지운 뒤 `executed`·"완료"로 끝난다. **기한이 지난 개인정보는 남고**
+          (다음 조각을 아무도 읽지 않으면 영구히), 하필 그 세션의 마지막 이벤트를 못 봤으므로
+          **기산 시점도 틀리다**. 드러나는 시점은 개인정보 실태 점검이고 되돌릴 수 없다.
+        - **포털 조회(§7 2.2)**: `projectFromLog(log, {}, { limit: N })` 의 결과가 온전한 목록으로
+          나갔다. 운영자 화면에는 **"그 통화는 없다"**가 뜨고(민원·분쟁 조사에서 가장 비싼 오답이다)
+          감사로그에는 **정상 조회**로 남아, 나중에 "조회했는데 없었다"의 근거가 된다.
+        **판정을 원장 옆 한 곳으로 모았다(§2)**: `events/store.ts` 의 `readWasTruncated` 다 —
+        마지막으로 읽은 줄의 오프셋이 원장의 마지막 오프셋보다 작으면 잘린 것이고, 한 건도 못
+        읽었으면 기준은 `afterOffset` 이다(그래서 **빈 원장은 잘린 것이 아니다**). 기간 투영도
+        자기 사본을 버리고 이 함수를 쓴다.
+        **두 절단을 같게 적지 않는다**: 사유를 뭉개면 문구가 "수집 상한에 걸려 **0건**을 보지
+        않았다"가 되어, 고쳐야 할 곳(`maxEvents` 가 아니라 `read.limit`·필터)을 운영이 영영 찾지
+        못한다. 둘은 겹칠 수 있으므로 각각 적는다 — 하나만 고친 뒤에도 목록이 계속 모자라면
+        고친 쪽이 틀렸다고 읽힌다.
+        **막는 방식은 자리마다 다르다**: 보존은 **레코드를 만들지 않고**(파기는 되돌릴 수 없다)
+        스윕이 거절하고, 조회는 **행을 그대로 돌려주되** 잘림을 적는다 — 페이지를 끊어 읽는 것은
+        정상 운영이고, 막으면 큰 원장에서는 아무 화면도 뜨지 않는다.
+        **검사하지 못하는 범위도 적었다(§13-3)**: 걸러 읽었는데 통과한 마지막 줄이 원장의 마지막
+        줄이면 오프셋만으로는 구분되지 않는다. 그 경우는 필터를 건 호출자만 아는 사실이므로
+        투영 옵션(`readTruncated`)으로 **직접 선언**하고, Core 는 추측해서 잘림으로 적지 않는다 —
+        단건 상세 조회가 전부 "잘렸다"로 표시되면 그 표시는 곧 무시되고 진짜 잘림도 함께 무시된다.
+        **주지 않거나 끝까지 읽으면 동작은 종전과 완전히 같다.**
+        **변이 검증(도구 출력 그대로)**: 보존 쪽 판정을 빼면 4건 실패 · 조회 쪽을 빼면 2건 실패 ·
+        보존 사유 문구를 빼면 3건 실패 — 전부 원본에서는 통과한다.
+        근거: `src/events/store.ts`(`readWasTruncated`) · `tests/events.store.test.mjs`(3건 추가) ·
+        `src/core/retentionInventory.ts`(`readTruncated` 옵션·카운터·사유) ·
+        `tests/core.retentionInventory.test.mjs`(5건 추가) ·
+        `src/portal/executeInteractions.ts`(같은 옵션·카운터·사유) ·
+        `tests/portal.executeInteractions.test.mjs`(3건 추가) ·
+        `src/events/periodLedger.ts`(사본 제거, §2) · `API.md` 반영
       · 남은 것: **Callbot 저장소 쪽 배선** — 코드는 훅마다 한 줄(README 참조)이며 더 쓸 것이 없다.
         남은 것은 저장소 결정 사항이다: 현행 LLM 툴(welfare_apply 등)과 Core 시나리오의 역할 분담
         (어느 쪽이 화면 노드를 밀 것인가)·실운영 Core 모듈·Flow id 를 **사람이 정해야 한다**,

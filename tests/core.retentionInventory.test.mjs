@@ -339,6 +339,74 @@ test('원장에서 바로 투영할 때 스코프는 원장이 가진 것을 쓴
   assert.deepEqual(ids(r.records), ['interaction_event:i1', 'transcript_masked:i1']);
 });
 
+// ── 7-2) 원장 읽기가 잘렸는가(§8.2) ──────────────────────────────────────────
+// 투영은 읽힌 줄만 손에 든다 — 읽기가 잘린 사실을 **스스로는 절대 알 수 없다**.
+// 묻지 않던 동안 `read.limit` 하나로 머리말 3번의 보호가 통째로 비껴갔다:
+// 조각만 담긴 목록이 `usable: true` 로 나가고 스윕은 그 조각만 지운 뒤 "완료"로 끝난다.
+
+test('읽기 상한으로 읽은 원장은 파기 근거가 아니다 — 레코드를 만들지 않고 사유를 적는다(§8.2)', b, () => {
+  const log = store.createMemoryEventLog(scope);
+  log.appendAll([...session('i1'), ...session('i2', { prefix: 'b' })]);
+
+  const cut = inv.projectRetainedRecordsFromLog(log, {}, { limit: 2 });
+  assert.equal(cut.counters.readTruncated, true);
+  assert.equal(cut.counters.truncated, true);
+  // 상한은 수집 상한이 아니다 — 보지 않은 건수를 0 으로 적지 않는다(§13-3).
+  assert.equal(cut.counters.eventsSkipped, 0);
+  assert.equal(cut.usable, false);
+  assert.deepEqual(cut.records, []);
+  assert.match(cut.noteKo, /원장 읽기가 잘렸다/);
+  assert.doesNotMatch(cut.noteKo, /수집 상한에 걸려 0건/);
+
+  // 끝까지 읽으면 종전과 완전히 같다.
+  const full = inv.projectRetainedRecordsFromLog(log);
+  assert.equal(full.counters.readTruncated, false);
+  assert.equal(full.usable, true);
+  assert.deepEqual(ids(full.records), [
+    'interaction_event:i1', 'interaction_event:i2', 'transcript_masked:i1', 'transcript_masked:i2',
+  ]);
+});
+
+test('잘린 읽기로 만든 목록은 스윕이 거절한다 — 지워지지 않은 것이 "완료"로 남지 않는다', b, async () => {
+  const log = store.createMemoryEventLog(scope);
+  log.appendAll([...session('i1'), ...session('i2', { prefix: 'b' })]);
+  const port = ex.createMemoryDisposalPort();
+
+  const r = await inv.runRetentionSweep({
+    inventory: inv.projectRetainedRecordsFromLog(log, {}, { limit: 2 }),
+    policy: policy(), port, at: NOW, activation: ON, timeoutMs: 500,
+  });
+
+  assert.equal(r.status, 'refused');
+  assert.deepEqual(port.calls.delete, []);
+  assert.ok(r.refusalsKo.some((s) => /원장 읽기가 잘렸다/.test(s)), r.refusalsKo.join(' / '));
+});
+
+test('걸러 읽은 원장도 잘린 것으로 본다 — 못 본 이벤트가 있는지 알 방법이 없다', b, () => {
+  const log = store.createMemoryEventLog(scope);
+  log.appendAll(session('i1'));
+  const filtered = inv.projectRetainedRecordsFromLog(log, {}, { types: ['session.started'] });
+  assert.equal(filtered.counters.readTruncated, true);
+  assert.equal(filtered.usable, false);
+});
+
+test('빈 원장은 잘린 것이 아니다 — 0건과 "못 봤다"를 같게 적지 않는다(§13-3)', b, () => {
+  const empty = inv.projectRetainedRecordsFromLog(store.createMemoryEventLog(scope));
+  assert.equal(empty.counters.readTruncated, false);
+  assert.equal(empty.usable, true);
+  assert.equal(empty.noteKo, undefined);
+});
+
+test('두 절단이 겹쳐도 사유가 둘 다 남는다 — 하나만 고치면 목록은 계속 모자라다', b, () => {
+  const log = store.createMemoryEventLog(scope);
+  log.appendAll([...session('i1'), ...session('i2', { prefix: 'b' })]);
+  const both = inv.projectRetainedRecordsFromLog(log, { maxEvents: 1 }, { limit: 3 });
+  assert.equal(both.counters.readTruncated, true);
+  assert.equal(both.counters.eventsSkipped, 2);
+  assert.match(both.noteKo, /원장 읽기가 잘렸다/);
+  assert.match(both.noteKo, /수집 상한에 걸려 2건/);
+});
+
 test('투영 결과가 planDisposition·executeDisposition 을 그대로 통과한다(배선 확인)', b, async () => {
   const log = store.createMemoryEventLog(scope);
   log.appendAll(session('i1', { utterance: '카드번호 1234-5678-9012-3456 입니다' }));

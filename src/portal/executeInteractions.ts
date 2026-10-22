@@ -34,6 +34,7 @@ import type {
   TurnCompletedEvent,
 } from '../events/schema.ts';
 import type { EventLog, ReadOptions } from '../events/store.ts';
+import { readWasTruncated } from '../events/store.ts';
 import { assertTenantScope, type TenantScope } from '../core/tenancy.ts';
 import { maskPii } from '../core/policyGuard.ts';
 import type { AuditChain, AuditRecord, Hasher } from '../audit/log.ts';
@@ -70,6 +71,18 @@ export interface InteractionIndexOptions {
   transcriptSpeakers?: readonly TranscriptSpeaker[];
   /** 수집 상한. 기본값 없음(§13-3) — 주지 않으면 전수 투영한다. */
   maxEvents?: number;
+  /**
+   * **원장 읽기 자체가 잘렸는가**(§7 2.2). 투영은 읽힌 줄만 손에 들고 있으므로 이 사실을
+   * 스스로는 절대 알 수 없다 — `projectFromLog` 가 `readWasTruncated` 로 판정해 넣는다.
+   * 직접 부르는 호스트가 선언하지 않으면 검사하지 않는다(§13-3: 종전과 완전히 같다).
+   *
+   * 선언이 없던 동안 `read.limit` 로 읽은 원장의 조회 결과는 **온전한 목록으로** 보였다:
+   * 운영자 화면에는 "그 통화는 없다"가 뜨고(민원·분쟁 조사에서 가장 비싼 오답이다),
+   * 감사로그에는 정상 조회로 남아 나중에 "조회했는데 없었다"의 근거가 된다.
+   * `truncated` 와 달리 조회를 막지는 않는다 — 페이지를 끊어 읽는 것은 정상 운영이고,
+   * 막으면 큰 원장에서는 아무 화면도 못 뜬다. **적되 숨기지 않는다.**
+   */
+  readTruncated?: boolean;
 }
 
 export interface InteractionIndexCounters {
@@ -85,6 +98,12 @@ export interface InteractionIndexCounters {
   eventsSkipped: number;
   /** 상한에 걸려 잘렸는가. true 면 아래 세션 통계는 **그 범위 안에서만** 참이다. */
   truncated: boolean;
+  /**
+   * 못 본 이벤트가 **원장 읽기**에서 생겼는가(`eventsSkipped` 는 0 이다). `truncated` 와 따로
+   * 적는 이유: 둘을 같게 적으면 사유 문구가 "수집 상한에 걸려 0건을 보지 않았다"가 되어,
+   * 고쳐야 할 곳(`maxEvents` 가 아니라 `read.limit`·필터)을 운영이 영영 찾지 못한다.
+   */
+  readTruncated: boolean;
   /** `session.started` 를 못 본 세션 — 기간 경계에서 잘린 원장 조각이다. */
   sessionsWithoutStart: number;
   /** `session.ended` 를 못 본 세션. 폴백·누수로 끝난 통화가 전부 여기 들어온다. */
@@ -131,6 +150,7 @@ function newCounters(): InteractionIndexCounters {
     eventsRejected: 0,
     eventsSkipped: 0,
     truncated: false,
+    readTruncated: false,
     sessionsWithoutStart: 0,
     sessionsWithoutEnd: 0,
     sessionsMissingDuration: 0,
@@ -201,6 +221,13 @@ export function projectInteractions(
 
   const wanted = new Set<TranscriptSpeaker>(opts.transcriptSpeakers ?? SPEAKERS);
   const counters = newCounters();
+  // 읽기 절단은 **순회 전에** 확정한다. 행은 그대로 돌려주되(페이지 읽기는 정상 운영이다)
+  // "본 범위 안에서만 참"이라는 사실은 `truncated` 하나로 모은다 — 조건을 두 벌로 적으면
+  // 한쪽만 고치는 날이 온다(§2).
+  if (opts.readTruncated === true) {
+    counters.truncated = true;
+    counters.readTruncated = true;
+  }
   const seen = new Set<string>();
   const byId = new Map<string, Acc>();
 
@@ -344,7 +371,10 @@ export function projectInteractions(
 /** 투영에서 숨기면 안 되는 사실만 한 줄로. 판정·점수는 만들지 않는다(§13-3). */
 export function indexNoteKo(c: InteractionIndexCounters): string | undefined {
   const parts: string[] = [];
-  if (c.truncated) parts.push(`수집 상한에 걸려 ${c.eventsSkipped}건을 보지 않았다 — 기간을 좁혀 다시 투영하라`);
+  // 두 절단은 **함께 일어날 수 있다**(읽기 상한 + 수집 상한). 사유를 뭉개면 고쳐야 할 곳이
+  // 가려진다 — 하나만 고친 뒤에도 목록이 계속 모자라 고친 쪽이 틀렸다고 읽힌다.
+  if (c.readTruncated) parts.push('원장 읽기가 잘렸다 — 못 본 이벤트가 있다(읽기 상한·필터). 이 목록은 본 범위 안에서만 참이다');
+  if (c.eventsSkipped > 0) parts.push(`수집 상한에 걸려 ${c.eventsSkipped}건을 보지 않았다 — 기간을 좁혀 다시 투영하라`);
   if (c.foreignTenantDropped > 0) parts.push(`다른 테넌트 이벤트 ${c.foreignTenantDropped}건 제외(§11.1 — 전달 경로를 점검하라)`);
   if (c.eventsRejected > 0) parts.push(`식별자 없는 이벤트 ${c.eventsRejected}건 제외(§8.1)`);
   if (c.duplicatesDropped > 0) parts.push(`중복 이벤트 ${c.duplicatesDropped}건 제외`);
@@ -363,13 +393,19 @@ export function indexNoteKo(c: InteractionIndexCounters): string | undefined {
 /**
  * 원장에서 바로 투영한다. 스코프는 **원장이 가진 것**을 쓴다 —
  * 호스트가 테넌트를 주장하지 못하게 하는 것은 브리지와 같은 규칙이다(§11.1).
+ *
+ * **읽기가 잘렸는지도 여기서 묻는다**(`readWasTruncated`, §2). 종전에는 묻지 않았고,
+ * 그래서 `read.limit` 로 읽은 조회 결과가 **온전한 목록으로** 나갔다 — 운영자에게는
+ * "그 통화는 없다"로 보이고 감사로그에는 정상 조회로 남는다.
  */
 export function projectFromLog(
   log: EventLog,
   opts: Omit<InteractionIndexOptions, 'scope'> = {},
   read?: ReadOptions,
 ): InteractionIndexResult {
-  return projectInteractions(log.read(read).map((r) => r.event), { ...opts, scope: log.scope });
+  const rows = log.read(read);
+  const readTruncated = readWasTruncated(log, rows, read) || opts.readTruncated === true;
+  return projectInteractions(rows.map((r) => r.event), { ...opts, scope: log.scope, readTruncated });
 }
 
 // ── 2) 감사에 묶인 조회 경로 ──────────────────────────────────────────────────

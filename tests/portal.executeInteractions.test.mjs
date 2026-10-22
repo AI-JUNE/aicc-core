@@ -250,6 +250,47 @@ test('원장 읽기 조건은 그대로 전달된다(세션 단위 상세 조회
   l.appendAll([...session(), ...session({ interactionId: 'i2' })]);
   const r = m.projectFromLog(l, {}, { interactionId: 'i2' });
   assert.deepEqual(r.rows.map((x) => x.id), ['i2']);
+  // 마지막 줄까지 읽었으므로 잘린 것이 아니다 — 단건 조회가 전부 "잘렸다"로 표시되면
+  // 그 표시는 곧 무시되고, 진짜 잘림도 함께 무시된다.
+  assert.equal(r.counters.readTruncated, false);
+});
+
+test('읽기 상한으로 읽은 조회는 "그 통화는 없다"로 끝나지 않는다 — 잘림을 적는다(§7 2.2)', b, () => {
+  const l = store.createMemoryEventLog(scope);
+  l.appendAll([...session(), ...session({ interactionId: 'i2' })]);
+
+  const cut = m.projectFromLog(l, {}, { limit: 2 });
+  assert.equal(cut.counters.readTruncated, true);
+  assert.equal(cut.counters.truncated, true);
+  // 수집 상한이 아니다 — 보지 않은 건수를 0 으로 적지 않는다(§13-3).
+  assert.equal(cut.counters.eventsSkipped, 0);
+  assert.match(cut.noteKo, /원장 읽기가 잘렸다/);
+  assert.doesNotMatch(cut.noteKo, /수집 상한에 걸려 0건/);
+  // **행은 그대로 돌려준다** — 페이지를 끊어 읽는 것은 정상 운영이고, 막으면 큰 원장에서는
+  // 아무 화면도 뜨지 않는다.
+  assert.deepEqual(cut.rows.map((x) => x.id), ['i1']);
+
+  const full = m.projectFromLog(l);
+  assert.equal(full.counters.readTruncated, false);
+  assert.equal(full.noteKo, undefined);
+  assert.deepEqual(full.rows.map((x) => x.id).sort(), ['i1', 'i2']);
+});
+
+test('빈 원장은 잘린 것이 아니다 — 0건과 "못 봤다"를 같게 적지 않는다(§13-3)', b, () => {
+  const r = m.projectFromLog(store.createMemoryEventLog(scope));
+  assert.equal(r.counters.readTruncated, false);
+  assert.equal(r.counters.truncated, false);
+  assert.equal(r.noteKo, undefined);
+});
+
+test('두 절단이 겹쳐도 사유가 둘 다 남는다 — 하나만 고치면 목록은 계속 모자라다', b, () => {
+  const l = store.createMemoryEventLog(scope);
+  l.appendAll([...session(), ...session({ interactionId: 'i2' })]);
+  const both = m.projectFromLog(l, { maxEvents: 1 }, { limit: 3 });
+  assert.equal(both.counters.readTruncated, true);
+  assert.equal(both.counters.eventsSkipped, 2);
+  assert.match(both.noteKo, /원장 읽기가 잘렸다/);
+  assert.match(both.noteKo, /수집 상한에 걸려 2건/);
 });
 
 // ── 조회: 권한·기록 ─────────────────────────────────────────────────────────

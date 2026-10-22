@@ -6,6 +6,7 @@
 // 사용: node scripts/channel-bridge.mjs --core <모듈경로> --adapter callbot
 //                                       [--export 이름] [--max-line-bytes 65536]
 //                                       [--include-handoff-summary] [--include-slots]
+//                                       [--include-switch-ticket]
 // 모듈은 `{ core, scope }` 를 export 하거나, 그것을 돌려주는 함수(default/createCore)를 export 한다.
 // 선택적으로 `rateLimiter`(+`rateLimitCost`)를 함께 내놓을 수 있다 — 브리지는 진입점 제한을
 // 지원하지만 여기서 넘기지 않으면 비-Node 호스트에서는 끝내 닿지 않는다. 내놓지 않으면 제한 없음이다(§13-3).
@@ -32,6 +33,7 @@ import { createBridge, encodeResponse } from '../src/channels/bridge.ts';
 
 const USAGE = `사용: node scripts/channel-bridge.mjs --core <모듈경로> --adapter <callbot|chatbot|dars>
        [--export 이름] [--max-line-bytes N] [--include-handoff-summary] [--include-slots]
+       [--include-switch-ticket]
 모듈은 { core, scope } 를 export 하거나, 그것을 돌려주는 함수를 export 합니다.
 기본 dry_run 이며 실회선 연결은 [승인 필요] 입니다.`;
 
@@ -97,6 +99,10 @@ try {
     approvalRef: built.approvalRef,
     includeHandoffSummary: flag('--include-handoff-summary'),
     includeSlots: flag('--include-slots'),
+    // §5.2 전환 링크를 이 호스트가 직접 만들어 보낼 때만 켠다. 끈 상태에서도 전환 **사실**은
+    // 응답에 실린다 — 토큰만 빠진다(§10.3). 켜지 않은 채 링크를 만들면 호스트는 Interaction id
+    // 로 링크를 만들 수밖에 없고, 그 링크는 1회용도 만료도 없다.
+    includeSwitchTicket: flag('--include-switch-ticket'),
     maxLineBytes,
     // 한도는 명령줄이 아니라 모듈에서 온다 — 숫자를 CLI 기본값으로 박으면 그 값이 곧 정책이 된다(§13-3).
     ...(built.rateLimiter !== undefined ? { rateLimiter: built.rateLimiter } : {}),

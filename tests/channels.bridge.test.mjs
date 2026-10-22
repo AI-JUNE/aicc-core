@@ -102,6 +102,86 @@ test('health 보고는 Core 로 전달되고 접수 건수를 돌려준다', b, 
   }));
   assert.equal(r.ok, true);
   assert.equal(r.result.accepted, 1);
+  assert.equal(r.result.acceptedKnown, true);
+  assert.equal(r.result.registered, true);
+  assert.equal(r.result.ignored, 0);
+});
+
+// 종전에는 `samples.length` 를 그대로 `accepted` 로 돌려줬다 — 그것은 **브리지가 파싱한 수**이고
+// Core 가 접수한 수가 아니다(§13-3). 아래 둘은 그 차이가 가장 비싼 두 상태다: 둘 다 예외가 없고,
+// 그 채널은 §9.3 판정에 한 건도 닿지 않은 채로 영구히 운영된다.
+
+test('선언하지 않은 컴포넌트의 샘플은 접수되지 않았다고 적는다 — 파싱한 수를 접수로 적지 않는다(§13-3)', b, async () => {
+  const { bridge } = build();
+  const r = await bridge.handleLine(line({
+    id: '1', op: 'health',
+    report: {
+      observedAt: NOW,
+      samples: [
+        { component: 'stt', state: 'up' },
+        { component: 'stt_v2', state: 'down' },   // 등록 시 선언하지 않은 이름(오타)
+      ],
+    },
+  }));
+  assert.equal(r.ok, true);
+  assert.equal(r.result.offered, 2);
+  assert.equal(r.result.accepted, 1);
+  assert.equal(r.result.ignored, 1);
+  // 호스트가 보낸 이름은 되돌려 적지 않는다(§10.3) — 대신 Core 의 선언 목록으로 맞춰 본다.
+  assert.ok(r.result.declared.includes('stt'));
+  assert.ok(!JSON.stringify(r.result).includes('stt_v2'));
+});
+
+test('등록되지 않은 채널의 보고는 0건 접수로 적힌다 — "올렸다"와 "닿았다"를 구분한다(§9.3)', b, async () => {
+  // 브리지는 callbot 인데 Core 에는 chatbot 만 등록된 배치. 종전에는 accepted 가 샘플 수였다.
+  const port = BP.createChannelPort({ id: 'chatbot' });
+  const core = R.createConversationCore({
+    scope: SCOPE,
+    flows: R.createMemoryFlowRegistry([flow]),
+    channels: [{ port, reportsComponents: P.CHANNEL_COMPONENTS.chatbot, contractVersion: 1 }],
+    policy: {
+      tenantId: 'goone', staleAfterMs: 60000, treatUnknownAsDown: false,
+      legacyIvrAvailable: false, agentQueueAvailable: true,
+    },
+    health: F.createHealthRegistry([]),
+    now: () => NOW,
+  });
+  const bridge = BR.createBridge({ core, adapter: 'callbot', scope: SCOPE });
+
+  const r = await bridge.handleLine(line({
+    id: '1', op: 'health',
+    report: { observedAt: NOW, samples: [{ component: 'stt', state: 'down' }] },
+  }));
+  assert.equal(r.ok, true);
+  assert.equal(r.result.registered, false);
+  assert.equal(r.result.offered, 1);
+  assert.equal(r.result.accepted, 0);
+  assert.deepEqual(r.result.declared, []);
+});
+
+test('접수 범위를 돌려주지 않는 Core 구현에서는 accepted 를 아예 싣지 않는다(§13-3)', b, async () => {
+  // 채널 계약(`ConversationCorePort`)만 구현한 호스트. 모르는 것을 숫자로 적지 않는다.
+  let seen = 0;
+  const bridge = BR.createBridge({
+    adapter: 'callbot', scope: SCOPE,
+    core: {
+      contractVersion: 1,
+      start: async () => { throw new Error('미사용'); },
+      send: async () => { throw new Error('미사용'); },
+      end: async () => { throw new Error('미사용'); },
+      reportHealth: () => { seen += 1; },
+    },
+  });
+  const r = await bridge.handleLine(line({
+    id: '1', op: 'health',
+    report: { observedAt: NOW, samples: [{ component: 'stt', state: 'up' }] },
+  }));
+  assert.equal(r.ok, true);
+  assert.equal(seen, 1, '보고 자체는 그대로 전달된다');
+  assert.equal(r.result.acceptedKnown, false);
+  assert.equal(r.result.accepted, undefined);
+  assert.equal(r.result.offered, 1);
+  assert.match(r.result.reasonKo, /알 수 없습니다/);
 });
 
 test('요청은 도착 순서대로 직렬 처리된다', b, async () => {
@@ -441,6 +521,100 @@ test('상담사측 소비자가 명시적으로 켠 경우에만 요약이 나�
   }));
   assert.equal(typeof r.result.handoff.summaryMasked, 'string');
   assert.equal(typeof r.result.state.slots.customer_name, 'string');
+});
+
+// ── §5.2 채널 전환 초대 ──────────────────────────────────────────────────────
+// 전환 지시는 종전까지 `port.invite` **한 곳에만** 있었다 — 그 경로는 Node 호스트에만 있다.
+// 그래서 파이썬 호스트에서는 전환이 조용히 반쪽만 일어났다: `state.channel` 은 화면으로
+// 바뀌어 이후 단계가 화면용으로 렌더되는데(통화 중인 고객이 그것을 듣는다) 링크는 아무도
+// 보내지 않는다. 고객은 오지 않는 화면을 기다리고, 사다리는 이미 전환을 골랐으므로
+// 상담사로 내려가지도 않는다. 어디에서도 예외가 나지 않는다.
+
+const flowRetry = {
+  id: 'retry', version: 1, startNodeId: 'ask',
+  nodes: { ask: { id: 'ask', kind: 'Collect', slot: 'code', prompt: '고객번호를 말씀해 주세요.' } },
+};
+
+/** 전환이 실제로 일어나는 배치: 음성 + 화면 채널 등록 + 전환 배선(토큰 발급). */
+async function switchBridge(bridgeOver = {}, { wired = true } = {}) {
+  const CS = await import('../src/core/channelSwitch.ts');
+  const callbot = BP.createChannelPort({ id: 'callbot' });
+  const dars = BP.createChannelPort({ id: 'dars' });
+  let n = 0;
+  const core = R.createConversationCore({
+    scope: SCOPE,
+    flows: R.createMemoryFlowRegistry([flowRetry]),
+    channels: [
+      { port: callbot, reportsComponents: P.CHANNEL_COMPONENTS.callbot, contractVersion: 1 },
+      { port: dars, reportsComponents: P.CHANNEL_COMPONENTS.dars, contractVersion: 1 },
+    ],
+    policy: {
+      tenantId: 'goone', staleAfterMs: 60000, treatUnknownAsDown: false,
+      legacyIvrAvailable: false, agentQueueAvailable: true,
+    },
+    health: F.createHealthRegistry([]),
+    now: () => NOW,
+    newInteractionId: () => 'i_bridge1',
+    ...(wired ? {
+      channelSwitch: {
+        invites: CS.createInviteRegistry(),
+        newToken: () => `tk_sw_${++n}`,
+        ttlMs: 300000,
+        carry: { allow: ['code'] },
+        reachable: () => true,
+        delivery: 'sms',
+      },
+    } : {}),
+  });
+  const bridge = BR.createBridge({ core, adapter: 'callbot', scope: SCOPE, ...bridgeOver });
+  await bridge.handleLine(line({ id: '1', op: 'start', req: { flowId: 'retry', entryPoint: 'inbound_call' } }));
+  await bridge.handleLine(line({ id: '2', op: 'send', interactionId: 'i_bridge1', turn: { input: { kind: 'timeout' } } }));
+  const r = await bridge.handleLine(line({ id: '3', op: 'send', interactionId: 'i_bridge1', turn: { input: { kind: 'timeout' } } }));
+  return r;
+}
+
+test('전환 사실은 노출 스위치와 무관하게 비-Node 호스트까지 간다 — 토큰은 기본적으로 빠진다(§5.2·§10.3)', b, async () => {
+  const r = await switchBridge();
+  assert.equal(r.ok, true, JSON.stringify(r.error));
+  assert.equal(r.result.state.channel, 'visual');
+
+  const s = r.result.switchInvite;
+  assert.equal(s.fromChannel, 'voice');
+  assert.equal(s.toChannel, 'visual');
+  assert.equal(s.ticketIssued, true, '열쇠가 발급됐다는 사실은 감추지 않는다');
+  assert.equal(typeof s.expiresAt, 'string');
+  // 기본은 끔 — 열쇠는 상담사용 요약과 같은 규칙으로 다룬다.
+  assert.equal(s.tokenIncluded, false);
+  assert.equal(s.token, undefined);
+  assert.equal(JSON.stringify(r.result).includes('tk_sw_1'), false);
+});
+
+test('링크를 직접 만드는 소비자가 켜면 토큰이 나간다 — hello 가 그 사실을 알려 준다', b, async () => {
+  const r = await switchBridge({ includeSwitchTicket: true });
+  assert.equal(r.result.switchInvite.tokenIncluded, true);
+  assert.equal(r.result.switchInvite.token, 'tk_sw_1');
+
+  const { bridge } = build({ includeSwitchTicket: true });
+  const h = await bridge.handleLine(line({ id: '1', op: 'hello' }));
+  assert.equal(h.result.includesSwitchTicket, true);
+  assert.equal((await build().bridge.handleLine(line({ id: '1', op: 'hello' }))).result.includesSwitchTicket, false);
+});
+
+test('전환 배선이 없으면 "토큰 없는 링크"라는 사실이 호스트에 도착한다(§10.3)', b, async () => {
+  const r = await switchBridge({ includeSwitchTicket: true }, { wired: false });
+  assert.equal(r.result.switchInvite.ticketIssued, false);
+  assert.equal(r.result.switchInvite.tokenless, true);
+  assert.equal(r.result.switchInvite.tokenIncluded, false);
+  assert.match(r.result.switchInvite.notIssuedKo, /세션의 열쇠/);
+});
+
+test('전환이 없는 턴에는 실리지 않는다 — 매 턴 실리면 호스트가 링크를 다시 보낸다', b, async () => {
+  const { bridge } = build();
+  await bridge.handleLine(line({ id: '1', op: 'start', req: { flowId: 'billing', entryPoint: 'inbound_call' } }));
+  const r = await bridge.handleLine(line({
+    id: '2', op: 'send', interactionId: 'i_bridge1', turn: { input: { kind: 'utterance', text: '홍길동' } },
+  }));
+  assert.equal('switchInvite' in r.result, false);
 });
 
 test('AI 고지는 문구와 감사 근거가 함께 비-Node 호스트까지 간다(§10.1)', b, async () => {

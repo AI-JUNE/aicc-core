@@ -53,6 +53,7 @@
 //    자기 출력에 멱등이지만 이 파일은 발화를 **읽지도 싣지도 않는다**(수량·건수만 센다).
 import type { InteractionEvent } from './schema.ts';
 import type { EventLog, ReadOptions } from './store.ts';
+import { readWasTruncated } from './store.ts';
 import { assertTenantScope, type TenantScope } from '../core/tenancy.ts';
 
 export const PERIOD_LEDGER_CONTRACT_VERSION = 1;
@@ -383,7 +384,8 @@ export function projectLedgerPeriodFromLog(
     );
   }
   const rows = log.read(read);
-  const lastSeen = rows.length > 0 ? (rows[rows.length - 1] as { offset: number }).offset : (read?.afterOffset ?? -1);
-  const readTruncated = lastSeen < log.lastOffset();
+  // 판정은 `readWasTruncated` 하나다(§2) — 같은 질문을 세 투영이 각자 적어 두면 그중
+  // 둘은 **묻지 않는 쪽으로** 틀렸다(그 함수 주석).
+  const readTruncated = readWasTruncated(log, rows, read);
   return projectLedgerPeriod(rows.map((r) => r.event), { ...opts, scope: log.scope, readTruncated });
 }
