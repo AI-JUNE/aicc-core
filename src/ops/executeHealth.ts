@@ -63,7 +63,8 @@ import type {
   HealthRegistry, HealthSample, HealthState,
 } from './fallback.ts';
 import {
-  CHANNEL_DEPENDENCIES, COMPONENT_TIER, aiResponseAllowed, decideFallbackMode, effectiveComponentState,
+  CHANNEL_DEPENDENCIES, COMPONENT_IDS, COMPONENT_TIER,
+  aiResponseAllowed, decideFallbackMode, effectiveComponentState,
 } from './fallback.ts';
 import type {
   BuildInfo, DependencyKind, DependencyProbe, DependencyResult, HealthReport, HealthStatus, Scheduler,
@@ -110,7 +111,7 @@ export const CORE_STATE_UNREADABLE_KO =
 export const PROBE_RUN_FAILED_KO =
   '호스트 프로브 실행 자체가 실패했다 — 의존성 점검 결과가 없다';
 
-const KNOWN_COMPONENTS = new Set<string>(Object.keys(COMPONENT_TIER));
+const KNOWN_COMPONENTS = new Set<string>(COMPONENT_IDS);
 const KNOWN_CHANNELS = new Set<string>(Object.keys(CHANNEL_DEPENDENCIES));
 const MAX_LABEL_LEN = 40;
 

@@ -31,6 +31,18 @@
      (3) `installGlobalCapture` → uncaught·unhandledRejection. Core 는 `process` 를 직접
      참조하지 않으므로 호스트가 소스를 주입한다(§6.2).
      최소 수준·중복 억제 창·창당 상한은 **운영이 정한다**(Core 는 기본값을 만들지 않는다, §13-3).
+     배선한 다음 **반드시 읽어야 하는 수치가 둘**이다. 둘 다 예외가 아니라 수치로만 나타나므로,
+     읽지 않으면 "붙였다"와 "나가고 있다"가 구분되지 않는다 —
+     `failed`(로거·수집기가 던진 수. 관측 실패로 통화를 끊지 않으므로 0 이 아니면 **로그가 한 줄도
+     나가지 않는데 대시보드는 조용하다**) · `droppedIds`(호스트의 통화 id·상관관계 id 가 개인정보
+     패턴에 걸려 로그 식별자로 싣지 못한 수. 0 이 아니면 id 생성 규칙을 고쳐야 한다, §10.3).
+     Node 호스트는 `core.observability()`·`bridge.observability()` 로 읽고, 비-Node 호스트는
+     브리지 op `observability` 를 쓴다(`maintenance: { observability: true }` 로 열어야 하며
+     기본은 닫힘이다). **임계는 Core 가 정하지 않는다** — 배포 직후의 일시적 전송 실패와 상시
+     실패를 가르는 기준은 조직 값이다(§13-3).
+     억제분 방출(`flushObservability`)은 **종료 직전에** 부른다 — 창에 묶여 있던 마지막 보고가
+     조사에서 가장 먼저 필요한 것이다. 브리지 실행기(`scripts/channel-bridge.mjs`)는 EOF 에서
+     브리지·Core 관측기를 **둘 다** 방출한다.
 3. 테스트 동반 — no-op 동작, 마스킹, DSN 미하드코딩을 불변식으로 검증
 4. `COMMERCIAL_READINESS.md` 의 "에러 모니터링" 항목을 `[x]` 로 변경
 

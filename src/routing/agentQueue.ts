@@ -471,7 +471,16 @@ export function offerAssignment(p: OfferParams): AssignmentOffer {
   };
 }
 
-export type OfferEvent = 'accept' | 'decline' | 'cancel' | 'tick';
+/**
+ * 오퍼에 올라올 수 있는 사건. **목록이 선언이고 타입이 그 파생이다**(§2) —
+ * 종전에는 유니온만 있었고 브리지(`channels/bridge.ts`)가 와이어 검증용으로 같은 네 값을
+ * 손으로 다시 적었다. `new Set<OfferEvent>([...])` 는 **빠뜨린 값을 컴파일 오류로 만들지
+ * 않으므로**, 사건이 하나 늘면 Node 호스트는 그 값을 올릴 수 있고 비-Node 호스트만
+ * `E_BAD_REQUEST` 를 받는다 — 같은 상담사 응답이 경로에 따라 갈리는 모양이다.
+ */
+export const OFFER_EVENTS = ['accept', 'decline', 'cancel', 'tick'] as const;
+
+export type OfferEvent = typeof OFFER_EVENTS[number];
 
 export type OfferNext = 'assigned' | 'requeue' | 'exhausted' | 'waiting' | 'cancelled';
 

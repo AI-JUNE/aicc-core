@@ -30,6 +30,17 @@ export const COMPONENT_TIER: Record<ComponentId, EngineTier> = {
   backend: 'L3_knowledge',
 };
 
+/**
+ * 알려진 컴포넌트 전체. **`COMPONENT_TIER` 가 유일한 출처다**(§2) — `Record<ComponentId, …>` 라
+ * 빠뜨리면 컴파일이 깨지므로, 이 목록은 손으로 적은 사본과 달리 늙지 않는다.
+ *
+ * 왜 따로 내놓는가: 런타임 판정("이 이름이 아는 컴포넌트인가")이 필요한 곳이 둘 이상이고
+ * (`ops/executeHealth.ts`·`channels/contract.ts`), 그때마다 배열 리터럴을 다시 적으면 **늘어난
+ * 것을 모르는 쪽만 조용히 틀린다** — 등록 검증이 새 컴포넌트를 '알 수 없음'으로 거부해
+ * 그 채널이 아예 붙지 못한다.
+ */
+export const COMPONENT_IDS: readonly ComponentId[] = Object.keys(COMPONENT_TIER) as ComponentId[];
+
 export type HealthState = 'up' | 'degraded' | 'down' | 'unknown';
 
 export interface HealthSample {

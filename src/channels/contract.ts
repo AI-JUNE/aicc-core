@@ -16,6 +16,7 @@ import type { TenantScope } from '../core/tenancy.ts';
 import type { SwitchTicket } from '../core/executeSwitch.ts';
 import type { DisclosurePlacement } from '../portal/aiDisclosure.ts';
 import type { ComponentId, HealthSample, FallbackDecision } from '../ops/fallback.ts';
+import { CHANNEL_DEPENDENCIES, COMPONENT_IDS } from '../ops/fallback.ts';
 import type { TurnBillingNote } from '../billing/turnUsage.ts';
 import type { ConsentPurpose } from '../consent/consent.ts';
 import type { ComplianceTurnNote } from '../qa/executeCompliance.ts';
@@ -59,12 +60,29 @@ export type BridgeOp =
   /** 배정 오퍼 만료 수렴 1회. 부르지 않으면 만료분이 열린 채 쌓인다. */
   | 'offerExpiry'
   /** 상담사 수락·거절·취소 반영. 올리지 않으면 재배정도 소진 수렴도 일어나지 않는다. */
-  | 'settleOffer';
+  | 'settleOffer'
+  /**
+   * 관측 실측(`ConversationCore.observability()`). 수치만 나간다.
+   *
+   * 왜 필요한가: `failed`·`droppedIds` 는 **그 두 결함의 유일한 신호**다(§13-3). 로거·수집기가
+   * 던지면 Core 는 통화를 끊지 않고 삼키지 않은 채 `failed` 로만 세고(그래서 "로그를 붙였다"와
+   * "로그가 나가고 있다"가 바깥에서 구분되지 않는다), 호스트의 통화 id·상관관계 id 가 개인정보
+   * 패턴에 걸리면 그 줄은 식별자 없이 남고 `droppedIds` 로만 집계된다(§10.3). 둘 다 예외가
+   * 아니고, 비-Node 호스트에는 그 수치를 읽을 자리가 아예 없었다.
+   */
+  | 'observability';
 
-const BRIDGE_OP_TUPLE = [
-  'hello', 'start', 'send', 'end', 'health',
-  'warnings', 'readiness', 'recoveryProbe', 'offerExpiry', 'settleOffer',
+/** 통화 경로. 요청 한도·전사 판정이 유지 루프와 다르게 다루는 쪽이다. */
+const CALL_PATH_OP_TUPLE = ['hello', 'start', 'send', 'end', 'health'] as const;
+
+/** 유지 루프. 호스트가 주기적으로 부르는 쪽이다(Core 는 타이머를 돌리지 않는다). */
+const MAINTENANCE_OP_TUPLE = [
+  'warnings', 'readiness', 'recoveryProbe', 'offerExpiry', 'settleOffer', 'observability',
 ] as const;
+
+// 전체 목록은 **두 분류의 합**이다 — 따로 적으면 op 를 늘릴 때 분류를 빼먹을 수 있고, 그러면
+// 그 op 만 요청 한도에 걸려(통화 경로로 분류된 셈) 수렴·복구 확인이 조용히 멈춘다.
+const BRIDGE_OP_TUPLE = [...CALL_PATH_OP_TUPLE, ...MAINTENANCE_OP_TUPLE] as const;
 
 /** 없는 op·오타를 막는다. */
 export const BRIDGE_OPS: readonly BridgeOp[] = BRIDGE_OP_TUPLE;
@@ -79,9 +97,10 @@ void _bridgeOpsCover;
  * (한도: 유지 루프를 제한기로 막으면 만료 수렴·복구 확인이 멈추고, 그 상태는 "상담사가 안 받는다"·
  * "엔진이 안 돌아온다"와 구분되지 않는다. 제한은 고객 트래픽 경로에만 건다.)
  */
-export const BRIDGE_MAINTENANCE_OPS: readonly BridgeOp[] = [
-  'warnings', 'readiness', 'recoveryProbe', 'offerExpiry', 'settleOffer',
-];
+export const BRIDGE_MAINTENANCE_OPS: readonly BridgeOp[] = MAINTENANCE_OP_TUPLE;
+
+/** 통화 경로 op. 유지 루프의 여집합이며 둘을 합친 것이 `BRIDGE_OPS` 다(§2). */
+export const BRIDGE_CALL_PATH_OPS: readonly BridgeOp[] = CALL_PATH_OP_TUPLE;
 
 /** 세션 시작 시 채널이 Core에 넘기는 최소 정보. 개인정보(발신번호 등)는 여기서 다루지 않는다(§10.3). */
 export interface ChannelSessionRequest {
@@ -362,6 +381,11 @@ export type ContractIssueCode =
   | 'E_CHANNEL_MISMATCH'
   | 'E_MISSING_CAPABILITY_IMPL'
   | 'E_UNDECLARED_COMPONENT'
+  /**
+   * 아는 컴포넌트이긴 하나 **이 채널의 §9.3 의존 목록 밖**이다. 헬스 레지스트리는 테넌트당
+   * 한 벌이므로, 그 선언을 통과시키면 이 채널의 샘플이 다른 채널의 폴백 판정을 내린다.
+   */
+  | 'E_FOREIGN_COMPONENT'
   | 'W_NO_FALLBACK_PATH'
   /** 재프롬프트 정책이 비어 있어 실패 시 원문이 그대로 재생된다(§5.1). 금지는 아니지만 운영이 알아야 한다. */
   | 'W_REPROMPT_POLICY'
@@ -624,10 +648,39 @@ export function validateRegistration(reg: ChannelRegistration): ContractIssue[] 
   if (port.capabilities.crossChannelInvite && typeof port.invite !== 'function') {
     issues.push({ code: 'E_MISSING_CAPABILITY_IMPL', severity: 'error', messageKo: 'crossChannelInvite 능력을 선언했으나 invite 구현이 없습니다(§5.2).' });
   }
-  const known = new Set<ComponentId>(['telephony', 'messaging', 'stt', 'tts', 'llm', 'rag', 'backend']);
+  // 아는 컴포넌트 목록은 `COMPONENT_TIER` 하나에서 온다(§2) — 여기서 다시 적으면 컴포넌트가
+  // 하나 늘어난 날 **이 검사만** 모르고, 그 컴포넌트를 올리는 채널은 등록 자체가 거부된다.
+  const known = new Set<string>(COMPONENT_IDS);
+  // 이 채널의 §9.3 의존 목록. `capabilities.channel` 로 본다 — 폴백 판정도 같은 값으로 돈다
+  // (`channels/runtime.ts`). 어댑터와 어긋난 선언은 위에서 이미 E_CHANNEL_MISMATCH 다.
+  const deps = CHANNEL_DEPENDENCIES[port.capabilities.channel] as readonly ComponentId[] | undefined;
   for (const c of reg.reportsComponents) {
     if (!known.has(c)) {
       issues.push({ code: 'E_UNDECLARED_COMPONENT', severity: 'error', messageKo: `알 수 없는 헬스 컴포넌트: ${String(c)}` });
+      continue;   // 모르는 이름은 어느 채널의 의존 목록에도 없다 — 같은 값을 두 번 적지 않는다.
+    }
+    /**
+     * **자기 채널이 의존하지 않는 컴포넌트는 올릴 수 없다**(§9.3).
+     *
+     * 헬스 레지스트리는 테넌트 하나당 **한 벌**이고 `decideFallbackMode` 는 거기서
+     * 컴포넌트별 최신 샘플을 읽는다. 그래서 선언을 넓히면 그 채널이 **남의 채널 판정을
+     * 내린다**: 챗봇이 `stt` 를 올릴 수 있게 되면 챗봇 쪽 오탐 하나로 **음성 전체가**
+     * `agent_only`·`legacy_ivr` 로 떨어지고, 반대로 챗봇이 `stt: up` 을 계속 올리면
+     * 진짜 STT 장애가 낡은 샘플 판정(`staleAfterMs`)에도 걸리지 않는다. 증상은 둘 다
+     * 엔진 장애와 구분되지 않는다 — "아무 채널이나 전체 폴백을 유발할 수 없다"는 규칙은
+     * 선언 **목록**을 보는 것만으로는 지켜지지 않고, 그 목록이 자기 의존 안에 있어야 한다.
+     *
+     * 막는 쪽을 등록 거부로 둔 이유: 되돌릴 수 있는 쪽은 기동 거절이고, 되돌릴 수 없는
+     * 쪽은 이미 다른 채널의 통화를 폴백으로 떨어뜨린 시간이다.
+     */
+    if (deps !== undefined && !deps.includes(c)) {
+      issues.push({
+        code: 'E_FOREIGN_COMPONENT',
+        severity: 'error',
+        messageKo: `${port.id}(${port.capabilities.channel}) 채널이 의존하지 않는 컴포넌트를 헬스 보고 대상으로 선언했습니다: `
+          + `${String(c)} — 이 채널이 올린 샘플이 그 컴포넌트에 의존하는 다른 채널의 §9.3 판정을 내립니다`
+          + `(의존: ${deps.join('·')}).`,
+      });
     }
   }
   if (!port.capabilities.transferToAgent && !port.capabilities.routeToLegacyIvr) {

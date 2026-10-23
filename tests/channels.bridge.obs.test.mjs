@@ -290,6 +290,185 @@ test('실행기는 Core 모듈이 내놓은 관측 배선을 브리지에 넘긴
   assert.ok(logs.some((r) => r.event === OBS.WARNING_EVENT), '미배선 경고가 로그로 나가지 않았다');
 });
 
+// ── 6. 관측 실측이 비-Node 호스트에 닿는다(§13-3·§10.3) ──────────────────────
+//
+// 배선을 켠 것만으로는 부족하다. `failed`·`droppedIds` 는 **그 두 결함의 유일한 신호**다 —
+// 로거·수집기가 던지면 Core 는 통화를 끊지 않고 `failed` 로만 세고(그래서 "로그를 붙였다"와
+// "로그가 나가고 있다"가 바깥에서 구분되지 않는다), 호스트의 통화 id·상관관계 id 가 개인정보
+// 패턴에 걸리면 그 줄은 식별자 없이 남고 `droppedIds` 로만 집계된다. 둘 다 예외가 아니고,
+// 비-Node 호스트에는 그 수치를 읽을 자리가 아예 없었다.
+
+const STAT_KEYS = ['recorded', 'rejected', 'warned', 'logged', 'captured', 'failed', 'droppedIds'];
+
+test('observability op 이 Core 수치를 내보낸다 — 호스트가 자기 결함을 읽을 유일한 자리다', b, async () => {
+  const w = wiring();
+  const bridge = build(
+    { observability: w.binding, maintenance: { observability: true } },
+    { observability: w.binding },
+  );
+  // 호스트의 통화 id 가 개인정보 형태인 배치를 재현한다(§10.3) — 그 줄은 식별자 없이 남는다.
+  await bridge.handleLine(line({
+    id: '1', op: 'start', req: { flowId: 'billing', entryPoint: 'inbound_call', correlationId: '010-1234-5678' },
+  }));
+  await bridge.handleLine('{깨진 줄');
+  const r = await bridge.handleLine(line({ id: '2', op: 'observability' }));
+  assert.equal(r.ok, true, JSON.stringify(r.error));
+  for (const k of STAT_KEYS) assert.equal(typeof r.result.core[k], 'number', `${k} 수치가 없다`);
+  assert.ok(r.result.core.droppedIds > 0, '개인정보 형태의 id 가 제외된 사실이 호스트에 닿지 않는다(§10.3)');
+  // 경계 수치는 **합치지 않는다** — Core 에 닿지도 못한 줄과 닿은 줄이 한 숫자가 되면
+  // "호스트 직렬화 버그로 전 줄이 깨지는" 상태가 "통화가 잘 도는" 상태와 같아 보인다.
+  assert.equal(r.result.bridgeKnown, true);
+  assert.equal(r.result.bridge.rejected, 1);
+  assert.equal(r.result.core.rejected, 0, '브리지 경계 거부가 Core 수치로 섞였다');
+});
+
+test('로거가 던지는 상태가 수치로 호스트에 닿는다(실패 경로)', b, async () => {
+  const boom = () => { throw new Error('sink 폭발'); };
+  const logger = {
+    minLevel: 'info', debug: boom, info: boom, warn: boom, error: boom,
+    child() { return logger; }, async time(_e, run) { return run(); },
+  };
+  const bridge = build(
+    { maintenance: { observability: true } },
+    { observability: { logger } },
+  );
+  await bridge.handleLine(startLine());
+  const r = await bridge.handleLine(line({ id: '2', op: 'observability' }));
+  assert.equal(r.ok, true, JSON.stringify(r.error));
+  assert.ok(r.result.core.failed > 0, '로그가 한 줄도 나가지 않는데 호스트는 "붙였다"로 믿는다');
+  // 브리지 쪽 배선이 없으면 그 자리는 **싣지 않는다** — 0 은 "거부 0건"으로 읽힌다.
+  assert.equal(r.result.bridgeKnown, false);
+  assert.equal(r.result.bridge, undefined);
+  assert.ok(r.result.reasonKo.length > 0);
+});
+
+test('Core 에 관측 배선이 없으면 0 이 아니라 E_NOT_WIRED 다(실패 경로)', b, async () => {
+  const bridge = build({ maintenance: { observability: true } });
+  const r = await bridge.handleLine(line({ id: '1', op: 'observability' }));
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, 'E_NOT_WIRED');
+  assert.equal(r.result, undefined, '"실패 0건"으로 읽힐 본문을 돌려주면 안 된다(§13-3)');
+});
+
+test('스위치를 켜지 않으면 거절된다 — 기본은 닫힘이다(경계)', b, async () => {
+  const w = wiring();
+  const bridge = build({ observability: w.binding }, { observability: w.binding });
+  const r = await bridge.handleLine(line({ id: '1', op: 'observability' }));
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, 'E_NOT_WIRED');
+  const hello = await bridge.handleLine(line({ id: '2', op: 'hello' }));
+  assert.ok(!hello.result.maintenanceOps.includes('observability'));
+});
+
+test('읽기가 억제분을 방출하지 않는다 — 종료 직전 방출이 빈 손이 되면 안 된다', b, async () => {
+  const sent = [];
+  // 중복 억제 창을 켠 수집기. 같은 지문의 두 번째 보고는 **보류**되고 방출로만 나간다.
+  const binding = {
+    monitor: EM.createErrorMonitor({ transport: (r) => sent.push(r), clock: () => 1, dedupeWindowMs: 60000 }),
+  };
+  const port = BP.createChannelPort({ id: 'callbot' });
+  const real = R.createConversationCore({
+    scope: SCOPE,
+    flows: R.createMemoryFlowRegistry([flow]),
+    channels: [{ port, reportsComponents: P.CHANNEL_COMPONENTS.callbot, contractVersion: 1 }],
+    policy: {
+      tenantId: 'goone', staleAfterMs: 60000, treatUnknownAsDown: false,
+      legacyIvrAvailable: false, agentQueueAvailable: true,
+    },
+    health: F.createHealthRegistry([]),
+    now: () => NOW,
+    observability: binding,
+  });
+  // 응답으로 바꿀 수 없는 결과 — **브리지만 아는 실패**라 수집기로 올라간다(위 3절).
+  const core = {
+    contractVersion: real.contractVersion,
+    start: async () => ({
+      interactionId: 'i_x', status: 'running', steps: [],
+      state: {
+        flowId: 'billing', flowVersion: 1, channel: 'voice', currentNodeId: 'greet',
+        slots: {}, failCount: 0, turnCount: 1, eventSeq: 1, status: 'running', visited: [],
+      },
+      events: null,
+    }),
+    send: (i, t) => real.send(i, t),
+    end: (i, r, x) => real.end(i, r, x),
+    reportHealth: (r) => real.reportHealth(r),
+    observability: () => real.observability(),
+  };
+  const bridge = BR.createBridge({
+    core, adapter: 'callbot', scope: SCOPE,
+    observability: binding, maintenance: { observability: true },
+  });
+  await bridge.handleLine(startLine('s1'));
+  await bridge.handleLine(startLine('s2'));
+  assert.equal(sent.length, 1, '같은 지문의 두 번째 보고가 억제되지 않았다 — 이 검사의 전제가 깨졌다');
+  const r = await bridge.handleLine(line({ id: '1', op: 'observability' }));
+  assert.equal(r.ok, true, JSON.stringify(r.error));
+  assert.equal(sent.length, 1, '읽기에 부작용을 섞으면 대시보드 새로고침마다 보고가 나간다');
+  // 방출은 종료 시점에 실행기가 한 번 한다.
+  assert.ok(bridge.flushObservability() > 0, '억제분이 남아 있지 않다 — 방출이 빈 손이 된다');
+  assert.equal(sent.length, 2);
+});
+
+test('실행기 경유로도 관측 실측을 읽을 수 있다 — 지원만 하고 아무도 못 지나가면 없는 기능이다', b, async () => {
+  const { spawnSync } = await import('node:child_process');
+  const { join, dirname } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+  const input = ['{"id":"1","op":"hello"}', '{"id":"2","op":"observability"}', ''].join('\n');
+  const run = spawnSync(process.execPath,
+    [join(ROOT, 'scripts', 'channel-bridge.mjs'), '--core', './fixtures/reference-core-observed.mjs',
+     '--adapter', 'callbot'],
+    { cwd: ROOT, input, encoding: 'utf8', timeout: 60000 });
+  assert.equal(run.status, 0, run.stderr);
+  const out = run.stdout.trim().split('\n').map((l) => JSON.parse(l));
+  assert.deepEqual(out[0].result.maintenanceOps, ['observability'],
+    '예시가 열어 두지 않으면 호스트는 열린 op 를 알 길이 없다');
+  assert.equal(out[1].ok, true, JSON.stringify(out[1].error));
+  for (const k of STAT_KEYS) assert.equal(typeof out[1].result.core[k], 'number', `${k} 수치가 없다`);
+});
+
+test('실행기가 종료 직전 Core 관측기까지 방출한다 — 런타임에만 배선한 배치가 조용히 잃던 것이다', b, async () => {
+  const { spawnSync } = await import('node:child_process');
+  const { join, dirname } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+  // **관측 배선을 브리지에 내놓지 않는** 모듈. 종전에는 `bridge.flushObservability()` 하나만
+  // 불렀으므로 이 배치에서는 Core 쪽 억제분이 프로세스와 함께 사라졌다 — 하필 종료 직전의
+  // 보고가 조사에서 가장 먼저 필요한 것이다. 호스트가 "같은 객체를 양쪽에 준다"를 지켰는지에
+  // 기대지 않는다.
+  const mod = [
+    'export default function () {',
+    '  return {',
+    "    scope: { tenantId: 'reference' },",
+    '    core: {',
+    '      contractVersion: 1,',
+    "      start: async () => { throw new Error('미사용'); },",
+    "      send: async () => { throw new Error('미사용'); },",
+    "      end: async () => { throw new Error('미사용'); },",
+    '      reportHealth: () => {},',
+    "      flushObservability: () => { process.stderr.write('CORE_FLUSHED\\n'); return 0; },",
+    '    },',
+    '  };',
+    '}',
+  ].join('\n');
+  const dir = mkdtempSync(join(tmpdir(), 'aicc-flush-'));
+  const file = join(dir, 'core.mjs');
+  writeFileSync(file, mod, 'utf8');
+  try {
+    const run = spawnSync(process.execPath,
+      [join(ROOT, 'scripts', 'channel-bridge.mjs'), '--core', file, '--adapter', 'callbot'],
+      { cwd: ROOT, input: '{"id":"1","op":"hello"}\n', encoding: 'utf8', timeout: 60000 });
+    assert.equal(run.status, 0, run.stderr);
+    assert.equal(JSON.parse(run.stdout.trim()).ok, true);
+    assert.ok(run.stderr.includes('CORE_FLUSHED'), `Core 관측기의 억제분이 방출되지 않았다: ${run.stderr}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('실행기: 관측을 내놓지 않는 모듈은 종전과 완전히 같다(§13-3)', b, async () => {
   const { spawnSync } = await import('node:child_process');
   const { join, dirname } = await import('node:path');

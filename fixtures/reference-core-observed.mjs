@@ -57,5 +57,22 @@ export default function createCore() {
     health: createHealthRegistry([]),
     observability,
   });
-  return { core, scope, port, observability };
+  return {
+    core,
+    scope,
+    port,
+    observability,
+    /**
+     * 관측 실측을 호스트가 읽게 열어 둔다. **배선을 켠 것만으로는 부족하다** —
+     * `failed`·`droppedIds` 는 그 두 결함의 유일한 신호이고(로거·수집기가 던지는 상태,
+     * 호스트의 id 가 §10.3 패턴에 걸려 로그에서 빠지는 상태) 둘 다 예외가 아니라 **수치로만**
+     * 나타난다. 비-Node 호스트에는 그 수치를 읽을 자리가 없었고, 그래서 "로그를 붙였다"와
+     * "로그가 나가고 있다"가 바깥에서 구분되지 않았다.
+     *
+     * 나머지 유지 루프는 여기서 열지 않는다 — 이 예시의 Core 에는 오퍼·복구 배선이 없고,
+     * 열면 `hello` 가 "열렸다"고 알린 op 가 `E_NOT_WIRED` 를 돌려준다
+     * (유지 루프까지 꿴 예시는 `reference-core-maintained.mjs` 다).
+     */
+    maintenance: { observability: true },
+  };
 }

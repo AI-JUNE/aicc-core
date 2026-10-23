@@ -53,6 +53,7 @@ import type {
 import { BRIDGE_MAINTENANCE_OPS, BRIDGE_OPS, CHANNEL_CONTRACT_VERSION } from './contract.ts';
 import type { AgentOfferStep, OfferExpiryReport, ReadinessRequest } from './runtime.ts';
 import type { OfferEvent } from '../routing/agentQueue.ts';
+import { OFFER_EVENTS } from '../routing/agentQueue.ts';
 import type { RecoveryRunReport } from '../ops/recoveryProbe.ts';
 import type { CoreReadinessReport } from '../ops/executeHealth.ts';
 import { profileFor } from './profiles.ts';
@@ -312,10 +313,10 @@ export interface BridgeOptions {
    * 빈 보고서를 돌려주면 호스트는 "0건"으로 읽고, 수렴이 한 번도 돈 적 없다는 사실을 모른다.
    *
    * 왜 자리가 필요한가: `ConversationCore` 의 유지 메서드(`runOfferExpiry`·`runRecoveryProbes`·
-   * `readiness`·`settleAgentOffer`·`warnings`)는 **Core 가 타이머를 돌리지 않으므로** 호스트가
-   * 부른다. 그런데 비-Node 호스트가 Core 에 닿는 길은 이 브리지뿐이고 브리지에는 그 자리가
-   * 없었다 — 즉 파이썬으로 Callbot 을 운영하는 배치에서는 **그 다섯 개를 부를 방법이 아예
-   * 없었다**. 증상은 전부 조용하다: 만료된 오퍼가 열린 채 쌓여 같은 콜이 두 번 제안되고,
+   * `readiness`·`settleAgentOffer`·`warnings`·`observability`)는 **Core 가 타이머를 돌리지
+   * 않으므로** 호스트가 부른다. 그런데 비-Node 호스트가 Core 에 닿는 길은 이 브리지뿐이고
+   * 브리지에는 그 자리가 없었다 — 즉 파이썬으로 Callbot 을 운영하는 배치에서는 **그 여섯 개를
+   * 부를 방법이 아예 없었다**. 증상은 전부 조용하다: 만료된 오퍼가 열린 채 쌓여 같은 콜이 두 번 제안되고,
    * 한 번 `degraded_ai` 로 내려간 테넌트는 엔진이 돌아와도 **영구히** 폴백에 남고(아무도 찌르지
    * 않으므로 헬스 샘플이 갱신되지 않는다), `/health` 는 §9.3 상태 없이 초록이고, 상담사의
    * 수락·거절은 원장에 도착하지 않아 재배정도 소진 수렴도 일어나지 않는다.
@@ -345,6 +346,12 @@ export interface BridgeMaintenanceBinding {
   offerExpiry?: boolean;
   settleOffer?: boolean;
   warnings?: boolean;
+  /**
+   * 관측 실측을 읽게 할지. **배선 객체를 Core 에 주지 않았으면 켜도 거절된다** —
+   * `observability()` 가 `undefined` 를 돌려주고, 그것을 0 으로 적으면 "실패 0건·식별자
+   * 제외 0건"이 되어 로거가 전부 던지고 있는 상태가 정상으로 읽힌다(§13-3).
+   */
+  observability?: boolean;
 }
 
 /**
@@ -357,9 +364,22 @@ type MaintenanceCapableCore = ConversationCorePort & {
   runRecoveryProbes?(nowIso?: string): Promise<RecoveryRunReport | undefined>;
   runOfferExpiry?(nowIso?: string): Promise<OfferExpiryReport | undefined>;
   settleAgentOffer?(p: { offerId: string; event: OfferEvent; nowIso?: string }): Promise<AgentOfferStep | undefined>;
+  observability?(): ObserverStats | undefined;
 };
 
-const OFFER_EVENTS: ReadonlySet<string> = new Set<OfferEvent>(['accept', 'decline', 'cancel', 'tick']);
+/**
+ * `settleOffer` 가 받는 사건. **목록을 다시 적지 않는다**(§2) — 상담사 응답의 전체 목록은
+ * `routing/agentQueue.ts` 의 `OFFER_EVENTS` 하나이고, 여기서 하는 일은 그중 **이 op 가
+ * 수행하지 않는 것**(`tick`)을 빼는 것뿐이다. 손으로 다시 적으면 사건이 하나 늘어난 날
+ * Node 호스트는 올릴 수 있고 비-Node 호스트만 `E_BAD_REQUEST` 를 받는다.
+ *
+ * 왜 `tick` 을 빼는가: 만료는 **수렴의 수단**이라 건별로 받으면 만료 판정이 `offerExpiry`
+ * 와 두 곳이 된다(§2). 그래서 거절 문구에도 `tick` 을 **허용값으로 적지 않는다** —
+ * 종전에는 모르는 값에 대한 안내가 "허용값: … tick" 이었고, 그 안내를 그대로 따른 호스트는
+ * 바로 다음 검사에서 또 거절당했다.
+ */
+const SETTLE_OFFER_EVENTS: readonly OfferEvent[] = OFFER_EVENTS.filter((e) => e !== 'tick');
+const SETTLE_OFFER_EVENT_SET: ReadonlySet<string> = new Set<string>(SETTLE_OFFER_EVENTS);
 
 /**
  * 와이어로 나갈 값의 복사. **JSON 왕복이 곧 경계다** — 호스트가 결과 객체를 손에 쥐고
@@ -904,6 +924,7 @@ export function createBridge(opts: BridgeOptions): Bridge {
       case 'recoveryProbe': return m.recoveryProbe === true;
       case 'offerExpiry': return m.offerExpiry === true;
       case 'settleOffer': return m.settleOffer === true;
+      case 'observability': return m.observability === true;
       default: return false;
     }
   }
@@ -917,6 +938,7 @@ export function createBridge(opts: BridgeOptions): Bridge {
       case 'recoveryProbe': return typeof maintCore.runRecoveryProbes === 'function';
       case 'offerExpiry': return typeof maintCore.runOfferExpiry === 'function';
       case 'settleOffer': return typeof maintCore.settleAgentOffer === 'function';
+      case 'observability': return typeof maintCore.observability === 'function';
       default: return false;
     }
   }
@@ -1067,20 +1089,52 @@ export function createBridge(opts: BridgeOptions): Bridge {
         const core = requireMaintenance('settleOffer', (c) => c.settleAgentOffer);
         // 상담사 응답은 **사실**이므로 본문에서 받는다. 형태는 부르기 전에 끝낸다.
         if (!nonEmptyString(body.offerId)) bad('offerId 가 없습니다.');
-        if (typeof body.event !== 'string' || !OFFER_EVENTS.has(body.event)) {
-          // 값은 되돌려 적지 않는다 — 호스트가 그 자리에 임의 문자열을 넣을 수 있다(§10.3).
-          bad(`event 가 유효하지 않습니다. 허용값: ${[...OFFER_EVENTS].join('·')}`);
-        }
         // `tick` 은 **만료 수렴의 수단**이라 여기서 받지 않는다 — 받으면 호스트가 임의 시점에
         // 한 건씩 만료시킬 수 있고, 그 판정은 `offerExpiry` 가 보는 것과 갈라진다(§2).
+        // **아는 값부터 거절한다**: 모르는 값 안내에 `tick` 을 섞어 적으면 그 안내를 따른
+        // 호스트가 다음 검사에서 또 거절당한다.
         if (body.event === 'tick') {
           bad('tick 은 offerExpiry 가 수행합니다 — 건별로 만료시키면 만료 판정이 두 곳이 됩니다(§2).');
+        }
+        if (typeof body.event !== 'string' || !SETTLE_OFFER_EVENT_SET.has(body.event)) {
+          // 값은 되돌려 적지 않는다 — 호스트가 그 자리에 임의 문자열을 넣을 수 있다(§10.3).
+          bad(`event 가 유효하지 않습니다. 허용값: ${SETTLE_OFFER_EVENTS.join('·')}`);
         }
         span.entered = true;
         const step = await core.settleAgentOffer!({ offerId: body.offerId, event: body.event as OfferEvent });
         span.returned = true;
         if (step === undefined) notWired('settleOffer', 'Core 에 배정 오퍼 배선이 없습니다(§2).');
         return projectOfferStep(step);
+      }
+      /**
+       * 관측 실측. **읽기만 한다** — 억제분 방출(`flushObservability`)은 부작용이라 여기에
+       * 섞지 않는다. 섞으면 대시보드를 새로 고칠 때마다 수집기로 보고가 나가고, 더 나쁘게는
+       * 종료 직전 방출이 "방금 읽었으니 비었다"로 바뀐다. 방출은 실행기가 종료 시점에 한다
+       * (`scripts/channel-bridge.mjs`).
+       *
+       * 관측기는 **둘**이다(런타임 진입점·브리지 경계). 둘을 합쳐 한 숫자로 적지 않는다 —
+       * 브리지의 `rejected` 는 Core 에 닿지도 못한 줄이고 런타임의 `recorded` 는 닿은 줄이라,
+       * 합치면 "호스트 직렬화 버그로 전 줄이 깨지는" 상태와 "통화가 잘 도는" 상태가 같은
+       * 수치로 보인다. 브리지 쪽 배선이 없으면 그 자리는 **싣지 않는다**(0 이 아니다).
+       */
+      case 'observability': {
+        const core = requireMaintenance('observability', (c) => c.observability);
+        span.entered = true;
+        const stats = core.observability!();
+        span.returned = true;
+        if (stats === undefined) {
+          notWired('observability', 'Core 에 관측 배선(로거·수집기)이 없습니다 — 0 건으로 적으면 '
+            + '로거가 전부 던지는 상태가 "실패 0건"으로 읽힙니다(§13-3).');
+        }
+        const own = observer?.stats();
+        return own === undefined
+          ? {
+            core: wireCopy(stats),
+            bridgeKnown: false,
+            reasonKo: '브리지에 관측 배선이 없어 경계 거부 수치가 없습니다 — '
+              + '깨진 줄·모르는 op·한도 초과는 Core 를 부르기 전에 끝나므로 Core 수치에도 없습니다.',
+          }
+          : { core: wireCopy(stats), bridge: wireCopy(own), bridgeKnown: true };
       }
     }
   }

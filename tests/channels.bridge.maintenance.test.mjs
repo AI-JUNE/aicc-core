@@ -203,7 +203,7 @@ test('readiness 는 요청(프로브·제한 시간)이 배선되지 않으면 �
 
 const OPEN = {
   warnings: true, recoveryProbe: true, offerExpiry: true, settleOffer: true,
-  readiness: { timeoutMs: 500 },
+  observability: true, readiness: { timeoutMs: 500 },
 };
 
 test('hello 가 열린 유지 op 를 알려준다 — 호스트가 하나씩 찔러 보지 않는다(§2)', b, async () => {
@@ -338,6 +338,57 @@ test('settleOffer 는 tick 을 받지 않는다 — 만료 판정이 두 곳이 
   assert.equal(r.ok, false);
   assert.equal(r.error.code, 'E_BAD_REQUEST');
   assert.match(r.error.messageKo, /offerExpiry/);
+});
+
+test('상담사 응답 목록을 브리지가 다시 적지 않는다 — tick 만 빼고 전부 받는다(§2)', b, async () => {
+  // 종전에는 브리지가 `new Set<OfferEvent>(['accept','decline','cancel','tick'])` 로 같은 목록을
+  // 손으로 들고 있었다. 그 대입은 **빠뜨린 값을 컴파일 오류로 만들지 않으므로**, 사건이 하나
+  // 늘면 Node 호스트는 올릴 수 있고 비-Node 호스트만 E_BAD_REQUEST 를 받는다 — 같은 상담사
+  // 응답이 경로에 따라 갈리는 모양이고, 그 상태는 "상담사가 안 받는다"와 구분되지 않는다.
+  const Q = await import('../src/routing/agentQueue.ts');
+  const { bridge } = build({
+    bridge: { maintenance: OPEN },
+    core: { routing: ROUTING({ offers: OFFERS() }) },
+  });
+  for (const event of Q.OFFER_EVENTS) {
+    const r = await call(bridge, 'settleOffer', { offerId: 'o_없음', event });
+    if (event === 'tick') {
+      assert.equal(r.ok, false, 'tick 은 offerExpiry 가 수행한다(§2)');
+      continue;
+    }
+    assert.notEqual(
+      r.error?.code, 'E_BAD_REQUEST',
+      `${event} 가 와이어에서 거부됐다 — 목록 사본이 낡았다(Node 호스트는 올릴 수 있다)`,
+    );
+  }
+});
+
+test('허용값 안내가 바로 다음 검사에서 거절될 값을 광고하지 않는다', b, async () => {
+  const { bridge } = build({
+    bridge: { maintenance: OPEN },
+    core: { routing: ROUTING({ offers: OFFERS() }) },
+  });
+  const r = await call(bridge, 'settleOffer', { offerId: 'o_1', event: 'yes' });
+  assert.equal(r.error.code, 'E_BAD_REQUEST');
+  assert.ok(
+    !r.error.messageKo.includes('tick'),
+    `안내를 그대로 따른 호스트가 다음 검사에서 또 거절당한다: ${r.error.messageKo}`,
+  );
+  for (const event of ['accept', 'decline', 'cancel']) {
+    assert.ok(r.error.messageKo.includes(event), `${event} 가 안내에서 빠졌다`);
+  }
+});
+
+test('op 분류의 합이 전체 목록이다 — 늘릴 때 분류를 빼먹을 수 없다(§2)', b, () => {
+  assert.deepEqual(
+    [...C.BRIDGE_CALL_PATH_OPS, ...C.BRIDGE_MAINTENANCE_OPS].sort(),
+    [...C.BRIDGE_OPS].sort(),
+    '분류되지 않은 op 는 통화 경로로 취급돼 요청 한도에 걸린다 — 수렴이 조용히 멈춘다',
+  );
+  // 한도 대상은 통화 경로의 부분집합이다(hello·end 는 어떤 경우에도 막지 않는다).
+  for (const op of BR.RATE_LIMITED_OPS) {
+    assert.ok(C.BRIDGE_CALL_PATH_OPS.includes(op), `${op} 가 통화 경로가 아닌데 한도에 걸려 있다`);
+  }
 });
 
 test('모르는 offerId 는 거절로 돌아오며 통화를 깨지 않는다(경계)', b, async () => {

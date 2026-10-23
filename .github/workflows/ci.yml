@@ -93,6 +93,13 @@ jobs:
           printf '%s\n' '{"id":"1","op":"offerExpiry"}' \
             | node scripts/channel-bridge.mjs --core ./fixtures/reference-core.mjs --adapter callbot > /tmp/maint-off.out
           grep -q 'E_NOT_WIRED' /tmp/maint-off.out
+          # 관측 실측(`observability`)은 다른 픽스처에 열려 있다 — 로거·수집기 배선이 있어야
+          # 의미가 있기 때문이다. `failed`·`droppedIds` 는 그 두 결함의 **유일한 신호**이고,
+          # 이 경로가 막히면 호스트는 "로그를 붙였다"와 "로그가 나가고 있다"를 구분할 수 없다.
+          printf '%s\n' '{"id":"1","op":"observability"}' \
+            | node scripts/channel-bridge.mjs --core ./fixtures/reference-core-observed.mjs --adapter callbot > /tmp/maint-obs.out 2>/dev/null
+          grep -q '"id":"1","ok":true' /tmp/maint-obs.out
+          grep -q '"droppedIds":' /tmp/maint-obs.out
 
       # 파이썬 참조 클라이언트가 실제로 브리지를 소비하는지 확인한다. Callbot 이 붙을 경로라서,
       # "Core 쪽은 맞는데 클라이언트가 틀린" 상황을 여기서 잡는다. 판정은 자기 채점이 되지 않게
