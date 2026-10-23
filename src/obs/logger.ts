@@ -94,9 +94,19 @@ export interface Logger {
   time<T>(event: string, run: () => Promise<T>, ctx?: LogContext): Promise<T>;
 }
 
-function normalizeKey(k: string): string {
+/**
+ * 차단 키 대조용 정규화. **`DENIED_FIELDS` 와 같은 이유로 여기 한 곳에만 있어야 한다**(§2).
+ *
+ * 목록만 공유하던 동안 이 함수는 로거와 오류 수집기에 각각 한 벌씩 있었다 — 즉 "이 키가 차단
+ * 대상인가"라는 **판정의 절반이 두 곳**이었다. 값은 같았지만 한쪽만 고치는 날의 결말이 조용하다:
+ * 구분자를 하나 더 지우는 쪽(예: `api.key`)만 고치면 **그 필드가 로그에서는 `[제거됨]` 인데
+ * 수집기 보고에는 원문으로 실린다**. 로그를 검사한 사람은 막혔다고 읽고, 나간 것은 인증값이다(§10.3).
+ */
+export function normalizeDeniedFieldKey(k: string): string {
   return k.toLowerCase().replace(/[_\-\s]/g, '');
 }
+
+const normalizeKey = normalizeDeniedFieldKey;
 
 /** 문자열 값은 마스킹 후 길이를 제한한다. 숫자·불리언은 그대로 둔다. */
 function sanitizeValue(v: unknown): string | number | boolean | undefined {

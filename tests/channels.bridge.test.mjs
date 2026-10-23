@@ -871,3 +871,117 @@ test('Api 노드가 없는 시나리오에는 대기 필드가 붙지 않는다(
   const s = await bridge.handleLine(line({ id: '0', op: 'start', req: { flowId: 'billing', entryPoint: 'inbound_call' } }));
   assert.equal('pendingConnectorId' in s.result.state, false);
 });
+
+// ── 미인식 입력(§5.1·§6.2) ───────────────────────────────────────────────────
+//
+// `FlowInput` 은 다섯 종류인데 와이어는 네 종류만 받고 있었다 — 즉 **미인식만** Node 호스트에서는
+// 보낼 수 있고 비-Node 호스트에서는 보낼 수 없었다. 남은 두 길이 전부 나쁘다는 것이 요점이다.
+
+async function started(bridge) {
+  return bridge.handleLine(line({ id: '0', op: 'start', req: { flowId: 'billing', entryPoint: 'inbound_call' } }));
+}
+
+test('미인식 턴을 와이어로 올릴 수 있고, §5.1 실패 판정이 실제로 돈다', b, async () => {
+  const { bridge } = build();
+  await started(bridge);
+  const r = await bridge.handleLine(line({
+    id: '1', op: 'send', interactionId: 'i_bridge1',
+    turn: { input: { kind: 'unrecognized', text: '카드를 잃어버렸어요' } },
+  }));
+  assert.equal(r.ok, true, JSON.stringify(r.error));
+  assert.equal(r.result.state.slotKeys.includes('customer_name'), false,
+    '미인식 발화가 슬롯 값으로 저장되면 고객은 엉뚱한 안내를 듣고 그 사실은 어디에도 남지 않는다');
+  assert.equal(r.result.state.failCount, 1);
+});
+
+test('같은 발화를 utterance 로 올리면 슬롯 값이 된다 — 그래서 바꿔 보내면 안 된다', b, async () => {
+  const { bridge } = build();
+  await started(bridge);
+  const r = await bridge.handleLine(line({
+    id: '1', op: 'send', interactionId: 'i_bridge1',
+    turn: { input: { kind: 'utterance', text: '카드를 잃어버렸어요' } },
+  }));
+  assert.equal(r.result.state.slotKeys.includes('customer_name'), true);
+  assert.equal(r.result.state.failCount, 0, '예외도 재프롬프트도 없다 — 이것이 조용한 쪽의 결말이다');
+});
+
+test('인식기가 아무 말도 돌려주지 못한 턴(빈 text)도 미인식으로 받는다', b, async () => {
+  const { bridge } = build();
+  await started(bridge);
+  const r = await bridge.handleLine(line({
+    id: '1', op: 'send', interactionId: 'i_bridge1', turn: { input: { kind: 'unrecognized', text: '' } },
+  }));
+  assert.equal(r.ok, true, '거절하면 호스트가 timeout 으로 바꿔 보내고, 말을 한 고객이 침묵으로 집계된다');
+  assert.equal(r.result.state.failCount, 1);
+});
+
+test('미인식 턴의 실측도 실린다 — 신뢰도는 실을 자리가 없어 사실로 남는다', b, async () => {
+  const { bridge, core } = build();
+  await started(bridge);
+  const r = await bridge.handleLine(line({
+    id: '1', op: 'send', interactionId: 'i_bridge1',
+    turn: {
+      input: { kind: 'unrecognized', text: '어' },
+      latency: { stt_ms: 120 }, usage: { stt_audio_ms: 2000 }, confidence: 0.3,
+    },
+  }));
+  assert.equal(r.ok, true, JSON.stringify(r.error));
+  const turn = r.result.events.find((e) => e.type === 'turn.completed');
+  assert.deepEqual(turn.latency_ms, { stt_ms: 120 });
+  assert.ok(core.warnings().some((i) => i.code === 'W_TURN_INPUT'),
+    '실을 자리가 없는 선언은 조용히 버리지 않고 적는다(§13-3)');
+});
+
+test('text 가 문자열이 아니면 그 줄만 거절된다(실패 경로)', b, async () => {
+  const { bridge } = build();
+  await started(bridge);
+  const r = await bridge.handleLine(line({
+    id: '1', op: 'send', interactionId: 'i_bridge1', turn: { input: { kind: 'unrecognized', text: 3 } },
+  }));
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, 'E_BAD_REQUEST');
+  const ok = await bridge.handleLine(line({
+    id: '2', op: 'send', interactionId: 'i_bridge1', turn: { input: { kind: 'unrecognized', text: '어' } },
+  }));
+  assert.equal(ok.ok, true, '거절된 줄이 다음 턴을 막지 않는다');
+});
+
+// ── 헬스 상태 목록은 한 곳에서 온다(§2·§9.3) ────────────────────────────────
+
+test('아는 헬스 상태를 모두 받는다 — 목록은 ops/fallback.ts 하나다', b, async () => {
+  const { bridge } = build();
+  const r = await bridge.handleLine(line({
+    id: '1', op: 'health',
+    report: { observedAt: NOW, samples: F.HEALTH_STATES.map((state) => ({ component: 'stt', state })) },
+  }));
+  assert.equal(r.ok, true, JSON.stringify(r.error));
+  assert.equal(r.result.offered, F.HEALTH_STATES.length);
+});
+
+test('모르는 상태는 거절한다 — 상태 없는 샘플을 up 으로 읽으면 장애가 정상으로 집계된다(실패 경로)', b, async () => {
+  const { bridge } = build();
+  for (const state of ['draining', '', 'UP', 1, null]) {
+    const r = await bridge.handleLine(line({
+      id: '1', op: 'health', report: { observedAt: NOW, samples: [{ component: 'stt', state }] },
+    }));
+    assert.equal(r.ok, false, `거절되지 않았다: ${String(state)}`);
+    assert.equal(r.error.code, 'E_BAD_REQUEST');
+  }
+});
+
+// ── 계약 버전 불일치(§2) ─────────────────────────────────────────────────────
+
+test('Core 계약 버전이 브리지와 다르면 기동을 거절한다 — Node 경로와 같은 판정이다', b, () => {
+  const { core } = build();
+  const wrap = (version) => ({
+    contractVersion: version,
+    start: (r) => core.start(r), send: (i, t) => core.send(i, t),
+    end: (i, r, x) => core.end(i, r, x), reportHealth: (r) => core.reportHealth(r),
+  });
+  assert.throws(
+    () => BR.createBridge({ core: wrap(99), adapter: 'callbot', scope: SCOPE }),
+    (e) => e.name === 'BridgeConfigError' && /계약 버전 불일치/.test(e.message),
+  );
+  // 버전이 맞으면 종전과 완전히 같다.
+  assert.ok(BR.createBridge({ core: wrap(core.contractVersion), adapter: 'callbot', scope: SCOPE }));
+});

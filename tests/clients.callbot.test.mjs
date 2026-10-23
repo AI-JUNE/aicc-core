@@ -616,3 +616,47 @@ h.close()
   assert.equal(out.degraded_after, true);
   assert.deepEqual(out.errors, ['E_BRIDGE_DOWN']);
 });
+
+test('§5.1 no-match 턴을 미인식으로 올린다 — 발화 훅으로 돌리면 슬롯 값이 된다', b, () => {
+  const out = parse(runDriver(`${PRELUDE}
+h = hooks()
+h.on_call_start("call-A")
+miss = h.on_unrecognized("call-A", "카드를 잃어버렸어요", usage={"stt_audio_ms": 400})
+empty = h.on_unrecognized("call-A")              # 인식기가 아무 말도 돌려주지 못한 턴
+bad = h.on_unrecognized("call-A", 3)             # 문자열이 아닌 값만 거른다
+h.on_call_end("call-A", billable_ms=1000)
+dump(h, miss=miss.result if miss else None, miss_ok=bool(miss and miss.ok),
+     empty_ok=bool(empty and empty.ok), bad_is_none=(bad is None))
+h.close()
+`));
+  const report = verifyBridgeTranscript(out.transcript, { adapter: 'callbot', maxLineBytes: 65536 });
+  assert.equal(report.verdict, 'passed', JSON.stringify(report.issues));
+  assert.equal(report.opCounts.send, 2, '문자열이 아닌 값은 보내지 않는다');
+  assert.equal(out.miss_ok, true);
+  assert.equal(out.empty_ok, true, '빈 텍스트를 버리면 사다리가 돌지 않아 통화가 멈춘 것처럼 보인다');
+  assert.equal(out.bad_is_none, true);
+  assert.equal(out.stats.ignored_empty, 1);
+  assert.equal(out.stats.turns_sent, 2);
+  // 미인식은 슬롯 값이 되지 않는다 — 이것이 `on_transcript` 로 바꿔 보내면 안 되는 이유다.
+  assert.equal(out.miss.state.slotKeys.includes('purpose'), false);
+  assert.equal(out.miss.state.failCount, 1);
+  assert.ok(out.transcript.requests.some((l) => l.includes('"unrecognized"')));
+});
+
+test('비동기 훅에도 미인식 자리가 있다 — 한쪽만 더하면 그 호스트에서만 사라진다', b, () => {
+  const out = parse(runDriver(`${PRELUDE}
+async def main():
+    h = AsyncCallbotCoreHooks(hooks())
+    await h.on_call_start("call-A")
+    r = await h.on_unrecognized("call-A", "어...", usage={"stt_audio_ms": 100})
+    await h.on_call_end("call-A", billable_ms=500)
+    await h.drain()
+    dump(h.inner, miss_ok=bool(r and r.ok), fail_count=(r.result["state"]["failCount"] if r and r.ok else None))
+    await h.close()
+asyncio.run(main())
+`));
+  assert.equal(out.miss_ok, true, 'asyncio 가 권장 경로다 — 여기서 빠지면 음성 채널 전체에서 사라진다');
+  assert.equal(out.fail_count, 1);
+  assert.equal(out.stats.turns_sent, 1);
+  assert.equal(out.stats.turns_missing_usage, 0);
+});

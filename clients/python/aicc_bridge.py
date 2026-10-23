@@ -126,6 +126,25 @@ class BridgeResponse:
         value = state.get("pendingConnectorId")
         return value if isinstance(value, str) and value else None
 
+    @property
+    def switch_invite(self) -> Optional[Dict[str, Any]]:
+        """§5.2 채널 전환 초대가 **이번 턴에 일어났다는 사실**. 없으면 None.
+
+        읽지 않으면 전환이 **조용히 반쪽만** 일어난다: Core 는 `state.channel` 을 화면으로
+        바꿔 이후 단계를 화면용으로 렌더하는데(통화 중인 고객이 그것을 듣는다) 링크를 보내는
+        것은 호스트이고, 비-Node 호스트에 그 지시가 도착하는 자리는 여기 하나뿐이다
+        (Node 호스트는 `port.invite` 로 받는다). 고객은 오지 않는 화면을 기다리고 §5.1
+        사다리는 이미 전환을 골랐으므로 상담사로도 내려가지 않는다 — 예외가 나지 않는다.
+
+        링크에 쓸 1회용 토큰(`token`)은 `include_switch_ticket=True` 로 띄운 클라이언트에만
+        실린다. 실리지 않았는데(`tokenIncluded` 가 False) 링크를 만들어야 한다면 **만들지 말고
+        그 사실을 운영에 알린다** — Interaction id 로 만든 링크는 1회용도 만료도 회수도 없다(§10.3).
+        """
+        if not self.ok or not isinstance(self.result, dict):
+            return None
+        invite = self.result.get("switchInvite")
+        return invite if isinstance(invite, dict) else None
+
 
 @dataclass
 class _Transcript:
@@ -161,6 +180,7 @@ class BridgeClient:
         max_line_bytes: Optional[int] = None,
         include_handoff_summary: bool = False,
         include_slots: bool = False,
+        include_switch_ticket: bool = False,
         keep_transcript: bool = False,
     ) -> None:
         root = core_root or os.environ.get("AICC_CORE")
@@ -182,6 +202,16 @@ class BridgeClient:
             argv.append("--include-handoff-summary")
         if include_slots:
             argv.append("--include-slots")
+        # §5.2 전환 링크를 **이 호스트가 직접 만들어 보낼 때만** 켠다(기본 꺼짐, §10.3).
+        #
+        # 이 스위치가 없던 동안 브리지·실행기에는 자리가 있는데 참조 클라이언트에서 켤 길이
+        # 없었다 — 그리고 음성(Callbot)이 바로 §5.2 전환이 일어나는 쪽이고 그 호스트가 파이썬이다.
+        # 그 배치에서 호스트가 받는 것은 `ticketIssued: true` · `tokenIncluded: false` 이므로,
+        # 링크를 만들려면 Interaction id 를 쓸 수밖에 없다 — 그 순간 1회용·만료·회수가 전부
+        # 무의미해지고(`core/executeSwitch.ts` 가 막겠다고 적어 둔 사고다) 링크 URL·프록시 로그·
+        # 상담 메모에 남은 id 가 곧 진행 중인 상담 화면의 열쇠가 된다. 어디에서도 예외가 나지 않는다.
+        if include_switch_ticket:
+            argv.append("--include-switch-ticket")
 
         self._adapter = adapter
         self._max_line_bytes = max_line_bytes
@@ -341,6 +371,36 @@ class BridgeClient:
         실어 주므로(§13 지연 지표) 측정했으면 그대로 넘긴다.
         """
         turn: Dict[str, Any] = {"input": {"kind": "dtmf", "digits": digits}}
+        if latency:
+            turn["latency"] = latency
+        if usage:
+            turn["usage"] = usage
+        return self.send(interaction_id, turn)
+
+    def send_unrecognized(
+        self,
+        interaction_id: str,
+        text: str = "",
+        *,
+        latency: Optional[Dict[str, float]] = None,
+        usage: Optional[Dict[str, float]] = None,
+    ) -> BridgeResponse:
+        """고객은 말했지만 **무엇을 원하는지 확정하지 못했다**(§5.1·§6.2).
+
+        인식기·호스트 NLU 가 no-match 를 돌려준 턴은 이것으로 보낸다. `text` 는 인식된 원문이며
+        아무 말도 돌려받지 못했으면 빈 문자열이다(그 상태도 유효한 미인식이다).
+
+        **`send_utterance` 로 바꿔 보내지 않는다.** `Collect` 노드는 비어 있지 않은 텍스트를
+        무조건 수락하므로, 미인식 발화를 발화로 올리면 "카드를 잃어버렸어요"가 **슬롯 값으로
+        저장된 채** 흐름이 다음 노드로 넘어간다 — 예외도 재프롬프트도 없고 고객은 엉뚱한 안내를
+        듣는다. `send_timeout` 으로 바꿔 보내는 것도 틀리다: 무입력과 미인식은 §5.1 사다리에서
+        다른 단계이고, 말을 한 고객이 침묵으로 집계된다.
+
+        **`confidence` 는 받지 않는다**: 이 입력에는 실을 자리가 없다(§13-3). 저신뢰 인식을
+        그대로 올려 Core 가 §5.1 신뢰도 조건으로 판정하게 하려면 `send_utterance(confidence=...)`
+        를 쓴다 — 어느 쪽을 보낼지는 인식기가 "값이 낮다"와 "매칭이 없다" 중 무엇을 말했는지로 갈린다.
+        """
+        turn: Dict[str, Any] = {"input": {"kind": "unrecognized", "text": text}}
         if latency:
             turn["latency"] = latency
         if usage:
@@ -579,6 +639,9 @@ class _SessionContext:
 
     def send_timeout(self, **kwargs: Any) -> BridgeResponse:
         return self._require_id_then(lambda i: self._client.send_timeout(i, **kwargs))
+
+    def send_unrecognized(self, text: str = "", **kwargs: Any) -> BridgeResponse:
+        return self._require_id_then(lambda i: self._client.send_unrecognized(i, text, **kwargs))
 
     def send_connector_result(self, ok: bool, **kwargs: Any) -> BridgeResponse:
         return self._require_id_then(lambda i: self._client.send_connector_result(i, ok, **kwargs))

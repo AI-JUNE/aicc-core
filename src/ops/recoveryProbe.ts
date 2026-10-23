@@ -28,7 +28,7 @@
 //    래치가 형태만 바꿔 되살아난다 **[승인 필요]**.
 //  - 프로브 때문에 절대 던지지 않는다. 복구 확인 루프가 예외로 죽으면 복구도 같이 죽는다.
 import type { ComponentId, FallbackPolicy, HealthProbe, HealthRegistry, HealthSample, HealthState } from './fallback.ts';
-import { effectiveComponentState } from './fallback.ts';
+import { effectiveComponentState, isHealthState } from './fallback.ts';
 import type { Scheduler } from './health.ts';
 import { EngineError } from '../adapters/http.ts';
 import { classifyEngineFailure, normalizeEngineError } from '../adapters/resilience.ts';
@@ -126,7 +126,10 @@ export interface RecoveryProbeRunner {
 function validSample(v: unknown, component: ComponentId): HealthSample | undefined {
   if (!v || typeof v !== 'object') return undefined;
   const s = v as Partial<HealthSample>;
-  if (s.state !== 'up' && s.state !== 'degraded' && s.state !== 'down' && s.state !== 'unknown') return undefined;
+  // 아는 상태 목록은 `ops/fallback.ts` 하나다(§2) — 손으로 적어 두었던 동안, 상태가 하나
+  // 늘면 이 판정만 모르고 **그 샘플을 규약 위반으로 버렸다**. 버려지면 그 컴포넌트는 새 샘플을
+  // 만들 주체가 사라져 한 번 내려간 채널이 영구히 폴백에 남는다(§9.3 — 래치와 같은 결말이다).
+  if (!isHealthState(s.state)) return undefined;
   if (typeof s.observedAt !== 'string' || Number.isNaN(Date.parse(s.observedAt))) return undefined;
   if (s.component !== component) return undefined;   // 다른 컴포넌트 상태를 대신 적지 못하게 한다
   return s as HealthSample;

@@ -282,6 +282,34 @@ class CallbotCoreHooks:
             usage_declared=bool(usage),
         )
 
+    def on_unrecognized(
+        self,
+        call_id: str,
+        text: str = "",
+        *,
+        latency: Optional[Dict[str, float]] = None,
+        usage: Optional[Dict[str, float]] = None,
+    ) -> Optional[BridgeResponse]:
+        """인식기가 no-match 를 돌려준 턴(§5.1·§6.2). **고객은 말했다.**
+
+        `on_transcript` 로 바꿔 보내지 않는다 — `Collect` 노드는 비어 있지 않은 텍스트를 무조건
+        수락하므로 미인식 발화가 **슬롯 값으로 저장된 채** 흐름이 넘어간다(예외도 재프롬프트도 없다).
+        `on_timeout` 도 틀리다: 말을 한 고객이 침묵으로 집계되고 §5.1 사다리의 다른 단계를 탄다.
+
+        **빈 `text` 를 버리지 않는다**(`on_transcript` 와 다른 점이다): 아무 말도 돌려받지 못한
+        것이 미인식의 가장 흔한 모양이고, 그 턴을 여기서 버리면 사다리가 돌지 않아 통화가 멈춘
+        것처럼 보인다. 문자열이 아닌 값만 거른다.
+        """
+        if not isinstance(text, str):
+            self.stats.ignored_empty += 1
+            return None
+        facts = self._facts(latency=latency, usage=usage)
+        return self._turn(
+            call_id,
+            lambda c, i: c.send_unrecognized(i, text, **facts),
+            usage_declared=bool(usage),
+        )
+
     def on_timeout(
         self,
         call_id: str,
@@ -543,6 +571,9 @@ class AsyncCallbotCoreHooks:
     # asyncio 에이전트가 권장 경로이므로 그 비대칭의 증상은 "음성 채널 전체에서 수량이 없다"다.
     async def on_dtmf(self, call_id: str, digits: str, **kw: Any) -> Optional[BridgeResponse]:
         return await self._run(call_id, lambda: self.inner.on_dtmf(call_id, digits, **kw))
+
+    async def on_unrecognized(self, call_id: str, text: str = "", **kw: Any) -> Optional[BridgeResponse]:
+        return await self._run(call_id, lambda: self.inner.on_unrecognized(call_id, text, **kw))
 
     async def on_timeout(self, call_id: str, **kw: Any) -> Optional[BridgeResponse]:
         return await self._run(call_id, lambda: self.inner.on_timeout(call_id, **kw))

@@ -42,6 +42,7 @@ import type { FlowInput } from '../flow/runner.ts';
 import type { EntryPoint, LatencyMs, UsageMetrics } from '../events/schema.ts';
 import { ENTRY_POINTS, LATENCY_KEYS, USAGE_METRIC_KEYS } from '../events/schema.ts';
 import type { HealthSample, ComponentId } from '../ops/fallback.ts';
+import { isHealthState } from '../ops/fallback.ts';
 import type { ClosedAction } from '../routing/agentQueue.ts';
 import type {
   AlternativeCause, HandoffPlacement, HandoffUnavailableCode,
@@ -463,7 +464,9 @@ function numberMap(v: unknown, allowed: ReadonlySet<string>): Record<string, num
 // 전부 "비-Node 호스트에서만 거부된다"였다(`LATENCY_KEYS`·`USAGE_METRIC_KEYS`·`ENTRY_POINTS` 주석).
 const LATENCY_KEY_SET: ReadonlySet<string> = new Set<string>(LATENCY_KEYS);
 const USAGE_KEY_SET: ReadonlySet<string> = new Set<string>(USAGE_METRIC_KEYS);
-const HEALTH_STATES: ReadonlySet<string> = new Set(['up', 'degraded', 'down', 'unknown']);
+// 헬스 상태도 같은 규칙이다 — 목록은 `ops/fallback.ts` 하나이고 판정만 빌려 온다(§2).
+// 손으로 적어 두었던 동안, 상태가 하나 늘면 Node 호스트는 그 샘플을 올릴 수 있고
+// **비-Node 호스트만** `E_BAD_REQUEST` 를 받았다("그 채널만 헬스가 안 올라간다").
 
 const ENTRY_POINT_SET: ReadonlySet<string> = new Set<string>(ENTRY_POINTS);
 
@@ -554,6 +557,29 @@ function toSessionRequest(body: Record<string, unknown>, opts: BridgeOptions): C
   return out;
 }
 
+/**
+ * 와이어로 받을 수 있는 입력 종류 — **`FlowInput` 을 전부 덮어야 한다**.
+ *
+ * 왜 목록을 두는가: 종전에는 아래 `switch` 가 네 종류만 알았고 `unrecognized` 는 "알 수 없는
+ * 입력 종류"로 거절됐다(§5.1·§6.2). 분류는 Core 밖(엔진·호스트 NLU)에서 일어나므로 **미인식은
+ * 호스트가 선언하는 사실**인데, 그 사실을 올릴 자리가 비-Node 호스트에는 없던 셈이다. 음성이
+ * 바로 미인식이 가장 많은 채널이고(소음·고령 고객·재발화) 그 호스트가 파이썬이다.
+ *
+ * 남은 두 길이 전부 나쁘다. 거절을 받으면 그 턴은 Core 에 **아예 도착하지 않아** §5.1 사다리가
+ * 돌지 않고, `utterance` 로 바꿔 보내면 더 조용하다 — `Collect` 노드는 비어 있지 않은 텍스트를
+ * 무조건 수락하므로 "카드를 잃어버렸어요"가 **슬롯 값으로 저장된 채** 다음 노드로 넘어간다.
+ * 예외도 재프롬프트도 없고 고객은 엉뚱한 안내를 듣는다(`FlowInput.unrecognized` 주석의 사고다).
+ *
+ * 목록을 컴파일 검사와 묶어 둔 이유: 입력 종류가 하나 늘어나는 날 이 자리만 모르면 같은 비대칭이
+ * 되풀이된다(Node 호스트는 보낼 수 있고 와이어만 거절한다).
+ */
+const WIRE_INPUT_KINDS = ['utterance', 'dtmf', 'timeout', 'connectorResult', 'unrecognized'] as const;
+
+/** 빠뜨린 종류가 있으면 이 대입이 컴파일 오류가 된다. */
+const _wireInputKindsCover: Exclude<FlowInput['kind'], typeof WIRE_INPUT_KINDS[number]> extends never
+  ? true : never = true;
+void _wireInputKindsCover;
+
 function toFlowInput(v: unknown): FlowInput {
   if (!isPlainObject(v)) bad('turn.input 이 없습니다.');
   const kind = v.kind;
@@ -568,6 +594,15 @@ function toFlowInput(v: unknown): FlowInput {
         input.confidence = v.confidence;
       }
       return input;
+    }
+    case 'unrecognized': {
+      // **빈 문자열을 거절하지 않는다**: 인식기가 아무 말도 못 돌려준 것(no-match)이 바로 이
+      // 입력의 가장 흔한 경우다. 거절하면 호스트는 그 턴을 `timeout` 으로 바꿔 보내게 되고
+      // (무입력과 미인식은 §5.1 사다리에서 다른 단계다) 그러면 고객은 말을 했는데 침묵으로
+      // 집계된다. `confidence` 는 받지 않는다 — 이 종류에는 실을 자리가 없고(§13-3),
+      // 턴 단위로 선언하면 런타임이 `W_TURN_INPUT` 으로 사실을 적는다.
+      if (typeof v.text !== 'string') bad('unrecognized 입력에는 text(문자열)가 필요합니다.');
+      return { kind: 'unrecognized', text: v.text };
     }
     case 'dtmf': {
       if (typeof v.digits !== 'string') bad('dtmf 입력에는 digits(문자열)가 필요합니다.');
@@ -628,7 +663,7 @@ function toHealthSamples(body: Record<string, unknown>): { samples: HealthSample
     if (!isPlainObject(s)) bad('samples 항목은 객체여야 합니다.');
     if (!nonEmptyString(s.component)) bad('samples 항목에 component 가 없습니다.');
     // 알 수 없는 컴포넌트는 여기서 막지 않는다 — Core 가 선언 목록으로 거른다(§9.3).
-    if (!nonEmptyString(s.state) || !HEALTH_STATES.has(s.state)) {
+    if (!isHealthState(s.state)) {
       // 상태 없는 샘플을 up 으로 읽으면, 장애 중인 엔진이 정상으로 집계된다(§9.3).
       bad(`samples 항목의 state 가 유효하지 않습니다: ${String(s.state)}`);
     }
@@ -839,6 +874,31 @@ export function createBridge(opts: BridgeOptions): Bridge {
   }
   if (opts.maxLineBytes !== undefined && (!Number.isInteger(opts.maxLineBytes) || opts.maxLineBytes <= 0)) {
     throw new BridgeConfigError('maxLineBytes 는 양의 정수여야 합니다.');
+  }
+  /**
+   * **계약 버전 불일치는 여기서 막는다**(§2).
+   *
+   * Node 경로에서는 같은 판정이 이미 있다 — `validateRegistration` 이 `E_VERSION_MISMATCH` 를
+   * error 로 내고 그 채널은 붙지 못한다. 그런데 브리지 경로에는 그 판정이 없었다: `hello` 가
+   * 두 숫자(`contractVersion`·`coreContractVersion`)를 **나란히 광고하면서 비교는 호스트에게
+   * 맡겼고**, 참조 파이썬 클라이언트도 프로토콜 버전과 어댑터만 본다. 즉 아무도 비교하지 않았다.
+   *
+   * 어긋나는 배치가 실재한다: 호스트 모듈이 `node_modules` 에 설치된 다른 판의 Core 로
+   * `{ core, scope }` 를 만들고, 실행기는 저장소 체크아웃의 브리지를 돌리는 구성이다(실행기는
+   * `--core` 로 **모듈 경로**를 받으므로 두 판이 섞이는 것이 설정 한 줄 차이다). 그 상태의 증상은
+   * 예외가 아니다 — 투영이 모르는 필드를 **조용히 빼고** 나가므로 호스트는 `placement`·
+   * `switchInvite`·`consent` 가 없는 응답을 "그 턴에는 없었다"로 읽는다. 전환 링크를 보내지 않고,
+   * 큐에 못 들어간 고객에게 상담사 연결을 안내하고, 동의 기록을 증명할 길이 없어진다.
+   *
+   * 기동을 거절하는 쪽을 골랐다: 되돌릴 수 있는 쪽은 기동 거절이고(설정 한 줄), 되돌릴 수 없는
+   * 쪽은 어긋난 판정으로 이미 지나간 통화다 — `E_FOREIGN_COMPONENT` 와 같은 저울이다.
+   */
+  if (opts.core.contractVersion !== CHANNEL_CONTRACT_VERSION) {
+    throw new BridgeConfigError(
+      `채널 계약 버전 불일치: Core ${String(opts.core.contractVersion)} ≠ 브리지 ${CHANNEL_CONTRACT_VERSION}. `
+      + 'Node 경로(validateRegistration)는 같은 불일치로 등록을 거부합니다 — 버전이 섞인 채 열린 '
+      + '브리지는 모르는 필드를 조용히 빼고 응답하므로 호스트가 그것을 "그 턴에는 없었다"로 읽습니다(§2).',
+    );
   }
   const capabilities = opts.capabilities ?? profileFor(opts.adapter);
   if (capabilities.adapter !== opts.adapter) {

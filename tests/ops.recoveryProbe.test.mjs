@@ -347,3 +347,32 @@ test('monotonic 을 주지 않으면 latencyMs 를 만들지 않는다(§13-3)',
   await measured.runner.runDue();
   assert.equal(measured.registry.latest('llm').latencyMs, 7);
 });
+
+// ── 아는 상태 목록은 `ops/fallback.ts` 하나다(§2) ────────────────────────────
+
+test('아는 상태는 모두 기록된다 — 목록을 손으로 적어 두면 늘어난 상태만 조용히 버려진다', b, async () => {
+  for (const state of fb.HEALTH_STATES) {
+    const { registry, runner } = setup({
+      initial: [sample('llm', 'down', T0)],
+      schedules: [{ probe: probeOf('llm', async () => sample('llm', state, at(1))), intervalMs: 1, timeoutMs: 100 }],
+      nowIso: at(1),
+    });
+    await runner.runDue();
+    assert.equal(registry.latest('llm').observedAt, at(1), `기록되지 않았다: ${state}`);
+  }
+});
+
+test('모르는 상태를 돌려준 프로브는 규약 위반이라 기록하지 않는다(실패 경로)', b, async () => {
+  for (const state of ['draining', 'UP', '', 1, undefined]) {
+    const { registry, runner } = setup({
+      initial: [sample('llm', 'down', T0)],
+      schedules: [{ probe: probeOf('llm', async () => sample('llm', state, at(1))), intervalMs: 1, timeoutMs: 100 }],
+      nowIso: at(1),
+    });
+    const report = await runner.runDue();
+    // 종전 상태가 남는다 — 모르는 값을 `up` 으로 읽으면 폴백이 근거 없이 풀린다(§9.3).
+    assert.equal(registry.latest('llm').state, 'down', `버려지지 않았다: ${String(state)}`);
+    assert.equal(report.attempts.length, 1, '시도한 사실은 남는다 — 조용히 건너뛴 것이 아니다');
+    assert.deepEqual(report.recovered, []);
+  }
+});

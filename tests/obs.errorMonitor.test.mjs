@@ -136,6 +136,31 @@ test('차단 키의 값은 제거되고 무엇을 지웠는지만 남는다', b,
   assert.equal(r.fields.stepCount, 3);
 });
 
+test('차단 판정은 로거와 한 벌이다 — 목록도 대조 방식도 같은 곳에서 온다(§2·§10.3)', b, async () => {
+  // 목록(`DENIED_FIELDS`)은 공유했지만 **대조 방식**(키 정규화)이 두 곳에 있었다. 값이 같아
+  // 증상이 없었을 뿐이고, 한쪽만 고치는 날의 결말은 "로그에는 [제거됨] 인데 수집기 보고에는
+  // 원문이 실린다"다 — 로그를 검사한 사람은 막혔다고 읽고, 나간 것은 인증값이다.
+  const logger = await import('../src/obs/logger.ts');
+  const t = collector();
+  const mon = m.createErrorMonitor({ dsn: 'x', transport: t });
+  const sink = logger.createMemorySink();
+  const log = logger.createLogger({ sink });
+  // 같은 키를 여러 표기로 넣는다 — 정규화가 갈라지면 두 쪽의 결과가 달라진다.
+  const fields = { 'API KEY': 'k1', 'Api-Key': 'k2', api_key: 'k3', ACCESSTOKEN: 'k4', stepCount: 1 };
+  mon.capture(new Error('x'), { code: 'E_INTERNAL', fields });
+  log.info('turn', { fields });
+  const fromMonitor = [...t.sent[0].redactedKeys].sort();
+  const fromLogger = [...sink.records[0].redactedKeys].sort();
+  assert.deepEqual(fromMonitor, fromLogger);
+  assert.deepEqual(fromMonitor, ['ACCESSTOKEN', 'API KEY', 'Api-Key', 'api_key']);
+  assert.equal(JSON.stringify(t.sent[0]).includes('k1'), false);
+  assert.equal(JSON.stringify(sink.records[0]).includes('k1'), false);
+  assert.equal(t.sent[0].fields.stepCount, 1, '허용 키는 그대로 남는다');
+  // 정규화 함수 자체가 하나인지 — 사본이 다시 생기면 위 두 줄은 한참 뒤에야 갈라진다.
+  assert.equal(typeof logger.normalizeDeniedFieldKey, 'function');
+  assert.equal(logger.normalizeDeniedFieldKey('API KEY'), 'apikey');
+});
+
 test('시계가 없으면 시각을 만들어 넣지 않는다(§13-3)', b, () => {
   const t = collector();
   const mon = m.createErrorMonitor({ dsn: 'x', transport: t });

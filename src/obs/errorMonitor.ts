@@ -20,7 +20,7 @@
 import { maskPii } from '../core/policyGuard.ts';
 import type { TenantScope } from '../core/tenancy.ts';
 import type { ApiErrorCode } from '../api/errors.ts';
-import { DENIED_FIELDS } from './logger.ts';
+import { DENIED_FIELDS, normalizeDeniedFieldKey } from './logger.ts';
 
 export const REDACTED = '[제거됨]';
 
@@ -278,9 +278,9 @@ export interface ErrorMonitor {
   stats(): ErrorMonitorStats;
 }
 
-function normalizeKey(k: string): string {
-  return k.toLowerCase().replace(/[_\-\s]/g, '');
-}
+// 차단 키 정규화도 로거 쪽 하나를 쓴다 — 목록(`DENIED_FIELDS`)만 공유하고 **대조 방식**을
+// 따로 들고 있으면 판정의 절반이 두 곳이 된다(`normalizeDeniedFieldKey` 주석의 사고).
+const normalizeKey = normalizeDeniedFieldKey;
 
 function sanitizeFieldValue(v: unknown): string | number | boolean | undefined {
   if (v === null || v === undefined) return undefined;

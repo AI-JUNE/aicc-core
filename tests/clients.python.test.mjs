@@ -608,3 +608,69 @@ c.close()
     );
   }
 });
+
+// ── 미인식 턴(§5.1·§6.2) ─────────────────────────────────────────────────────
+// 분류는 Core 밖(인식기·호스트 NLU)에서 일어나므로 **미인식은 호스트가 선언하는 사실**인데,
+// 파이썬 호스트에는 그 사실을 올릴 자리가 없었다. 음성이 미인식이 가장 많은 채널이고 그 호스트가
+// 파이썬이라, 남은 두 길(거절을 받거나 발화로 바꿔 보내기)이 전부 나쁜 쪽으로 쓰이고 있었다.
+
+test('§5.1 미인식 턴을 보낼 수 있다 — 발화로 바꿔 보내면 슬롯 값이 된다', b, () => {
+  const source = `${PRELUDE}
+c = client()
+c.hello()
+s = c.start(flow_id="f_reference_voice", entry_point="inbound_call")
+# 시작 직후는 용건을 받는 Collect 노드다. 인식기가 no-match 를 돌려준 턴을 사실 그대로 올린다.
+miss = c.send_unrecognized(s.interaction_id, "카드를 잃어버렸어요",
+                           latency={"stt_ms": 130}, usage={"stt_audio_ms": 900})
+empty = c.send_unrecognized(s.interaction_id)                  # 아무 말도 못 돌려받은 경우
+# 비교: 같은 발화를 발화로 올리면 그대로 슬롯 값이 된다(예외도 재프롬프트도 없다).
+c2 = client()
+c2.hello()
+s2 = c2.start(flow_id="f_reference_voice", entry_point="inbound_call")
+as_utt = c2.send_utterance(s2.interaction_id, "카드를 잃어버렸어요")
+json.dump({"miss_ok": miss.ok, "miss": miss.result, "empty_ok": empty.ok, "empty": empty.result,
+           "as_utt": as_utt.result, "lines": c.transcript.requests}, sys.stdout, ensure_ascii=False)
+c.close(); c2.close()
+`;
+  const run = withDriver(source, (f) => runPython(f));
+  assert.equal(run.status, 0, run.stderr);
+  const out = JSON.parse(run.stdout);
+  assert.equal(out.miss_ok, true, '계약에 있는 입력 종류가 와이어에서 거절됐다');
+  assert.equal(out.miss.state.slotKeys.includes('purpose'), false,
+    '미인식 발화가 슬롯 값으로 저장되면 고객은 엉뚱한 안내를 듣는다');
+  assert.equal(out.miss.state.failCount, 1, '§5.1 실패 판정을 타지 않았다');
+  // 실측은 미인식 턴에서도 원장에 실린다(§11.2·§13).
+  const turn = out.miss.events.find((e) => e.type === 'turn.completed' && e.speaker === 'customer');
+  assert.deepEqual(turn.usage, { stt_audio_ms: 900 });
+  assert.equal(turn.latency_ms.stt_ms, 130);
+  // 아무 말도 돌려받지 못한 턴도 미인식이다 — 거절하면 호스트가 무음으로 바꿔 보낸다.
+  assert.equal(out.empty_ok, true);
+  assert.equal(out.empty.state.failCount, 2);
+  // 발화로 바꿔 보낸 쪽의 결말을 같은 검사에 고정한다(그래서 바꿔 보내면 안 된다).
+  assert.equal(out.as_utt.state.slotKeys.includes('purpose'), true);
+  assert.equal(out.as_utt.state.failCount, 0);
+  // 선언하지 않은 값을 만들어 넣지 않는다(§13-3).
+  const emptyLine = out.lines.find((l) => l.includes('"unrecognized"') && l.includes('"text":""'));
+  assert.ok(emptyLine, `빈 미인식 줄을 찾지 못했다: ${JSON.stringify(out.lines)}`);
+  assert.equal(emptyLine.includes('usage'), false, emptyLine);
+  assert.equal(emptyLine.includes('confidence'), false, '이 입력에는 신뢰도를 실을 자리가 없다');
+});
+
+// ── §5.2 전환 토큰 노출 스위치(§10.3) ────────────────────────────────────────
+
+test('§5.2 전환 토큰 노출을 참조 클라이언트에서 켤 수 있다 — 기본은 꺼짐이다', b, () => {
+  const source = `${PRELUDE}
+off = client()
+on = client(include_switch_ticket=True)
+json.dump({"off": off.hello().result, "on": on.hello().result}, sys.stdout, ensure_ascii=False)
+off.close(); on.close()
+`;
+  const run = withDriver(source, (f) => runPython(f));
+  assert.equal(run.status, 0, run.stderr);
+  const out = JSON.parse(run.stdout);
+  // 끈 쪽이 기본이다 — 1회용 합류 토큰은 진행 중인 상담의 열쇠이고 응답 줄은 호스트 로그에 남는다.
+  assert.equal(out.off.includesSwitchTicket, false);
+  // 켤 길이 없던 동안 음성 호스트는 `ticketIssued: true`·`tokenIncluded: false` 만 받았고,
+  // 링크를 만들려면 Interaction id 를 쓸 수밖에 없었다(1회용·만료·회수가 전부 무의미해진다).
+  assert.equal(out.on.includesSwitchTicket, true, '실행기에는 있는 스위치를 클라이언트에서 켤 수 없다');
+});

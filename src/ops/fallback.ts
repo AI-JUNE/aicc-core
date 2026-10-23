@@ -41,7 +41,29 @@ export const COMPONENT_TIER: Record<ComponentId, EngineTier> = {
  */
 export const COMPONENT_IDS: readonly ComponentId[] = Object.keys(COMPONENT_TIER) as ComponentId[];
 
-export type HealthState = 'up' | 'degraded' | 'down' | 'unknown';
+/**
+ * 알려진 헬스 상태 전체. **타입을 이 목록에서 파생시킨다** — 목록과 타입이 따로 있으면
+ * 사본이 두 벌이 되고, 그 어긋남은 `COMPONENT_IDS` 주석의 실패와 같은 모양이다.
+ *
+ * 왜 런타임 목록이 필요한가: 이 유니온을 **외부에서 온 값으로 판정하는 자리가 둘**이다 —
+ * JSONL 브리지(`channels/bridge.ts`, 비-Node 호스트가 올리는 샘플)와 복구 프로브
+ * (`ops/recoveryProbe.ts`, 프로브 구현이 돌려준 값). 둘 다 손으로 적은 사본을 들고 있었고,
+ * 상태가 하나 늘어나는 날의 결말은 **양쪽 다 조용하다**:
+ *  - 브리지는 그 샘플을 `E_BAD_REQUEST` 로 거절한다 — Node 호스트는 올릴 수 있고
+ *    **비-Node 호스트만** 올리지 못하므로, 증상은 "그 채널만 헬스가 안 올라간다"다.
+ *  - 프로브 판정기는 규약 위반으로 보아 **그 샘플을 버린다** — 그러면 그 컴포넌트는
+ *    새 샘플을 만들 주체가 사라져 한 번 내려간 채널이 영구히 폴백에 남는다(§9.3).
+ */
+const HEALTH_STATE_TUPLE = ['up', 'degraded', 'down', 'unknown'] as const;
+
+export type HealthState = typeof HEALTH_STATE_TUPLE[number];
+
+export const HEALTH_STATES: readonly HealthState[] = HEALTH_STATE_TUPLE;
+
+/** 외부에서 온 값이 아는 상태인가. 없는 상태를 `up` 으로 읽지 않기 위한 단일 판정이다(§2). */
+export function isHealthState(v: unknown): v is HealthState {
+  return typeof v === 'string' && (HEALTH_STATES as readonly string[]).includes(v);
+}
 
 export interface HealthSample {
   component: ComponentId;
