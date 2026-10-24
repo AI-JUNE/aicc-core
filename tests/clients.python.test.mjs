@@ -772,3 +772,132 @@ json.dump(out, sys.stdout, ensure_ascii=False)
   assert.equal(out.fallback.mode, 'agent_direct');
   assert.equal(out.fallback.none, null);
 });
+
+// ── §11.2 과금 근거: 보냈다 ≠ 실렸다 ────────────────────────────────────────
+// 클라이언트는 `usage`·`billable_ms` 를 **보낼** 수 있었지만, 그것이 §8.1 원장에 실렸는지를
+// 읽는 자리가 없었다. 두 질문은 다르다 — 실을 자리가 없는 턴(장애 폴백으로 조기 종료·커넥터
+// 재개·이미 실측이 실린 턴·두 번째 end)에서 Core 는 싣지 않고 사유를 돌려준다. 호스트가 그것을
+// 읽지 않으면 보낸 것을 들어간 것으로 세고, 그 수량은 공급사 청구서에만 남는다(과소청구 방향이라
+// 과다청구 차단에도 걸리지 않는다).
+
+test('§11.2 실측·통화 구간이 원장에 실렸는지를 참조 클라이언트가 알려준다(정상 경로)', b, () => {
+  const source = `${PRELUDE}
+c = client()
+c.hello()
+s = c.start(flow_id="f_reference_voice", entry_point="inbound_call")
+iid = s.interaction_id
+declared = c.send_dtmf(iid, "1", usage={"stt_audio_ms": 1200, "tts_audio_ms": 800})
+silent = c.send_dtmf(iid, "1")                      # 선언 없음 — 누락이 아니다
+
+# 종료는 **아직 달리는 세션**에서 본다. 위 통화는 첫 입력에 상담사로 이관돼 이미 끝났고,
+# 끝난 세션의 end 는 그 자체로 "실을 수 없었다"가 된다(두 번째 end 와 구분되지 않는다).
+c2 = client()
+c2.hello()
+s2 = c2.start(flow_id="f_reference_voice", entry_point="inbound_call")
+ended = c2.end(s2.interaction_id, "고객 종료", billable_ms=65000)
+twice = c2.end(s2.interaction_id, "한 번 더", billable_ms=65000)   # 이미 닫혔다
+json.dump({
+    "declared": {"attached": declared.usage_attached, "reasons": declared.billing_reasons_ko,
+                 "dropped": declared.billing_dropped_units,
+                 "recorded": declared.billable_ms_recorded,
+                 # 손으로 파낸 값과 접근자가 같은 것을 가리키는지 — 갈라지면 둘 중 하나가 거짓이다.
+                 "by_hand": (declared.result or {}).get("billing", {}).get("usageAttached")},
+    "silent": {"billing": silent.billing, "attached": silent.usage_attached,
+               "reasons": silent.billing_reasons_ko, "dropped": silent.billing_dropped_units},
+    "ended": {"recorded": ended.billable_ms_recorded, "attached": ended.usage_attached,
+              "reasons": ended.billing_reasons_ko},
+    "twice": {"ok": twice.ok, "recorded": twice.billable_ms_recorded,
+              "reasons": twice.billing_reasons_ko},
+}, sys.stdout, ensure_ascii=False)
+c.close(); c2.close()
+`;
+  const run = withDriver(source, (f) => runPython(f));
+  assert.equal(run.status, 0, run.stderr);
+  const out = JSON.parse(run.stdout);
+  assert.equal(out.declared.attached, true, '실측이 실렸는데 접근자가 그 사실을 전하지 못했다');
+  assert.equal(out.declared.by_hand, true);
+  assert.deepEqual(out.declared.reasons, [], '실린 턴에 사유가 생겼다');
+  assert.deepEqual(out.declared.dropped, [], '실린 턴에서 항목이 빠졌다');
+  assert.equal(out.declared.recorded, null, '턴 응답에 통화 구간 판정이 생겼다(end 의 값이다)');
+  // 선언이 없는 턴은 **누락이 아니다**. False 로 읽으면 "근거 없는 턴"이 통화 수만큼 부풀고,
+  // 그 숫자를 보고 운영은 멀쩡한 집계를 의심한다(§13-3).
+  assert.equal(out.silent.billing, null);
+  assert.equal(out.silent.attached, null);
+  assert.deepEqual(out.silent.reasons, []);
+  assert.deepEqual(out.silent.dropped, []);
+  assert.equal(out.ended.recorded, true, '통화 구간이 실렸는데 접근자가 전하지 못했다');
+  assert.equal(out.ended.attached, null, '종료 응답에 턴 실측 판정이 생겼다');
+  // 두 번째 end: Core 는 멱등하게 받지만 그 호출의 구간은 실리지 않는다. 호스트가 "실렸다"로
+  // 읽으면 그 통화는 통화 분 집계에 없는데 장부에는 선언된 것으로 남는다(§11.2).
+  assert.equal(out.twice.ok, true, 'end 가 막혔다 — 세션 누수는 요금으로 나타난다');
+  assert.equal(out.twice.recorded, false, '이미 닫힌 세션에 구간이 실렸다고 읽었다');
+  assert.ok(out.twice.reasons.length > 0, '싣지 못한 사유가 비어 있다 — 운영이 원인을 못 찾는다');
+});
+
+test('§11.2 과금 근거를 선언 없음·싣지 못함·형태 위반으로 나눠 읽는다(실패·경계 경로)', b, () => {
+  // 실을 자리가 없는 턴(폴백 조기 종료·커넥터 재개)과 이중 출처는 실제 브리지로 한 번에 만들 수
+  // 없다(둘 다 테넌트 배선·엔진 기동이 전제다). 판정 자체는 순수하므로 응답 모양으로 고정한다.
+  const source = `${PRELUDE}
+from aicc_bridge import BridgeResponse, BridgeError
+
+def resp(billing, ok=True):
+    body = {"interactionId": "i1"}
+    if billing is not None:
+        body["billing"] = billing
+    return BridgeResponse(id="1", ok=ok, result=body)
+
+cases = {
+    # 실을 자리가 없었다 — 호스트 잘못이 아니지만 그 수량은 원장에 없다(§9.3·§11.2).
+    "unattached": resp({"usageAttached": False,
+                        "usageReasonKo": "장애 폴백(agent_direct)으로 이 턴에 고객 발화 이벤트가 만들어지지 않았습니다."}),
+    # 같은 항목을 둘이 내놓아 합산하지 않고 빼냈다. 합치면 그 자리가 곧 이중 계상이다.
+    "conflict": resp({"usageAttached": True, "usageConflicts": ["stt_audio_ms"],
+                      "usageRejected": ["channel.gpu_seconds"]}),
+    "end_unrecorded": resp({"billableMsRecorded": False,
+                            "billableMsReasonKo": "이미 종료된 세션이라 통화 과금 구간을 싣지 않았습니다."}),
+    "none": resp(None),
+    # 형태가 틀린 판정을 참으로도 거짓으로도 읽지 않는다(§13-3).
+    "bad_shape": resp({"usageAttached": "yes", "billableMsRecorded": 1,
+                       "usageReasonKo": 7, "usageConflicts": "stt_audio_ms"}),
+    # 빈 사유 문자열은 사유가 아니다 — 목록에 실으면 운영 화면에 빈 줄이 뜬다.
+    "empty_reason": resp({"usageAttached": False, "usageReasonKo": ""}),
+}
+err = BridgeResponse(id="1", ok=False, error=BridgeError(code="E_BAD_REQUEST", message_ko="형태 위반"))
+out = {k: {"attached": v.usage_attached, "recorded": v.billable_ms_recorded,
+           "reasons": v.billing_reasons_ko, "dropped": v.billing_dropped_units,
+           "billing": v.billing}
+       for k, v in cases.items()}
+out["error"] = {"attached": err.usage_attached, "recorded": err.billable_ms_recorded,
+                "reasons": err.billing_reasons_ko, "dropped": err.billing_dropped_units,
+                "billing": err.billing}
+json.dump(out, sys.stdout, ensure_ascii=False)
+`;
+  const run = withDriver(source, (f) => runPython(f));
+  assert.equal(run.status, 0, run.stderr);
+  const out = JSON.parse(run.stdout);
+  assert.equal(out.unattached.attached, false);
+  assert.equal(out.unattached.reasons.length, 1, 'Core 가 쓴 사유가 호스트에 닿지 않았다');
+  assert.equal(out.unattached.recorded, null, '턴 판정에서 통화 구간을 읽어냈다');
+  assert.equal(out.conflict.attached, true);
+  assert.deepEqual(out.conflict.dropped, ['stt_audio_ms', 'channel.gpu_seconds'],
+    '빠진 항목이 호스트에 닿지 않았다 — 턴은 성공이고 수량만 사라진다');
+  assert.equal(out.end_unrecorded.recorded, false);
+  assert.equal(out.end_unrecorded.attached, null);
+  assert.equal(out.end_unrecorded.reasons.length, 1);
+  // 선언이 없는 응답을 누락으로 읽지 않는다.
+  assert.equal(out.none.billing, null);
+  assert.equal(out.none.attached, null);
+  assert.deepEqual(out.none.reasons, []);
+  // 형태가 틀린 값은 모름이다 — "yes" 를 참으로 읽으면 싣지 못한 턴이 실린 것으로 집계된다.
+  assert.equal(out.bad_shape.attached, null);
+  assert.equal(out.bad_shape.recorded, null);
+  assert.deepEqual(out.bad_shape.reasons, [], '숫자를 사유 문구로 실었다');
+  assert.deepEqual(out.bad_shape.dropped, [], '문자열을 항목 목록으로 풀어 적었다');
+  assert.deepEqual(out.empty_reason.reasons, []);
+  // 오류 응답의 본문은 읽지 않는다 — 거부를 "실렸다/안 실렸다"로 읽으면 안 된다.
+  assert.equal(out.error.billing, null);
+  assert.equal(out.error.attached, null);
+  assert.equal(out.error.recorded, null);
+  assert.deepEqual(out.error.reasons, []);
+  assert.deepEqual(out.error.dropped, []);
+});

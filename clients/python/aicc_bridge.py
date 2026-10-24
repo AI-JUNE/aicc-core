@@ -37,6 +37,13 @@ Callbot 의 음성 에이전트는 파이썬 프로세스다. Node 로 된 채�
    고객에게 "상담사를 연결해 드리겠습니다"가 나가고, 예외도 오류 응답도 없다.
    **모르는 것은 None 이다**(§13-3) — 배선이 없어 판정 자체가 없는 상태를 False 로 적으면
    종전까지 되던 안내가 그 테넌트 전체에서 사라진다.
+10. **보냈다와 실렸다를 구분한다(§11.2).** 8번이 "보낼 수 있어야 한다"였다면 이것은 "들어갔는지
+   확인할 수 있어야 한다"다. 실측·통화 구간을 선언해도 실릴 자리가 없으면(장애 폴백으로 조기
+   종료된 턴·커넥터 재개 턴·이미 실측이 실린 턴·두 번째 end) Core 는 **싣지 않고 사유를 돌려준다** —
+   `billing`·`usage_attached`·`billable_ms_recorded`·`billing_reasons_ko`·`billing_dropped_units`
+   가 그 자리다. 읽지 않으면 호스트는 보낸 것을 들어간 것으로 세고, 그 턴의 엔진 비용은 공급사
+   청구서에만 남는다. 과소청구 방향이라 과다청구 차단에도 걸리지 않고 대사에서 '미설명'으로만
+   돌아온다. **선언이 없었던 것(None)과 싣지 못한 것(False)을 같게 적지 않는다**(§13-3).
 
 무엇을 하지 않는가 (build now, activate on approval)
 ---------------------------------------------------
@@ -207,6 +214,89 @@ class BridgeResponse:
             return None
         action = placement.get("action")
         return action if isinstance(action, str) and action else None
+
+    @property
+    def billing(self) -> Optional[Dict[str, Any]]:
+        """§11.2 과금 근거가 **이번 호출에서 어디까지 실렸는가**. 선언이 하나도 없었으면 None.
+
+        어떤 노출 스위치와도 무관하게 오는 값이다(수치와 Core 가 쓴 사유뿐 — 개인정보가 없다).
+        읽지 않으면 호스트는 자기가 선언한 실측이 §8.1 원장에 **들어가지 않았다는 사실**을
+        알 길이 없다: 이 클라이언트의 `usage`·`billable_ms` 인자는 "보냈다"까지만 보장하고
+        실릴 자리가 있었는지는 Core 가 판정한다. 그 차이는 예외로도 오류 응답으로도 나타나지
+        않고, 몇 주 뒤 §11.2 대사에서 '미설명'으로만 돌아온다 — 과소청구 방향이라 과다청구
+        차단에도 걸리지 않는다.
+        """
+        if not self.ok or not isinstance(self.result, dict):
+            return None
+        billing = self.result.get("billing")
+        return billing if isinstance(billing, dict) else None
+
+    @property
+    def usage_attached(self) -> Optional[bool]:
+        """이번 턴의 실측이 원장 이벤트에 **실제로 실렸는가**. 셋 중 하나다 — True·False·None.
+
+        None 은 "이번 호출에 실측 선언이 없었다"이고 **실패가 아니다**(§13-3). False 로 적으면
+        실측을 보내지 않은 턴까지 누락으로 세어 "근거 없는 턴" 건수가 통화 수만큼 부풀고,
+        반대로 False 를 True 로 읽으면 진짜 누락이 0건으로 보인다. 둘 다 조용하다.
+
+        False 가 되는 경로는 전부 호스트 잘못이 아니다: 장애 폴백으로 조기 종료된 턴·커넥터
+        재개 턴에는 고객 발화 이벤트가 없어 실을 자리가 없고(§9.3), 이미 실측이 실린 턴은
+        덮어쓰지 않는다. 사유는 `billing_reasons_ko` 에 Core 가 쓴 문구로 온다.
+        """
+        billing = self.billing
+        if billing is None:
+            return None
+        value = billing.get("usageAttached")
+        return value if isinstance(value, bool) else None
+
+    @property
+    def billable_ms_recorded(self) -> Optional[bool]:
+        """§11.2 통화 과금 구간이 `session.ended` 에 실렸는가. 선언하지 않았으면 None.
+
+        `end(billable_ms=...)` 를 **두 번째로** 부른 경우가 가장 흔한 False 다 — Core 는 멱등하게
+        받지만 그 호출의 구간은 실리지 않으며, 호스트는 자기가 선언한 값이 들어갔다고 읽는다.
+        """
+        billing = self.billing
+        if billing is None:
+            return None
+        value = billing.get("billableMsRecorded")
+        return value if isinstance(value, bool) else None
+
+    @property
+    def billing_reasons_ko(self) -> List[str]:
+        """과금 근거가 실리지 않은 사유(한국어). **Core 가 쓴 문구 그대로** 돌려준다.
+
+        호스트가 사유를 지어내면 운영은 "왜 수량이 없는지"를 저장소마다 다르게 읽는다(§2).
+        실린 경우·선언이 없는 경우에는 빈 목록이다 — 빈 목록을 "문제 없음"으로 읽어도 되는
+        유일한 자리가 여기다(판정 자체는 `usage_attached`·`billable_ms_recorded` 가 말한다).
+        """
+        billing = self.billing
+        if billing is None:
+            return []
+        out: List[str] = []
+        for key in ("usageReasonKo", "billableMsReasonKo"):
+            value = billing.get(key)
+            if isinstance(value, str) and value:
+                out.append(value)
+        return out
+
+    @property
+    def billing_dropped_units(self) -> List[str]:
+        """집계에서 **빠진 사용량 항목** 이름. 빠졌다는 사실을 숨기지 않는다(§11.2).
+
+        두 가지가 섞여 온다: 같은 항목을 둘 이상이 내놓아 합산하지 않고 빼낸 것(`usageConflicts`
+        — 합치면 그 자리가 곧 이중 계상이다)과, 실측으로 볼 수 없어 버린 것(`usageRejected`).
+        어느 쪽이든 그 항목은 원장에 없다. 0 으로 메우지 않는다 — 0 은 "실측했고 안 썼다"다.
+        """
+        billing = self.billing
+        if billing is None:
+            return []
+        out: List[str] = []
+        for key in ("usageConflicts", "usageRejected"):
+            value = billing.get(key)
+            if isinstance(value, list):
+                out.extend(str(v) for v in value)
+        return out
 
     @property
     def fallback(self) -> Optional[Dict[str, Any]]:

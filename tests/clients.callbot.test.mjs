@@ -660,3 +660,91 @@ asyncio.run(main())
   assert.equal(out.stats.turns_sent, 1);
   assert.equal(out.stats.turns_missing_usage, 0);
 });
+
+// ── 보냈다 ≠ 실렸다(§11.2) ────────────────────────────────────────────────────
+// 선언 건수만 세면 카운터가 "근거 있는 턴"을 과대 보고한다 — 실을 자리가 없어 버려진 실측도
+// 선언된 턴으로 세기 때문이다. Core 는 그 판정을 응답에 돌려주므로 그대로 읽어 나눠 센다.
+
+test('§11.2 선언했는데 실리지 않은 실측·통화 구간을 선언 누락과 나눠 센다', b, () => {
+  // 참조 시나리오는 첫 발화에 상담사로 이관되며 그 턴에서 Core 세션이 끝난다 — 그 뒤에 온
+  // 턴·종료는 실제 운영의 "늦게 도착한 입력"과 같은 경로이고(전송 재시도 루프가 거기 몰린다),
+  // 훅 어댑터는 자기 쪽 `call.ended` 가 아직 False 라 그대로 보낸다.
+  const out = parse(runDriver(`${PRELUDE}
+h = hooks()
+h.on_call_start("call-A")
+first = h.on_transcript("call-A", "user", "상담사 연결해 주세요", usage={"stt_audio_ms": 2400})
+late = h.on_transcript("call-A", "user", "여보세요", usage={"stt_audio_ms": 300})
+ended = h.on_call_end("call-A", billable_ms=48000)
+dump(h,
+     first_attached=first.usage_attached if first else None,
+     late_attached=late.usage_attached if late else None,
+     late_reasons=late.billing_reasons_ko if late else None,
+     end_recorded=ended.billable_ms_recorded if ended else None)
+h.close()
+`));
+  assert.equal(out.first_attached, true, '실린 턴을 실리지 않았다고 읽으면 누락 건수가 부풀어 멀쩡한 집계를 의심하게 된다');
+  assert.equal(out.late_attached, false);
+  assert.ok(out.late_reasons.length > 0, 'Core 가 쓴 사유가 호스트에 닿지 않았다');
+  assert.equal(out.end_recorded, false, '이미 끝난 세션에 구간이 실렸다고 읽었다');
+  // 선언은 전부 했으므로 종전 카운터는 0 이다 — 그것만 보면 "근거 있는 턴 2건"으로 읽힌다.
+  assert.equal(out.stats.turns_missing_usage, 0);
+  assert.equal(out.stats.ends_missing_billable_ms, 0);
+  // 실제로 원장에 없는 것은 이쪽이다.
+  assert.equal(out.stats.turns_usage_unattached, 1, '실을 자리가 없어 버려진 실측을 세지 않았다');
+  assert.equal(out.stats.ends_billable_ms_unrecorded, 1, '버려진 통화 구간을 세지 않았다');
+  assert.equal(out.stats.turns_usage_dropped, 0);
+  assert.equal(out.stats.turns_sent, 2);
+});
+
+test('§11.2 집계에서 빠진 항목·판정 없음을 누락으로 세지 않는다(실패·경계 경로)', b, () => {
+  // 이중 출처·형태 위반은 실제 브리지로 한 번에 만들 수 없다(엔진 기동이 전제다).
+  // 판정은 응답을 읽는 일이므로 응답 모양으로 고정한다.
+  const out = parse(runDriver(`${PRELUDE}
+from aicc_bridge import BridgeResponse
+
+class Canned:
+    """턴마다 미리 정한 billing 을 돌려준다. 회선·엔진을 만지지 않는다."""
+    def __init__(self, billings):
+        self.billings = list(billings)
+        self.transcript = None
+        self.ends = 0
+    def hello(self): return BridgeResponse(id="1", ok=True, result={})
+    def start(self, **kw): return BridgeResponse(id="2", ok=True, result={"interactionId": "i1"})
+    def send_utterance(self, i, text, **kw):
+        body = {"interactionId": i}
+        billing = self.billings.pop(0)
+        if billing is not None:
+            body["billing"] = billing
+        return BridgeResponse(id="3", ok=True, result=body)
+    def end(self, i, reason, **kw):
+        self.ends += 1
+        return BridgeResponse(id="9", ok=True, result={"interactionId": i})
+    def close(self): pass
+
+c = Canned([
+    {"usageAttached": True, "usageConflicts": ["stt_audio_ms"]},   # 턴은 성공, 수량만 빠졌다
+    {"usageAttached": True, "usageRejected": ["channel.gpu_seconds"]},
+    None,                                                          # 판정 없음 — 누락이 아니다
+    {"usageAttached": "yes"},                                      # 형태 위반 — 모름이다
+])
+h = CallbotCoreHooks(lambda: c, flow_id="f", on_error=lambda code, m: errors.append(code))
+h.on_call_start("c1")
+for _ in range(4):
+    h.on_transcript("c1", "user", "네", usage={"stt_audio_ms": 100})
+h.on_call_end("c1", billable_ms=1000)
+json.dump({"stats": h.stats.as_dict(), "errors": errors, "ends": c.ends,
+           "degraded": h.degraded, "enabled": h.enabled, "reason": h.disabled_reason_ko,
+           "transcript": None}, sys.stdout, ensure_ascii=False)
+h.close()
+`));
+  assert.equal(out.stats.turns_sent, 4);
+  assert.equal(out.stats.turns_usage_dropped, 2, '턴은 성공이고 수량만 빠진 건을 세지 않으면 어디에서도 드러나지 않는다');
+  // 판정이 없는 응답·형태가 틀린 판정을 "실리지 않았다"로 세면 멀쩡한 턴이 누락으로 집계된다(§13-3).
+  assert.equal(out.stats.turns_usage_unattached, 0);
+  // 종료 판정이 없는 응답도 같다 — 선언했으니 누락 카운터도 올라가지 않는다.
+  assert.equal(out.stats.ends_billable_ms_unrecorded, 0);
+  assert.equal(out.stats.ends_missing_billable_ms, 0);
+  assert.equal(out.ends, 1);
+  assert.deepEqual(out.errors, []);
+  assert.equal(out.degraded, false);
+});

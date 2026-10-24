@@ -87,6 +87,46 @@ test('§11.2 토큰·STT·TTS 사용량은 turn.completed 실측에서만 집계
   assert.equal(agg.buckets[0].turnsMissingUsage, 1);
 });
 
+test('§11.2 합계가 모든 칸에서 버킷 합과 같다 — 한 칸만 빠져도 그 항목이 청구서에서 사라진다', b, () => {
+  // `totalQuantities` 가 칸마다 한 줄씩 손으로 적혀 있던 동안, 칸을 늘리고 그 줄을 빠뜨리면
+  // 버킷에는 수량이 있는데 합계는 0 이었다 — 예외도 경고도 없고 과소청구 방향이라 차단 판정에도
+  // 걸리지 않는다. 그래서 **목록 전체**를 돌며 대조한다(한 칸을 지정해 보는 검사로는 못 잡는다).
+  const full = Object.fromEntries(ev.USAGE_METRIC_KEYS.map((k, i) => [k, (i + 1) * 1000]));
+  const events = [
+    ev.turnCompleted(meta('e1'), { turnId: 't1', speaker: 'customer', utterance: '네', usage: full }),
+    ev.sessionEnded(meta('e2'), { outcome: 'AUTO_RESOLVED', turnCount: 1, durationMs: 90000, billableMs: 90000 }),
+    // 다른 날·다른 채널 → 버킷이 갈린다. 버킷이 하나면 합계가 틀려도 같은 값이 나온다.
+    ev.turnCompleted(meta('e3', { occurredAt: '2026-01-06T09:00:00.000Z', channel: 'chat', interactionId: 'i2' }),
+      { turnId: 't2', speaker: 'customer', utterance: '네', usage: full }),
+  ];
+  const agg = bl.aggregateUsage(events, { scope: { tenantId: 't1' }, granularity: 'day', rounding });
+  assert.ok(agg.buckets.length >= 2, '버킷이 갈리지 않아 합계 검사가 성립하지 않는다');
+  const t = bl.totalQuantities(agg);
+  for (const unit of bl.BILLABLE_UNITS) {
+    const sum = agg.buckets.reduce((acc, bk) => acc + bk.quantities[unit], 0);
+    assert.equal(t[unit], sum, `${unit} 합계가 버킷 합과 다르다 — 그 항목이 청구서에서 빠진다`);
+  }
+  // 파생이 말뿐이 아닌지: 실측을 선언한 항목의 수량은 전부 0 보다 커야 한다.
+  for (const [metric, route] of bl.METRIC_UNIT_ROUTES) {
+    assert.ok(t[route.to] > 0, `${metric} 실측이 ${route.to} 에 한 번도 도착하지 않았다`);
+  }
+});
+
+test('§11.2 실측 항목 하나의 형태가 틀려도 나머지 항목은 그대로 집계된다(실패 경로)', b, () => {
+  // 환산표 루프가 한 항목의 거부를 다른 항목으로 번지게 하면, 틀린 숫자 하나가 그 턴의 모든
+  // 수량을 지운다 — 과소청구 방향이라 조용하다.
+  const bad = { ...Object.fromEntries(ev.USAGE_METRIC_KEYS.map((k) => [k, 500])), stt_audio_ms: Number.NaN };
+  const agg = bl.aggregateUsage([
+    ev.turnCompleted(meta('e1'), { turnId: 't1', speaker: 'customer', utterance: '네', usage: bad }),
+  ], { scope: { tenantId: 't1' }, granularity: 'total', rounding });
+  const t = bl.totalQuantities(agg);
+  assert.equal(agg.buckets[0].usageValuesRejected, 1, '거부 건수가 항목 수와 어긋났다');
+  assert.equal(t.stt_seconds, 0, 'NaN 을 0 으로 보정해 "0 을 실측했다"로 적으면 안 된다');
+  assert.equal(t.llm_prompt_tokens, 500);
+  assert.equal(t.embedding_tokens, 500);
+  assert.equal(t.tts_seconds, 0.5);
+});
+
 test('§11.2 반올림 규칙은 주입된 계약 값을 따른다', b, () => {
   assert.equal(bl.applyRounding(61, { unitSeconds: 60, mode: 'ceil', minimumUnits: 0 }), 2);
   assert.equal(bl.applyRounding(61, { unitSeconds: 60, mode: 'floor', minimumUnits: 0 }), 1);

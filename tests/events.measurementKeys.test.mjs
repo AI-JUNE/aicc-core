@@ -45,6 +45,14 @@ function optionalFieldsOf(source, ifaceName) {
   return [...body.matchAll(/^\s{2}(\w+)\?:/gm)].map((m) => m[1]);
 }
 
+/** 소스에서 인터페이스의 **필수** 필드 이름을 뽑는다(과금 수량 칸은 전부 필수다). */
+function requiredFieldsOf(source, ifaceName) {
+  const start = source.indexOf(`export interface ${ifaceName} {`);
+  assert.notEqual(start, -1, `${ifaceName} 선언을 찾지 못했다`);
+  const body = source.slice(start, source.indexOf('\n}', start));
+  return [...body.matchAll(/^\s{2}(\w+): /gm)].map((m) => m[1]);
+}
+
 /** 소스에서 문자열 유니온 타입의 값을 뽑는다. */
 function unionValuesOf(source, typeName) {
   const re = new RegExp(`export type ${typeName} =([^;]+);`);
@@ -107,6 +115,28 @@ test('§11.2 과금 단위 목록이 집계 수량에서 파생된다 — 유니
   );
 });
 
+test('BILLABLE_UNITS 가 UsageQuantities 의 칸과 정확히 일치한다(§11.2)', b, () => {
+  // 합계·초기화·대사가 이 목록 하나에서 파생된다. 손으로 적은 사본이 하나라도 남아 있으면
+  // 칸이 늘어나는 날 **합계만 조용히 0** 이 되고, 합계가 곧 청구서 한 줄이다.
+  const declared = requiredFieldsOf(read('../src/billing/usage.ts'), 'UsageQuantities');
+  assert.deepEqual([...BL.BILLABLE_UNITS].sort(), declared.slice().sort());
+  assert.equal(declared.length, 8);
+});
+
+test('실측 항목 → 과금 수량 환산표가 UsageMetrics 를 빠짐없이 덮는다(§11.2·§6.2)', b, () => {
+  // 종전에는 턴 집계가 항목마다 한 줄씩 손으로 적혀 있었다 — 늘어난 항목을 그 줄에 적지 않으면
+  // 그 수량은 원장에만 있고 집계에는 한 번도 들어오지 않는다(예외도 경고도 없다).
+  assert.match(read('../src/billing/usage.ts'), /METRIC_UNIT_ROUTE_TABLE: Record<keyof UsageMetrics,/);
+  assert.deepEqual([...BL.METRIC_UNIT_ROUTES.keys()].sort(), [...S.USAGE_METRIC_KEYS].sort());
+  for (const [metric, route] of BL.METRIC_UNIT_ROUTES) {
+    assert.ok(BL.BILLABLE_UNITS.includes(route.to), `${metric} 가 없는 수량 칸(${route.to})으로 간다`);
+    assert.ok(route.perUnit > 0, `${metric} 의 환산 제수가 0 이하다 — 수량이 Infinity 가 된다`);
+  }
+  // ms → 초 환산이 실제로 그 두 항목에만 걸려 있는지(토큰을 1000 으로 나누면 조용한 과소청구다).
+  assert.equal(BL.METRIC_UNIT_ROUTES.get('stt_audio_ms').perUnit, 1000);
+  assert.equal(BL.METRIC_UNIT_ROUTES.get('llm_prompt_tokens').perUnit, 1);
+});
+
 // ── 2) 실패 경로: 소비처가 사본을 다시 만들면 잡는다 ────────────────────────
 
 test('소비처가 키 목록 전체를 다시 선언하지 않는다 — 사본이 생기면 실패한다', b, () => {
@@ -116,6 +146,7 @@ test('소비처가 키 목록 전체를 다시 선언하지 않는다 — 사본
     '../src/adapters/engineSet.ts',
     '../src/billing/turnUsage.ts',
     '../src/reports/aggregate.ts',
+    '../src/billing/usage.ts',
   ];
   // 주석(`//`·` * `)은 사본이 아니다 — 왜 한 곳인지 적어 둔 줄이므로 지운 뒤 본다.
   const stripComments = (s) => s.split('\n').filter((ln) => !/^\s*(\/\/|\*|\/\*)/.test(ln)).join('\n');

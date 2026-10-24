@@ -204,12 +204,71 @@ test('직전 턴의 usageAttached: true 가 늦은 입력의 답으로 새어 �
   assert.notEqual(r.billing.usageAttached, last.billing.usageAttached);
 });
 
-test('실측을 선언하지 않은 늦은 입력은 직전 결과 그대로다 — 종전과 완전히 같다(§13-3)', b, async () => {
+test('실측을 선언하지 않은 늦은 입력도 직전 턴의 과금 근거를 되풀이하지 않는다 — 상태만 그대로다', b, async () => {
+  // 선언이 **있는** 갈래는 이미 막혀 있었는데(바로 위 검사) 없는 갈래는 `lastResult` 를 통째로
+  // 돌려주어 직전 턴의 `usageAttached: true` 가 그대로 새어 나왔다 — 아무 실측도 싣지 않은
+  // 호출이 "실었다"고 답한 셈이다. 전송 계층의 재시도 루프가 이 경로로 몰리므로 그 거짓
+  // 진술은 임의의 횟수만큼 되풀이된다(§11.2). 상태(단계·세션)는 되풀이하는 것이 의도다.
   const { core, last } = await endedSession();
   const r = await core.send('i_fb1', { input: { kind: 'utterance', text: '여보세요' } });
-  assert.deepEqual(r.billing, last.billing);
+  assert.equal(last.billing.usageAttached, true);
+  assert.equal(r.billing, undefined, '선언이 없는 호출이 직전 턴의 과금 근거를 들고 돌아왔다');
   assert.deepEqual(r.events, []);
   assert.equal(r.status, last.status);
+  assert.deepEqual(r.state, last.state, '상태를 되풀이하지 않으면 채널이 마지막 안내를 못 렌더한다');
+  assert.deepEqual(r.steps, last.steps);
+});
+
+test('늦은 입력은 직전 턴의 전환 초대·고지·확정 동의를 다시 싣지 않는다(§5.2·§10.1·§8.1)', b, async () => {
+  // 이 경로들은 `lastResult` 를 그대로 돌려준다. 거기에는 상태가 아니라 **그 턴에 일어난 사실**을
+  // 적는 칸이 섞여 있어서, 되풀이하면 호스트가 한 번 일어난 일을 여러 번 수행·기록한다:
+  // 전환 링크 재발송(1회용 열쇠가 무의미해진다) · 고지 감사 근거 중복 · 같은 동의가 추가 전용
+  // 이력에 여러 번. 셋 다 예외가 아니고, 재시도 루프가 이 경로로 몰리므로 건수도 적지 않다.
+  const { core, last } = await endedSession();
+  const rec = core.sessions.get('i_fb1');
+  rec.lastResult = {
+    ...last,
+    disclosure: { channel: 'voice', placement: 'first_turn', configVersion: 3 },
+    consent: {
+      recorded: { purpose: 'recording', state: 'granted', policyVersion: 2 },
+      notRecordedKo: '적지 못한 사유',
+      pendingRequired: ['marketing'],
+    },
+    switchInvite: { fromChannel: 'voice', toChannel: 'visual', ticketIssued: true, expiresAt: NOW },
+  };
+  core.sessions.put(rec);
+
+  const late = await core.send('i_fb1', { input: { kind: 'utterance', text: '여보세요' } });
+  assert.equal(late.switchInvite, undefined, '끝난 통화의 늦은 입력마다 전환 링크를 다시 보내게 된다');
+  assert.equal(late.disclosure, undefined, '아무 고지도 나가지 않은 호출이 고지 근거를 들고 돌아왔다');
+  assert.equal(late.consent.recorded, undefined, '같은 동의가 이력에 여러 번 적힌다');
+  assert.equal(late.consent.notRecordedKo, undefined);
+  // **서 있는 값은 남는다** — 지금 미획득인 필수 목적은 그 동안 개인정보 조회가 막힌다는 뜻이고,
+  // 지우면 호스트는 막힌 이유를 알 길이 없다(§10.1).
+  assert.deepEqual(late.consent.pendingRequired, ['marketing']);
+
+  // 선언이 **있는** 갈래도 같은 규칙이다(그 갈래는 billing 만 바꿔 끼우고 나머지는 새고 있었다).
+  const declared = await core.send('i_fb1', { input: { kind: 'utterance', text: '여보세요' }, usage: { stt_audio_ms: 400 } });
+  assert.equal(declared.switchInvite, undefined);
+  assert.equal(declared.disclosure, undefined);
+  assert.equal(declared.consent.recorded, undefined);
+  assert.equal(declared.billing.usageAttached, false, '늦은 입력의 실측은 실리지 않는다(§8.1)');
+
+  // 이미 닫힌 세션에 end 를 다시 불러도 같다 — `close()`·예외 경로에서 실제로 일어난다.
+  const twice = await core.end('i_fb1', '한 번 더', { billableMs: 1000 });
+  assert.equal(twice.switchInvite, undefined);
+  assert.equal(twice.disclosure, undefined);
+  assert.equal(twice.consent.recorded, undefined);
+  assert.equal(twice.billing.billableMsRecorded, false);
+});
+
+test('동의에 서 있는 값이 없으면 칸 자체를 만들지 않는다 — 빈 객체는 "확인했는데 없음"으로 읽힌다(경계)', b, async () => {
+  const { core, last } = await endedSession();
+  const rec = core.sessions.get('i_fb1');
+  rec.lastResult = { ...last, consent: { recorded: { purpose: 'recording', state: 'denied', policyVersion: 1 } } };
+  core.sessions.put(rec);
+  const late = await core.send('i_fb1', { input: { kind: 'utterance', text: '여보세요' } });
+  assert.equal(late.consent, undefined, '빈 동의 객체가 실렸다 — 호스트는 그것을 "동의 판정 있음"으로 읽는다');
 });
 
 test('빈 사용량 객체도 선언이다 — 실을 수 없다는 사실을 돌려준다(조용히 버리지 않는다)', b, async () => {

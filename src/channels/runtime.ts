@@ -414,6 +414,44 @@ function withoutSwitchToken(result: ChannelTurnResult): ChannelTurnResult {
 }
 
 /**
+ * 끝난 세션에 **늦게 도착한 입력**에 되돌려줄 복사본에서, 직전 턴의 "이번 턴 사실"을 걷어낸다.
+ *
+ * 그 경로들(`send` 의 조기 반환·이미 닫힌 `end`)은 `lastResult` 를 그대로 돌려준다 — 상태와
+ * 단계를 되풀이하는 것은 의도다(채널이 마지막 안내를 다시 렌더할 수 있어야 한다). 그런데 턴
+ * 결과에는 **상태가 아니라 이번 호출에 일어난 사실**을 적는 칸이 섞여 있고, 그것을 되풀이하면
+ * 전부 거짓 진술이 된다. 하필 **전송 계층의 재시도 루프가 이 경로로 몰린다**(위 `send` 주석) —
+ * 즉 한 번 일어난 사실이 임의의 횟수만큼 다시 보고된다. 증상은 하나도 예외가 아니다:
+ *  - `switchInvite`(§5.2): 호스트는 전환 링크를 **다시 보낸다**. 1회용 토큰은 보관 복사본에서
+ *    이미 빠지므로(`withoutSwitchToken`) 그 재발송은 `tokenIncluded: false` 상태이고, 링크를
+ *    직접 만드는 호스트는 Interaction id 로 만들 수밖에 없다 — 1회용·만료·회수가 전부 무의미해진다.
+ *    같은 규칙이 **달리는 세션에는 이미 있었다**("전환이 없는 턴에는 실리지 않는다").
+ *  - `disclosure`(§10.1): 아무 고지도 나가지 않은 호출이 **고지 감사 근거**를 들고 돌아온다.
+ *    호스트가 그것으로 감사 기록을 남기면 "몇 번 고지했는가"가 재시도 횟수만큼 부풀고,
+ *    §7 점검에서 고지 누락을 찾을 때 그 중복이 먼저 보인다.
+ *  - `consent.recorded`(§10.1): 같은 동의가 **추가 전용 이력에 여러 번** 적힌다. 철회·보유기간
+ *    판정이 그 이력을 근거로 돌기 때문에 되풀이는 집계가 아니라 판정을 흔든다.
+ *  - `billing`(§11.2): 아무 실측도 싣지 않은 호출이 `usageAttached: true` 를 들고 돌아온다.
+ *    `send` 의 '선언이 있었던' 갈래는 이미 이 사고를 막아 두었는데(바로 아래 주석), **선언이
+ *    없던 갈래와 `end` 재호출은 그대로 새고 있었다** — 호스트가 응답의 과금 근거로 자기 장부를
+ *    쓰면 원장에 없는 수량이 장부에만 생긴다. 빠진 항목(`usageConflicts`·`usageRejected`)도
+ *    같이 되풀이돼, 한 번 일어난 이중 출처를 운영이 재시도마다 다시 쫓는다.
+ *
+ * **남기는 것은 상태다**: `state`·`steps`·`status`·`handoff`·`fallback` 은 세션에 서 있는 사실이고
+ * (되풀이해도 거짓이 아니다), `consent.pendingRequired` 도 지금 미획득인 목적이라 서 있는 값이다.
+ * `compliance` 는 세션 전체의 점검 요약이므로 남긴다 — 이번 턴의 사실이 아니다.
+ */
+function withoutTurnFacts(result: ChannelTurnResult): ChannelTurnResult {
+  const {
+    billing: _billing, disclosure: _disclosure, switchInvite: _invite, consent, ...standing
+  } = result;
+  if (consent === undefined) return standing;
+  // 확정 사실(`recorded`)과 그 사실을 적지 못한 사유만 뺀다 — 남는 것이 없으면 칸 자체를
+  // 만들지 않는다(빈 객체는 "확인했는데 아무것도 없음"으로 읽힌다).
+  const { recorded: _recorded, notRecordedKo: _notRecorded, ...standingConsent } = consent;
+  return Object.keys(standingConsent).length === 0 ? standing : { ...standing, consent: standingConsent };
+}
+
+/**
  * 인텐트 진입 배선(§5.1·§5.3·§2). **주지 않으면 종전과 완전히 같다**(§13-3) —
  * 채널은 시작할 시나리오 id 를 **이미 알고 있어야** 하고, 인텐트 진입 노드
  * (`INTENT_SLOT` 을 수집하는 Collect)는 평범한 Collect 로 동작한다.
@@ -3453,8 +3491,9 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       // 종료된 세션에 늦게 도착한 입력은 새 이벤트를 만들지 않는다(멱등, §8.1).
       // events를 비워 돌려준다 — 채널이 마지막 결과를 다시 발행해 중복 집계하는 경로를 막는다.
       if (rec.ended || rec.state.status !== 'running') {
-        // 실측을 선언하지 않았으면 **직전 턴의 결과 그대로**다(종전과 완전히 같다, §13-3).
-        if (turn.usage === undefined) return { ...rec.lastResult, events: [] };
+        // 실측을 선언하지 않았으면 **직전 턴의 상태 그대로**다 — 다만 그 턴에 일어난 사실
+        // (전환 초대·고지·확정 동의·과금 근거)은 싣지 않는다(`withoutTurnFacts` 주석).
+        if (turn.usage === undefined) return { ...withoutTurnFacts(rec.lastResult), events: [] };
         // 선언했으면 `billing` 을 그대로 돌려줄 수 없다. 그 필드는 "**이 호출의** 실측이 어디까지
         // 실렸는가"인데, 직전 턴의 `usageAttached: true` 를 그대로 되돌려주면 호스트는 방금
         // 보낸 실측이 원장에 들어갔다고 읽는다 — 들어가지 않았고, 그 차이는 예외가 아니라
@@ -3462,7 +3501,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
         // 몰리므로 건수도 적지 않다. 종료된 세션에 `turn.completed` 를 뒤늦게 만들지는 않는다
         // (추가 전용, §8.1) — `end()` 가 늦은 `billableMs` 를 다루는 방식과 같은 규칙이다.
         return {
-          ...rec.lastResult,
+          ...withoutTurnFacts(rec.lastResult),
           events: [],
           billing: {
             usageAttached: false,
@@ -3565,7 +3604,10 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
           billableMsReasonKo: '세션이 이미 종료돼 session.ended 에 통화 구간을 실을 수 없었습니다 '
             + '(추가 전용 이벤트는 뒤늦게 고치지 않습니다, §8.1) — 이 통화는 통화 분 집계에서 빠집니다(§11.2).',
         };
-        return { ...rec.lastResult, events: [], ...(note !== undefined ? { billing: note } : {}) };
+        // 상태는 되풀이하고 **직전 턴의 사실은 되풀이하지 않는다**(`withoutTurnFacts` 주석).
+        // 두 번째 `end` 는 `close()`·예외 경로에서 실제로 일어나므로, 전환 링크·고지 근거·확정
+        // 동의를 다시 실으면 그 호스트는 한 번 일어난 일을 두 번 수행·기록한다.
+        return { ...withoutTurnFacts(rec.lastResult), events: [], ...(note !== undefined ? { billing: note } : {}) };
       }
 
       // §4.1 — 목표 미달 상태에서 고객이 끊으면 자동완결이 아니다.

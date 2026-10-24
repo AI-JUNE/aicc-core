@@ -6,7 +6,7 @@
 //  1) 중복 이벤트가 두 번 세어짐        → §8.1 멱등 키로 먼저 dedupe 한 뒤 집계한다.
 //  2) 올림/버림 규칙이 서로 다름        → 반올림 규칙을 코드에 박지 않고 호출자(계약)가 주입한다(§13-3).
 //  3) 근거 없는 추정치가 섞임           → 실측이 없는 세션은 세지 않고 '누락'으로 따로 보고한다.
-import type { InteractionEvent, SessionEndedEvent, TurnCompletedEvent } from '../events/schema.ts';
+import type { InteractionEvent, SessionEndedEvent, TurnCompletedEvent, UsageMetrics } from '../events/schema.ts';
 import { dedupeEvents } from '../events/bus.ts';
 import { assertTenantScope, type TenantScope } from '../core/tenancy.ts';
 import type { ChannelKind } from '../domain/types.ts';
@@ -115,17 +115,58 @@ export interface UsageAggregate {
   buckets: UsageBucket[];
 }
 
+/**
+ * 과금 수량 칸의 **유일한 목록**. 초기화·합계·대사가 전부 이 하나에서 파생된다(§2).
+ *
+ * 종전에 이 목록은 세 곳에 손으로 적혀 있었고(초기화 객체·합계 루프·대사 단위 유니온), 그중
+ * **합계만 조용했다**: 칸을 하나 늘리면 초기화 객체는 타입이 모자라 컴파일 오류가 되지만
+ * `totalQuantities` 는 그 칸을 더하는 줄이 없어도 **그냥 통과한다**. 결과는 버킷에는 수량이
+ * 있는데 합계는 0 이고, 합계가 곧 청구서 한 줄이라 **그 항목이 통째로 빠진 청구서**가 나간다 —
+ * 과소청구 방향이라 과다청구 차단(`blocked`)에도 걸리지 않고, 대사에서는 명세에만 있는
+ * 수량이 되어 '미설명'으로만 보인다(§11.2·§13-3).
+ */
+const QUANTITY_KEY_TUPLE = [
+  'voice_seconds', 'voice_units', 'sessions',
+  'llm_prompt_tokens', 'llm_completion_tokens', 'stt_seconds', 'tts_seconds', 'embedding_tokens',
+] as const;
+
+/** 빠뜨린 칸이 있으면 이 대입이 컴파일 오류가 된다(목록이 하나여도 오타·누락은 막아야 한다). */
+const _quantityKeysCover: Exclude<BillableUnit, typeof QUANTITY_KEY_TUPLE[number]> extends never
+  ? true : never = true;
+void _quantityKeysCover;
+
+/** 과금 수량 칸 전체. 외부 명세를 만드는 쪽도 이 목록을 보고 선언한다. */
+export const BILLABLE_UNITS: readonly BillableUnit[] = QUANTITY_KEY_TUPLE;
+
+/**
+ * §11.2 실측 항목(`UsageMetrics`) → 과금 수량 칸 + 환산 제수.
+ *
+ * `Record<keyof UsageMetrics, …>` 인 것이 핵심이다 — 실측 항목이 하나 늘면 **이 표가 컴파일
+ * 오류**가 된다. 종전에는 턴 집계가 항목마다 한 줄씩 손으로 적혀 있어서, 늘어난 항목을 그
+ * 자리에 적지 않으면 그 수량은 원장에만 있고 집계에는 **한 번도 들어오지 않는다**(어제 늘어난
+ * `embedding_tokens` 가 바로 그 모양이었다). 예외도 경고도 없다.
+ *
+ * `perUnit` 은 실측 단위 → 수량 단위 제수다(ms → 초는 1000). 1 이면 그대로 더한다.
+ * **반올림하지 않는다** — 통화 반올림은 계약 규칙이 따로 있고(`applyRounding`), 여기서
+ * 임의로 깎으면 그 값이 곧 정책이 된다(§13-3).
+ */
+const METRIC_UNIT_ROUTE_TABLE: Record<keyof UsageMetrics, { to: BillableUnit; perUnit: number }> = {
+  llm_prompt_tokens: { to: 'llm_prompt_tokens', perUnit: 1 },
+  llm_completion_tokens: { to: 'llm_completion_tokens', perUnit: 1 },
+  stt_audio_ms: { to: 'stt_seconds', perUnit: 1000 },
+  tts_audio_ms: { to: 'tts_seconds', perUnit: 1000 },
+  embedding_tokens: { to: 'embedding_tokens', perUnit: 1 },
+};
+
+/** 환산표(읽기 전용 투영). 검사·문서가 같은 표를 본다 — 사본을 만들지 않는다(§2). */
+export const METRIC_UNIT_ROUTES: ReadonlyMap<keyof UsageMetrics, { to: BillableUnit; perUnit: number }> =
+  new Map(Object.entries(METRIC_UNIT_ROUTE_TABLE) as [keyof UsageMetrics, { to: BillableUnit; perUnit: number }][]);
+
 function emptyQuantities(): UsageQuantities {
-  return {
-    voice_seconds: 0,
-    voice_units: 0,
-    sessions: 0,
-    llm_prompt_tokens: 0,
-    llm_completion_tokens: 0,
-    stt_seconds: 0,
-    tts_seconds: 0,
-    embedding_tokens: 0,
-  };
+  // 칸을 손으로 다시 적지 않는다 — 목록은 `QUANTITY_KEY_TUPLE` 하나다.
+  const q = {} as UsageQuantities;
+  for (const k of BILLABLE_UNITS) q[k] = 0;
+  return q;
 }
 
 function newBucket(tenantId: string, bucket: string, channel: ChannelKind): UsageBucket {
@@ -214,11 +255,11 @@ export function aggregateUsage(events: InteractionEvent[], opts: AggregateOption
         }
         return v;
       };
-      b.quantities.llm_prompt_tokens += take(u.llm_prompt_tokens);
-      b.quantities.llm_completion_tokens += take(u.llm_completion_tokens);
-      b.quantities.stt_seconds += take(u.stt_audio_ms) / 1000;
-      b.quantities.tts_seconds += take(u.tts_audio_ms) / 1000;
-      b.quantities.embedding_tokens += take(u.embedding_tokens);
+      // 항목마다 한 줄씩 적지 않는다 — 환산표(`METRIC_UNIT_ROUTE_TABLE`) 하나에서 돈다.
+      // 없는 값은 `take` 가 0 으로 돌려주므로 선언하지 않은 항목이 거부로 세어지지 않는다.
+      for (const [metric, route] of METRIC_UNIT_ROUTES) {
+        b.quantities[route.to] += take(u[metric]) / route.perUnit;
+      }
     }
   }
 
@@ -237,18 +278,16 @@ export function aggregateUsage(events: InteractionEvent[], opts: AggregateOption
   };
 }
 
-/** 버킷 합계 — 청구서 한 줄에 대응하는 값. */
+/**
+ * 버킷 합계 — 청구서 한 줄에 대응하는 값.
+ *
+ * 칸 목록을 손으로 적지 않는다(`QUANTITY_KEY_TUPLE` 주석) — 여기서 한 칸을 빠뜨리면
+ * 버킷에는 있는 수량이 합계에서 0 이 되고, 그 상태는 어디에서도 예외가 아니다.
+ */
 export function totalQuantities(agg: UsageAggregate): UsageQuantities {
   const t = emptyQuantities();
   for (const b of agg.buckets) {
-    t.voice_seconds += b.quantities.voice_seconds;
-    t.voice_units += b.quantities.voice_units;
-    t.sessions += b.quantities.sessions;
-    t.llm_prompt_tokens += b.quantities.llm_prompt_tokens;
-    t.llm_completion_tokens += b.quantities.llm_completion_tokens;
-    t.stt_seconds += b.quantities.stt_seconds;
-    t.tts_seconds += b.quantities.tts_seconds;
-    t.embedding_tokens += b.quantities.embedding_tokens;
+    for (const k of BILLABLE_UNITS) t[k] += b.quantities[k];
   }
   return t;
 }

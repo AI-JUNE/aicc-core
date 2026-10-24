@@ -44,6 +44,12 @@ agent.py 에 넣을 것은 훅마다 한 줄이다(이 파일은 agent.py 를 im
    청구를 막지도 않고, 공급사 청구서와의 차이는 몇 주 뒤 대사에서 '미설명'으로만 나타난다(§11.2).
    **추정하지 않는다**(§13-3): 회선이 주지 않으면 싣지 않고, 선언 없이 보낸 턴을
    `stats.turns_missing_usage` 로 센다 — 세지 않으면 "근거 없는 턴"이 몇 건인지 모르는 채 월말이 온다.
+6-2. **보낸 것을 들어간 것으로 세지 않는다(§11.2).** 선언 건수만 세면 카운터가 "근거 있는 턴"을
+   **과대 보고**한다 — 실을 자리가 없어 버려진 실측(장애 폴백으로 조기 종료된 턴·커넥터 재개 턴·
+   이미 실측이 실린 턴·두 번째 end)도 선언된 턴으로 세기 때문이다. Core 가 응답에 그 판정을
+   돌려주므로(`billing`) 그대로 읽어 `turns_usage_unattached`·`turns_usage_dropped`·
+   `ends_billable_ms_unrecorded` 로 **나눠 센다**. 합쳐 세면 "회선이 값을 주지 않았다"와
+   "준 값이 버려졌다"가 같은 숫자가 되는데, 둘의 고칠 곳은 서로 다른 저장소다.
 7. **한도 초과는 장애가 아니다(§9.3).** `E_RATE_LIMITED` 를 브리지 사망과 같게 다루면 통화 전체가
    Core 를 잃는다. 대신 브리지가 준 `retryAfterMs` 동안 **그 통화의 턴만** 보내지 않는다.
    대기 시간을 주지 않았으면 대기하지 않는다(없는 근거를 만들지 않는다, §13-3).
@@ -101,6 +107,19 @@ class HookStats:
     #: §11.2 턴 단위 실측(`usage`)을 선언하지 않고 보낸 턴 수. 통화 구간과 같은 이유로 센다 —
     #: 그 턴의 STT·TTS·LLM 수량은 원장에 없고 공급사 청구서에만 남는다.
     turns_missing_usage: int = 0
+    #: 실측이 **있었는데 원장에 실리지 않은** 턴 수(Core 판정 `billing.usageAttached == False`).
+    #: 위의 `turns_missing_usage` 와 전혀 다른 숫자다 — 그쪽은 "우리가 선언하지 않았다"이고
+    #: 이쪽은 "선언했는데 Core 에 실을 자리가 없었다"다. 둘을 합쳐 세면 "선언만 하면 집계된다"는
+    #: 거짓 안심이 남는다: 장애 폴백으로 조기 종료된 턴·커넥터 재개 턴에는 고객 발화 이벤트가
+    #: 없어 실측을 실을 자리가 애초에 없다(§9.3·§11.2). 사유는 응답의 `billing_reasons_ko` 에 있다.
+    turns_usage_unattached: int = 0
+    #: 집계에서 빠진 사용량 **항목**이 하나라도 있던 턴 수(이중 출처·실측으로 볼 수 없는 값).
+    #: 턴 자체는 성공이고 수량만 빠지므로, 세지 않으면 어디에서도 드러나지 않는다.
+    turns_usage_dropped: int = 0
+    #: §11.2 통화 구간을 **선언했는데 실리지 않은** 종료 수(`billing.billableMsRecorded == False`).
+    #: `ends_missing_billable_ms`(선언 자체가 없음)와 나눠 센다 — 합치면 "회선이 값을 주지 않았다"와
+    #: "준 값이 버려졌다"가 같은 숫자가 되고, 둘의 고칠 곳은 서로 다른 저장소다.
+    ends_billable_ms_unrecorded: int = 0
 
     def as_dict(self) -> Dict[str, int]:
         return dict(self.__dict__)
@@ -360,6 +379,11 @@ class CallbotCoreHooks:
             )
             if res is not None:
                 self.stats.calls_ended += 1
+                # 선언한 구간이 실제로 `session.ended` 에 실렸는지는 Core 가 판정한다 —
+                # 가장 흔한 False 는 이미 닫힌 세션을 다시 닫은 경우이고(멱등하게 받되 구간은
+                # 싣지 않는다) 그 통화는 통화 분 집계에서 빠진다. 선언 없음(None)과 구분해 센다.
+                if res.billable_ms_recorded is False:
+                    self.stats.ends_billable_ms_unrecorded += 1
             return res
 
     def close(self) -> None:
@@ -469,6 +493,13 @@ class CallbotCoreHooks:
                 # 같은 이유로 센다 — 그 턴의 엔진 비용은 원장에 없고 청구서에만 남는다.
                 if not usage_declared:
                     self.stats.turns_missing_usage += 1
+                # **보냈다와 실렸다는 다른 질문이다**(§11.2). 선언 건수만 세던 동안 이 어댑터의
+                # 카운터는 "근거 있는 턴"을 과대 보고했다 — 실을 자리가 없어 버려진 실측도
+                # 선언된 턴으로 세었기 때문이다. Core 의 판정을 그대로 읽는다(지어내지 않는다).
+                if res.usage_attached is False:
+                    self.stats.turns_usage_unattached += 1
+                if res.billing_dropped_units:
+                    self.stats.turns_usage_dropped += 1
                 if self._on_turn is not None:
                     try:
                         self._on_turn(call_id, res.result)
