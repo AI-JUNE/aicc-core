@@ -3476,6 +3476,81 @@
         실패, 원본에서는 통과한다. 실수집기 전송 없음(인메모리 transport 로만 검증).
         근거: `src/obs/logger.ts`(`normalizeDeniedFieldKey` 공개) · `src/obs/errorMonitor.ts`(사본 제거) ·
         `tests/obs.errorMonitor.test.mjs`(1건) · `API.md` 반영
+      · Core 측 완료(78): **임베딩 토큰이 실릴 칸이 없어, 읽는 코드가 한 줄도 없었다(2026-10-24, 1)** —
+        OpenAI 호환 어댑터의 머리말이 직접 적어 두었다: "임베딩 사용량은 UsageMetrics 에 자리가
+        없어 기록하지 않는다 … 자리가 생기기 전까지는 비워 둔다". 그 상태가 그대로 성립해 있었다 —
+        `embeddings` 응답에는 `usage.prompt_tokens` 가 실려 오는데 **읽는 코드가 저장소에 0줄**이고,
+        중립 JSON 규약(`parseEmbeddingResponse`)도 벡터만 돌려주었다. 결과는 예외가 아니다: §5.2
+        RAG 색인·질의의 토큰은 **공급사 청구서에만** 남고 §8.1 원장에는 한 줄도 없으며, 몇 주 뒤
+        §11.2 대사에서 '미설명' 차이로 돌아온다. 그 방향이 과소청구라 과다청구 차단(`blocked`)에도
+        걸리지 않아, 아무도 눈여겨보지 않으면 영원히 그대로다.
+        - **칸을 LLM 과 따로 둔다**(`UsageMetrics.embedding_tokens`). 섞어 넣으면 대사는 "둘 다 맞지
+          않는다"까지만 말할 수 있다 — 두 모델은 단가가 다르고 공급사 리포트도 따로 나온다.
+          입력/출력으로 나누지도 않는다: 임베딩은 출력 토큰이 없고, 없는 칸을 0 으로 채우면
+          "0 을 실측했다"가 된다(§13-3).
+        - **환산은 규격 어댑터가 한다**(§6.2). `toUsageMetrics` 는 `prompt_tokens` 를
+          `llm_prompt_tokens` 로 읽는데 임베딩 응답도 **같은 이름을 쓴다** — 그대로 통과시키면
+          임베딩 토큰이 LLM 칸에 쌓인다. 그래서 `openaiCompat` 안에 전용 환산을 두고,
+          `prompt_tokens`(없으면 `total_tokens`)만 본다. 음수·소수·숫자 아님은 **만들지 않는다**.
+        - **파서가 벡터와 실측을 함께 돌려준다**(`parseLlmResponse`·`parseChatCompletion` 과 같은
+          모양). 사용량을 따로 뽑는 함수를 두면 그것이 곧 "부르지 않으면 사라지는 자리"가 되고,
+          사라진 실측은 예외 없이 과소청구로만 나타난다. 벡터 검증이 먼저다 — 실측이 멀쩡해도
+          어긋난 벡터는 색인에 들어가지 않는다(§5.2).
+        - **`lastUsage` 는 조각당 한 칸 그대로다**(stt·tts·llm 과 같은 변수). 임베딩만 칸을 따로
+          두면 임베딩을 부르지 않은 턴이 **직전 턴의 토큰을 한 번 더** 싣는다 — 그 이중 계상은
+          과다청구 방향의 그럴듯한 숫자다. 한 턴에 둘 다 불러 앞 호출이 덮인 경우는 런타임이
+          호출 횟수로 세어 사실대로 적는다(종전 (31) 의 규칙을 그대로 쓴다).
+        - **목록은 늘리지 않아도 따라온다**: `USAGE_METRIC_KEYS` 하나에서 브리지 검증·엔진셋
+          수집·턴 귀속이 파생되므로, 칸 하나를 더하면 비-Node 호스트도 같은 날 그 키를 보낼 수
+          있다(사본 구조였다면 브리지만 모르는 동안 **그 턴 전체가 거부**됐다).
+        **변이 검증(도구 출력 그대로)**: 목록에서 키를 빼면 2건 실패 · 정수 검사에서 빼면 1건 실패 ·
+        `embed` 가 `lastUsage` 를 채우지 않으면 2건 실패 · 사용량 환산의 음수/소수 거부를 풀면
+        1건 실패 — 전부 원본에서는 통과한다. 실호출 없음(가짜 fetch 로만 검증).
+        실엔진 연결은 여전히 **[승인 필요]**.
+        **남은 것은 사람이 정하는 값이다**: 임베딩 단가와 허용 오차(`Tolerance`)는 계약 값이고,
+        공급사 임베딩 리포트를 `ExternalStatement` 로 넣는 일은 운영 절차다(§13-3).
+        근거: `src/events/schema.ts`(`embedding_tokens`·`USAGE_METRIC_KEY_TUPLE`) ·
+        `src/billing/usage.ts`(집계·합계·대사) · `src/billing/turnUsage.ts`(정수 검사) ·
+        `src/adapters/http.ts`(`toUsageMetrics`·`parseEmbeddingResponse`·`lastUsage`) ·
+        `src/adapters/openaiCompat.ts`(`parseEmbeddings`·전용 환산) ·
+        `tests/adapters.openaiCompat.test.mjs`(1건 추가) · `tests/adapters.http.test.mjs`(2건 추가) ·
+        `tests/billing.usage.test.mjs`(2건 추가) · `tests/channels.runtime.engineUsage.test.mjs`(2건 추가) ·
+        `tests/events.measurementKeys.test.mjs`(1건 추가) · `API.md` 반영
+      · Core 측 완료(79): **과금 단위 목록과 집계 수량이 두 벌이었다(2026-10-24, 2)** —
+        `BillableUnit`(유니온 7개)과 `UsageQuantities`(필드 7개)가 같은 목록을 손으로 두 번 적고
+        있었고, `reconcile` 은 둘을 `as keyof UsageQuantities` 로 이어 붙여 어긋남을 가렸다.
+        어긋나는 날의 결말이 양쪽 다 조용하다 — **수량만 늘면** 외부 명세가 그 단위를 선언할 수
+        없어 대조 줄이 **아예 생기지 않는다**(불일치가 아니라 무언 — 한 번도 검증되지 않은 채
+        청구로 나간다). **유니온만 늘면** `core` 가 `undefined` 라 `diff` 가 NaN 이 되고, NaN 비교는
+        언제나 거짓이라 그 버킷이 통째로 `mismatch` 로 떨어진다.
+        `BillableUnit = keyof UsageQuantities` 로 파생시켰다 — (78)의 `embedding_tokens` 가 양쪽에
+        동시에 서는 것이 그 파생이 말뿐이 아니라는 증거다(값으로도 검사에 고정했다).
+        **변이 검증(도구 출력 그대로)**: 유니온을 손으로 적은 사본으로 되돌리면 1건 실패,
+        원본에서는 통과한다.
+        근거: `src/billing/usage.ts`(`BillableUnit`·`UsageQuantities` 주석) ·
+        `tests/events.measurementKeys.test.mjs`(1건) · `API.md` 반영
+      · Core 측 완료(80): **큐 배정 판정을 읽을 자리가 참조 클라이언트에 없었다(2026-10-24, 3)** —
+        계약(`ChannelTurnResult.handoff.placement`)과 브리지 투영(`BridgePlacementPayload`)이 둘 다
+        "`placement !== 'queued'` 면 큐에 사람이 들어가지 않았으니 **상담사 연결 안내를 해서는 안
+        된다**"고 적어 두었는데, 파이썬 참조 클라이언트에는 그 값을 읽는 접근자가 없었다. 호스트는
+        `result["handoff"]["placement"]["placement"]` 를 손으로 파야 했고(이 저장소의 종전 검사가
+        바로 그 모양이다), 저장소 셋이 각자 파면 각자 다르게 판다(§2).
+        가장 흔한 오답은 `handoff["queue"]` 만 보는 것이다 — 대안(콜백·음성사서함·기존 IVR)으로 간
+        건은 **놓을 큐 id 를 아예 들고 있지 않아** `queue` 가 비고, 그 모양은 "큐를 선언하지 않은
+        이관"과 똑같다. 음성이 바로 그 대안이 선언되는 채널이고 그 호스트가 파이썬이다. 증상은
+        예외도 오류 응답도 아니다 — 고객은 오지 않는 상담사를 기다리다 끊는다.
+        **`queued` 는 세 값이다**(`True`·`False`·`None`). 라우팅이 배선되지 않은 테넌트에는 판정
+        자체가 없는데 그것을 `False` 로 적으면 종전까지 되던 이관 안내가 **그 테넌트 전체에서**
+        사라지고, `True` 로 적으면 오지 않는 상담사를 안내한다 — 둘 다 조용하다(§13-3). 모르는
+        판정 문자열(새 종류가 생긴 날)도 `True` 로 읽지 않는다.
+        §9.3 장애 폴백 판정(`fallback`)도 함께 열었다 — Node 호스트는 `port.routeToLegacyIvr`·
+        `port.transfer`·`port.end` 로 같은 지시를 받지만 비-Node 호스트에는 그 자리가 없어,
+        회선을 내릴지 상담사로 넘길지를 아는 경로가 이 값 하나다.
+        **변이 검증(도구 출력 그대로)**: 미배선을 `False` 로 돌려주게 하면 2건 실패(정상 경로의
+        "이관 없는 턴"과 경계 경로가 동시에 깨진다), 원본에서는 통과한다. 실회선 없음
+        (브리지 dry_run·예시 시나리오로만 검증).
+        근거: `clients/python/aicc_bridge.py`(`queued`·`handoff_action`·`handoff_placement`·
+        `handoff`·`fallback`) · `tests/clients.python.test.mjs`(2건 추가) · `API.md` 반영
       · 남은 것: **Callbot 저장소 쪽 배선** — 코드는 훅마다 한 줄(README 참조)이며 더 쓸 것이 없다.
         남은 것은 저장소 결정 사항이다: 현행 LLM 툴(welfare_apply 등)과 Core 시나리오의 역할 분담
         (어느 쪽이 화면 노드를 밀 것인가)·실운영 Core 모듈·Flow id 를 **사람이 정해야 한다**,
@@ -3485,10 +3560,10 @@
         답변 지시문·청킹 설정은 테넌트 값이고, 문서 단위 청크 삭제 수단(`removeChunks`)은 **벡터 DB 선정
         후** 호스트가 붙인다(없으면 개정 전 청크가 남는다는 사실이 색인 결과에 드러난다),
         챗봇·D-ARS CI 게이트 활성화를 위한 `AICC_CORE_TOKEN` 등록 **[승인 필요]**, 실회선·실메신저 연결 **[승인 필요]**,
-        **참조 클라이언트 복사본 재동기화(2026-10-03 발생 · 2026-10-23 갱신 2)** — (27)·(56)·(62)·(72)·
-        (73)·(76)이 `clients/python/aicc_bridge.py`·`aicc_callbot.py` 를 고쳤으므로 Callbot 저장소의
+        **참조 클라이언트 복사본 재동기화(2026-10-03 발생 · 2026-10-24 갱신 3)** — (27)·(56)·(62)·(72)·
+        (73)·(76)·(80)이 `clients/python/aicc_bridge.py`·`aicc_callbot.py` 를 고쳤으므로 Callbot 저장소의
         `voice-agent/aicc/` 복사본은 낡았다
-        (지문: `aicc_bridge.py` → `c750980e2c94`, `aicc_callbot.py` → `0ca706510f2a`). 자동 개발 세션의
+        (지문: `aicc_bridge.py` → `6274c27e0739`, `aicc_callbot.py` → `0ca706510f2a`). 자동 개발 세션의
         작업 디렉터리 제한으로 그 저장소를 고칠 수 없어 **사람이 복사한다** — 복사 전까지는
         `node scripts/client-drift.mjs --source clients/python --target <callbot>/voice-agent/aicc
         --files aicc_bridge.py,aicc_callbot.py` 가 '다름'으로 실패하는 것이 정상이다(게이트가 바로 이
@@ -3497,10 +3572,13 @@
         선언할 방법이 없고, Api 대기(§6.1)에 결과를 되돌려줄 방법도 없으며, (62)로 열린
         **유지 루프 여섯 개**(만료 수렴·복구 확인·readiness·상담사 응답·계약 경고·관측 실측)를 부를
         방법도 없는 상태가 유지된다 — 그 상태에서는 Core 쪽 배선을 켜도 호스트가 한 번도 부르지 않는다.
-        **(73)·(76) 이후로 둘이 더 늘었다**: 인식기의 no-match 를 미인식으로 올릴 자리
+        **(73)·(76)·(80) 이후로 셋이 더 늘었다**: 인식기의 no-match 를 미인식으로 올릴 자리
         (`on_unrecognized`)가 없어 그 턴을 발화로 올리면 **슬롯 값으로 저장된 채** 흐름이 넘어가고
         (§5.1 — 예외도 재프롬프트도 없다), §5.2 전환 토큰 노출(`include_switch_ticket`)을 켤 수 없어
-        링크를 만들려면 Interaction id 를 쓸 수밖에 없다(1회용·만료·회수가 무의미해진다, §10.3).
+        링크를 만들려면 Interaction id 를 쓸 수밖에 없고(1회용·만료·회수가 무의미해진다, §10.3),
+        §9.3 큐 배정 판정(`queued`·`handoff_action`)을 읽을 자리가 없어 **큐에 못 들어간 고객에게
+        상담사 연결을 안내**하게 된다(대안으로 간 건은 `queue` 가 비어 "큐 선언 없는 이관"과 같은
+        모양이고, 고객은 오지 않는 상담사를 기다리다 끊는다).
         복사본이 낡은 채로 호스트가 실측을 선언하면 그 턴은 **TypeError 로 실패해 `degraded` 로
         드러난다**(조용히 사라지지 않는다 — (56) 검사가 그 모양을 고정한다),
         **동의 배선의 테넌트 값(2026-10-04 추가)** — (28)로 경로는 열렸지만 켜는 데 필요한 것은

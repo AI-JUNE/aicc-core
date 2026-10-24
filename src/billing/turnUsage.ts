@@ -32,7 +32,9 @@ import { USAGE_METRIC_KEYS } from '../events/schema.ts';
 export const USAGE_UNITS: readonly (keyof UsageMetrics)[] = USAGE_METRIC_KEYS;
 
 /** 개수로만 성립하는 항목 — 소수 토큰은 실측이 아니라 환산 실수의 신호다. */
-const COUNT_UNITS: readonly (keyof UsageMetrics)[] = ['llm_prompt_tokens', 'llm_completion_tokens'];
+const COUNT_UNITS: readonly (keyof UsageMetrics)[] = [
+  'llm_prompt_tokens', 'llm_completion_tokens', 'embedding_tokens',
+];
 
 /** 한 턴에 실측을 내놓은 출처. `origin` 은 분쟁 추적용 이름이며 개인정보를 담지 않는다. */
 export interface UsageContribution {

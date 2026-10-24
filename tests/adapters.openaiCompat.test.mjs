@@ -195,7 +195,7 @@ test('응답 지연은 E_TIMEOUT 으로 끝난다(무한 대기 없음)', b, asy
 
 // ── 임베딩 ─────────────────────────────────────────────────────────────────────
 
-test('임베딩: 규격 요청·index 로 순서 복원·사용량은 기록하지 않는다', b, async () => {
+test('임베딩: 규격 요청·index 로 순서 복원·토큰은 임베딩 칸에 기록한다(§11.2)', b, async () => {
   const f = fakeFetch(() => jsonRes({
     object: 'list',
     data: [
@@ -213,7 +213,29 @@ test('임베딩: 규격 요청·index 로 순서 복원·사용량은 기록하�
   assert.equal(body.encoding_format, 'float');
   assert.equal(body.input.length, 2);
   assert.equal(JSON.stringify(body).includes('010-1234-5678'), false);   // §10.3
-  assert.equal(e.lastUsage(), undefined);   // 임베딩 토큰을 LLM 칸에 섞지 않는다(§11.2)
+  // 자리가 없던 동안 이 9 토큰은 공급사 청구서에만 남고 §8.1 원장에는 0줄이었다 — 방향이
+  // 과소청구라 과다청구 차단에도 걸리지 않아 대사에서 '미설명'으로만 돌아왔다(§11.2).
+  assert.deepEqual(e.lastUsage(), { embedding_tokens: 9 });
+  // LLM 칸에는 섞지 않는다 — 단가도 공급사 리포트도 따로다.
+  assert.equal(e.lastUsage().llm_prompt_tokens, undefined);
+});
+
+test('임베딩 사용량 실패 경로: 실측으로 볼 수 없는 값은 만들지 않는다(§13-3)', b, async () => {
+  const run = async (usage) => {
+    const f = fakeFetch(() => jsonRes({ data: [{ index: 0, embedding: [0.1] }], ...(usage === undefined ? {} : { usage }) }));
+    const e = m.createOpenAiCompatEngines({ ...LIVE, fetchImpl: f });
+    await e.embedding.embed(['가']);
+    return e.lastUsage();
+  };
+  assert.equal(await run(undefined), undefined, 'usage 가 없으면 0 으로 채우지 않는다');
+  assert.equal(await run({}), undefined);
+  assert.equal(await run({ prompt_tokens: -1 }), undefined, '음수는 실측이 아니다');
+  assert.equal(await run({ prompt_tokens: 1.5 }), undefined, '소수 토큰은 환산 실수의 신호다');
+  assert.equal(await run({ prompt_tokens: 'nine' }), undefined);
+  // prompt_tokens 가 없는 규격은 total_tokens 로 되돌린다(값 자체는 같다).
+  assert.deepEqual(await run({ total_tokens: 12 }), { embedding_tokens: 12 });
+  // 못 쓰는 prompt_tokens 가 total_tokens 를 가리지 않는다.
+  assert.deepEqual(await run({ prompt_tokens: null, total_tokens: 7 }), { embedding_tokens: 7 });
 });
 
 test('임베딩 실패 경로: 개수·index 중복/범위·차원·숫자 위반은 전부 E_PROTOCOL', b, () => {
@@ -229,7 +251,9 @@ test('임베딩 실패 경로: 개수·index 중복/범위·차원·숫자 위�
   for (const raw of bad) {
     assert.throws(() => m.parseEmbeddings(raw, 2), (err) => err.code === 'E_PROTOCOL', JSON.stringify(raw));
   }
-  assert.deepEqual(m.parseEmbeddings({ data: [{ index: 0, embedding: [0.5] }] }, 1), [[0.5]]);
+  assert.deepEqual(m.parseEmbeddings({ data: [{ index: 0, embedding: [0.5] }] }, 1), { vectors: [[0.5]] });
+  // 실측이 없으면 `usage` 키 자체를 만들지 않는다 — 빈 객체는 "0 을 실측했다"로 읽힌다(§13-3).
+  assert.equal('usage' in m.parseEmbeddings({ data: [{ index: 0, embedding: [0.5] }] }, 1), false);
 });
 
 test('임베딩 경계: 빈 입력은 무호출 · 빈 문자열·배치 상한 초과는 호출 전 거절', b, async () => {

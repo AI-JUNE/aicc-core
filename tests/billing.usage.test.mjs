@@ -110,6 +110,54 @@ test('§11.2 대사: 허용 오차 안이면 matched, 벗어나면 mismatch', b,
   assert.equal(ng.mismatchCount, 1);
 });
 
+// ── §5.2 임베딩 토큰(§11.2) ──────────────────────────────────────────────────
+// 칸이 없던 동안 RAG 색인·질의의 임베딩 비용은 공급사 청구서에만 남고 원장에는 0줄이었다.
+// 방향이 과소청구라 과다청구 차단에도 걸리지 않아, 대사에서 '미설명'으로만 돌아왔다.
+
+test('§11.2 임베딩 토큰이 집계되고 공급사 리포트와 대사된다', b, () => {
+  const t1 = ev.turnCompleted(meta('e1'), {
+    turnId: 'tn1', speaker: 'customer', utterance: '잔액 알려줘',
+    usage: { embedding_tokens: 14, llm_prompt_tokens: 200 },
+  });
+  const t2 = ev.turnCompleted(meta('e2'), {
+    turnId: 'tn2', speaker: 'customer', utterance: '카드 재발급',
+    usage: { embedding_tokens: 11 },
+  });
+  const agg = bl.aggregateUsage([t1, t2], { scope: { tenantId: 't1' }, granularity: 'total', rounding });
+  const q = bl.totalQuantities(agg);
+  assert.equal(q.embedding_tokens, 25);
+  // LLM 칸과 섞이지 않는다 — 단가도 공급사 리포트도 따로다.
+  assert.equal(q.llm_prompt_tokens, 200);
+  // 공급사가 따로 내놓는 임베딩 리포트가 이제 **비교 대상을 갖는다**. 칸이 없던 동안
+  // 이 명세는 `reconcile` 에서 core=undefined 와 만나 비교 자체가 성립하지 않았다.
+  const r = bl.reconcile(
+    agg,
+    [{ source: 'llm_vendor_report', bucket: 'total', channel: 'voice', quantities: { embedding_tokens: 25 } }],
+    { absolute: 0, relative: 0 },
+  );
+  assert.equal(r.lines[0].status, 'matched');
+  assert.equal(r.lines[0].diffs[0].unit, 'embedding_tokens');
+  assert.equal(r.lines[0].diffs[0].core, 25);
+});
+
+test('§11.2 임베딩 토큰 실패 경로: 못 쓰는 값은 0 으로도 그대로도 세지 않는다', b, () => {
+  const bad = ev.turnCompleted(meta('e1'), {
+    turnId: 'tn1', speaker: 'customer', utterance: '네',
+    usage: { embedding_tokens: -5 },
+  });
+  const agg = bl.aggregateUsage([bad], { scope: { tenantId: 't1' }, granularity: 'total', rounding });
+  assert.equal(bl.totalQuantities(agg).embedding_tokens, 0);
+  assert.equal(agg.buckets[0].usageValuesRejected, 1);
+  // 과다청구 차단 판정이 NaN 으로 비껴가지 않는지 — 음수 하나가 합계를 오염시키면 안 된다.
+  const r = bl.reconcile(
+    agg,
+    [{ source: 'llm_vendor_report', bucket: 'total', channel: 'voice', quantities: { embedding_tokens: 40 } }],
+    { absolute: 0, relative: 0 },
+  );
+  assert.equal(r.lines[0].diffs[0].diff, -40);
+  assert.equal(r.lines[0].status, 'mismatch');
+});
+
 test('§11.2 대사: 외부에만 있는 구간은 missing_core로 보고한다', b, () => {
   const agg = bl.aggregateUsage([], { scope: { tenantId: 't1' }, granularity: 'month', rounding });
   const r = bl.reconcile(agg, [{ source: 'carrier_cdr', bucket: '2026-01', channel: 'voice', quantities: { voice_seconds: 10 } }],

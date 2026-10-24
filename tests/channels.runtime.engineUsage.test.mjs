@@ -135,6 +135,30 @@ test('Core 가 부른 엔진의 실측이 턴 이벤트에 실린다(§11.2)', b
   assert.deepEqual(turnUsageOf(r), { llm_prompt_tokens: 42, llm_completion_tokens: 7 });
 });
 
+test('§5.2 임베딩 토큰도 같은 길로 원장까지 간다 — 칸이 없던 동안 통째로 사라졌다(§11.2)', b, async () => {
+  // 규격 어댑터는 `embeddings` 응답의 usage 를 아예 읽지 않았고(`UsageMetrics` 에 칸이 없었다),
+  // 그래서 RAG 색인·질의 토큰은 공급사 청구서에만 남았다. 여기서 보는 것은 **칸을 만든 뒤에도
+  // 중간 어딘가가 그 키를 모르면 조용히 빠지는가**다 — 브리지·엔진셋 수집·턴 귀속이 전부
+  // 같은 목록(`USAGE_METRIC_KEYS`)을 보므로 한 곳만 몰라도 여기서 드러난다.
+  const e = engineDecl({ usage: usageBox({ llm_prompt_tokens: 42, embedding_tokens: 31 }) });
+  const { core } = build({ engines: e.decl, intent: intentBinding });
+  await core.start(reqOf());
+  const r = await core.send('i_eu1', { input: { kind: 'utterance', text: '잔액 알려줘' } });
+  assert.equal(r.billing.usageAttached, true);
+  assert.deepEqual(turnUsageOf(r), { llm_prompt_tokens: 42, embedding_tokens: 31 });
+  assert.equal(r.billing.usageRejected, undefined, '아는 항목을 정체불명으로 버리면 안 된다');
+});
+
+test('§11.2 소수 임베딩 토큰은 실측이 아니라 환산 실수의 신호다(실패 경로)', b, async () => {
+  // 0 으로 보정하지 않는다 — 보정은 "0 토큰을 실측했다"는 거짓 근거를 만든다(§13-3).
+  const e = engineDecl({ usage: usageBox({ embedding_tokens: 12.5 }) });
+  const { core } = build({ engines: e.decl, intent: intentBinding });
+  await core.start(reqOf());
+  const r = await core.send('i_eu1', { input: { kind: 'utterance', text: '잔액 알려줘' } });
+  assert.deepEqual(r.billing.usageRejected, ['engine_set.embedding_tokens']);
+  assert.equal(turnUsageOf(r), undefined, '버린 값이 이벤트에 실리면 버린 의미가 없다');
+});
+
 test('채널 선언과 엔진 실측은 **한 번에** 합쳐 싣는다 — 따로 붙이면 뒤쪽이 사라진다', b, async () => {
   const e = engineDecl();
   const { core } = build({ engines: e.decl, intent: intentBinding });

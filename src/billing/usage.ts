@@ -11,15 +11,19 @@ import { dedupeEvents } from '../events/bus.ts';
 import { assertTenantScope, type TenantScope } from '../core/tenancy.ts';
 import type { ChannelKind } from '../domain/types.ts';
 
-/** 과금 수량 단위. 금액은 이 모듈의 관심사가 아니다. */
-export type BillableUnit =
-  | 'voice_seconds'      // 통화 과금 대상 시간(초) — 반올림 전 원시값
-  | 'voice_units'        // 계약 반올림 규칙 적용 후의 과금 단위 수(예: 분 단위 올림)
-  | 'sessions'           // 세션 수
-  | 'llm_prompt_tokens'
-  | 'llm_completion_tokens'
-  | 'stt_seconds'
-  | 'tts_seconds';
+/**
+ * 과금 수량 단위. 금액은 이 모듈의 관심사가 아니다.
+ *
+ * **목록을 따로 적지 않는다**(§2) — `UsageQuantities` 의 키에서 파생시킨다. 종전에는 같은
+ * 일곱 개가 두 벌이었고, 어긋나는 날의 결말이 양쪽 다 조용하다:
+ *  - **수량만 늘면**(`UsageQuantities` 에 칸이 생기고 이 유니온은 그대로) 외부 명세가 그 단위를
+ *    **선언할 수 없다**. `reconcile` 은 명세에 있는 단위만 비교하므로 그 수량은 한 번도 대조되지
+ *    않은 채 청구로 나간다 — 불일치가 아니라 **아무 줄도 생기지 않는다**.
+ *  - **유니온만 늘면** `b.quantities[unit]` 이 `undefined` 이고 `core - external` 이 NaN 이 된다.
+ *    `withinTolerance` 는 언제나 거짓이라 그 버킷이 통째로 `mismatch` 로 떨어진다.
+ * 파생시키면 둘 중 어느 쪽도 손으로 맞출 필요가 없다.
+ */
+export type BillableUnit = keyof UsageQuantities;
 
 /** 계약이 정하는 통화 반올림 규칙. 기본값을 두지 않는다 — 계약마다 다르고, 추정하면 분쟁이 된다. */
 export interface RoundingRule {
@@ -53,13 +57,21 @@ export function bucketKey(occurredAtIso: string, g: BucketGranularity): string {
 }
 
 export interface UsageQuantities {
+  /** 통화 과금 대상 시간(초) — 반올림 전 원시값 */
   voice_seconds: number;
+  /** 계약 반올림 규칙 적용 후의 과금 단위 수(예: 분 단위 올림) */
   voice_units: number;
+  /** 세션 수 */
   sessions: number;
   llm_prompt_tokens: number;
   llm_completion_tokens: number;
   stt_seconds: number;
   tts_seconds: number;
+  /**
+   * 임베딩 토큰(§5.2 RAG). 공급사 리포트가 LLM 과 **따로** 내놓는 수량이므로 칸도 따로다 —
+   * 합쳐 적으면 대사는 "둘 다 맞지 않는다"까지만 말할 수 있다(`UsageMetrics.embedding_tokens`).
+   */
+  embedding_tokens: number;
 }
 
 export interface UsageBucket {
@@ -112,6 +124,7 @@ function emptyQuantities(): UsageQuantities {
     llm_completion_tokens: 0,
     stt_seconds: 0,
     tts_seconds: 0,
+    embedding_tokens: 0,
   };
 }
 
@@ -205,6 +218,7 @@ export function aggregateUsage(events: InteractionEvent[], opts: AggregateOption
       b.quantities.llm_completion_tokens += take(u.llm_completion_tokens);
       b.quantities.stt_seconds += take(u.stt_audio_ms) / 1000;
       b.quantities.tts_seconds += take(u.tts_audio_ms) / 1000;
+      b.quantities.embedding_tokens += take(u.embedding_tokens);
     }
   }
 
@@ -234,6 +248,7 @@ export function totalQuantities(agg: UsageAggregate): UsageQuantities {
     t.llm_completion_tokens += b.quantities.llm_completion_tokens;
     t.stt_seconds += b.quantities.stt_seconds;
     t.tts_seconds += b.quantities.tts_seconds;
+    t.embedding_tokens += b.quantities.embedding_tokens;
   }
   return t;
 }

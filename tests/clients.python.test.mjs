@@ -674,3 +674,101 @@ off.close(); on.close()
   // 링크를 만들려면 Interaction id 를 쓸 수밖에 없었다(1회용·만료·회수가 전부 무의미해진다).
   assert.equal(out.on.includesSwitchTicket, true, '실행기에는 있는 스위치를 클라이언트에서 켤 수 없다');
 });
+
+// ── §9.3 큐 배정 판정을 읽을 자리(§2) ────────────────────────────────────────
+// 계약·브리지는 "`placement !== 'queued'` 면 큐에 사람이 들어가지 않았으니 상담사 연결 안내를
+// 해서는 안 된다"고 적어 두었는데, 참조 클라이언트에는 그 값을 읽는 자리가 없었다 — 호스트는
+// `result["handoff"]["placement"]["placement"]` 를 손으로 파야 했고(이 파일의 종전 검사가 바로
+// 그 모양이다), 세 저장소가 각자 파면 각자 다르게 틀린다. `queue` 만 보는 것이 가장 흔한 오답이다:
+// 대안(콜백·음성사서함)으로 간 건은 놓을 큐 id 가 없어 `queue` 가 비고, 그 모양은 "큐를 선언하지
+// 않은 이관"과 똑같다. 음성이 바로 그 대안이 선언되는 채널이고 그 호스트가 파이썬이다.
+
+test('§9.3 큐에 실제로 들어갔는지를 참조 클라이언트가 알려준다(정상 경로)', b, () => {
+  const source = `${MAINTAINED_PRELUDE}
+c = client()
+c.hello()
+s = c.start(flow_id="f_reference_voice", entry_point="inbound_call")
+turned = c.send_utterance(s.interaction_id, "상담사 연결해 주세요")
+json.dump({
+    "queued": turned.queued,
+    "action": turned.handoff_action,
+    "placement": (turned.handoff_placement or {}).get("placement"),
+    # 손으로 파낸 값과 접근자가 같은 것을 가리키는지 — 갈라지면 둘 중 하나가 거짓이다.
+    "by_hand": ((turned.result or {}).get("handoff", {}).get("placement", {}) or {}).get("placement"),
+    "has_handoff": turned.handoff is not None,
+    # 이관이 없던 턴에는 아무것도 서지 않는다(시작 응답).
+    "start_queued": s.queued,
+    "start_handoff": s.handoff,
+}, sys.stdout, ensure_ascii=False)
+c.close()
+`;
+  const run = withDriver(source, (f) => runPython(f));
+  assert.equal(run.status, 0, run.stderr);
+  const out = JSON.parse(run.stdout);
+  assert.equal(out.has_handoff, true, '이관 턴인데 handoff 가 없다');
+  assert.equal(out.placement, 'queued');
+  assert.equal(out.by_hand, 'queued');
+  assert.equal(out.queued, true, '큐에 들어간 건을 들어가지 않았다고 읽으면 이관 안내가 사라진다');
+  assert.equal(out.action, null, '큐에 들어갔는데 대안이 실리면 호스트가 콜백까지 건다');
+  // 이관이 없는 턴을 "큐에 못 들어갔다"로 읽으면 매 턴 콜백 안내가 나간다.
+  assert.equal(out.start_queued, null);
+  assert.equal(out.start_handoff, null);
+});
+
+test('§9.3 큐에 못 들어간 건을 True 로도 False 로도 잘못 읽지 않는다(실패·경계 경로)', b, () => {
+  // 배선 없는 테넌트·대안·설정 결함은 실제 브리지로 한 번에 만들 수 없다(큐 설정·상담사
+  // 가용 인원이 전부 사람이 정하는 값이다). 판정 자체는 순수하므로 응답 모양으로 고정한다.
+  const source = `${PRELUDE}
+from aicc_bridge import BridgeResponse, BridgeError
+
+def resp(handoff, ok=True):
+    body = {"interactionId": "i1"}
+    if handoff is not None:
+        body["handoff"] = handoff
+    return BridgeResponse(id="1", ok=ok, result=body)
+
+cases = {
+    # 대안: 놓을 큐가 없어 queue 가 비어 있다 — queue 만 보면 "큐 선언 없는 이관"과 같은 모양이다.
+    "alternative": resp({"summaryAvailable": False,
+                         "placement": {"placement": "alternative", "cause": "closed",
+                                       "action": "callback", "reasonKo": "운영시간 외",
+                                       "summaryPresent": False, "warnings": []}}),
+    # 설정 결함: 목적지를 아예 정하지 못했다. 대안도 없으므로 안내를 지어내면 안 된다.
+    "unavailable": resp({"summaryAvailable": False,
+                         "placement": {"placement": "unavailable", "code": "E_CONFIG_INVALID",
+                                       "reasonKo": "큐 설정 오류", "issues": [],
+                                       "summaryPresent": False, "warnings": []}}),
+    # 라우팅 미배선: 판정이 **없다**. False 로 읽으면 종전까지 되던 안내가 통째로 사라진다.
+    "unwired": resp({"queue": "q_default", "summaryAvailable": True}),
+    "no_handoff": resp(None),
+    # 판정 값이 모르는 문자열이면 True 로 읽지 않는다(새 종류가 생긴 날 오지 않는 상담사를 안내한다).
+    "unknown_kind": resp({"summaryAvailable": False, "placement": {"placement": 7}}),
+}
+err = BridgeResponse(id="1", ok=False, error=BridgeError(code="E_RATE_LIMITED", message_ko="한도"))
+out = {k: {"queued": v.queued, "action": v.handoff_action} for k, v in cases.items()}
+out["error"] = {"queued": err.queued, "action": err.handoff_action,
+                "handoff": err.handoff, "fallback": err.fallback}
+# §9.3 폴백 판정도 읽을 자리가 있어야 한다 — 비-Node 호스트에는 이 값이 유일한 경로다.
+fb = BridgeResponse(id="1", ok=True, result={"interactionId": "i1",
+                                             "fallback": {"mode": "agent_direct", "disable": ["llm"]}})
+out["fallback"] = {"mode": fb.fallback["mode"], "none": resp(None).fallback}
+json.dump(out, sys.stdout, ensure_ascii=False)
+`;
+  const run = withDriver(source, (f) => runPython(f));
+  assert.equal(run.status, 0, run.stderr);
+  const out = JSON.parse(run.stdout);
+  assert.equal(out.alternative.queued, false, '대안으로 간 건을 큐 배정으로 읽으면 오지 않는 상담사를 안내한다');
+  assert.equal(out.alternative.action, 'callback', '대안을 모르면 호스트가 아무것도 하지 못한다');
+  assert.equal(out.unavailable.queued, false);
+  assert.equal(out.unavailable.action, null, '선언되지 않은 대안을 만들어 주면 그 선택이 곧 정책이 된다');
+  // 모름은 False 가 아니다 — 라우팅 미배선 테넌트에서 이관 안내를 지우면 그 자체가 장애다(§13-3).
+  assert.equal(out.unwired.queued, null);
+  assert.equal(out.no_handoff.queued, null);
+  assert.equal(out.unknown_kind.queued, null);
+  // 오류 응답에서 본문을 읽지 않는다 — 거부를 "이관 없음"으로 읽으면 안 된다.
+  assert.equal(out.error.queued, null);
+  assert.equal(out.error.handoff, null);
+  assert.equal(out.error.fallback, null);
+  assert.equal(out.fallback.mode, 'agent_direct');
+  assert.equal(out.fallback.none, null);
+});

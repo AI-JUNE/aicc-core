@@ -224,6 +224,10 @@ export function toUsageMetrics(raw: unknown): UsageMetrics | undefined {
   const c = num(u['completion_tokens']); if (c !== undefined) m.llm_completion_tokens = c;
   const s = num(u['stt_audio_ms']); if (s !== undefined) m.stt_audio_ms = s;
   const t = num(u['tts_audio_ms']); if (t !== undefined) m.tts_audio_ms = t;
+  // 임베딩은 `embedding_tokens` 하나로만 받는다. OpenAI 호환 임베딩 응답은 같은 수를
+  // `prompt_tokens`·`total_tokens` 에도 적는데, 거기서 읽으면 **LLM 칸에 임베딩 토큰이 쌓인다** —
+  // 규격 어댑터가 그 환산을 책임진다(§6.2 `openaiCompat.parseEmbeddings`).
+  const e = num(u['embedding_tokens']); if (e !== undefined) m.embedding_tokens = e;
   return Object.keys(m).length > 0 ? m : undefined;
 }
 
@@ -276,19 +280,33 @@ export function parseTtsResponse(raw: unknown): { chunk: AudioChunk; usage?: Usa
   return usage === undefined ? { chunk } : { chunk, usage };
 }
 
-export function parseEmbeddingResponse(raw: unknown, expected: number): number[][] {
+/**
+ * 임베딩 응답 → 벡터 + §11.2 실측. **형제 파서들과 같은 모양으로 돌려준다**
+ * (`parseLlmResponse`·`parseSttResponse`·`parseTtsResponse`).
+ *
+ * 종전에는 벡터만 돌려주었고, 그래서 게이트웨이가 `usage` 를 실어 보내도 **읽는 코드가
+ * 한 줄도 없었다** — 그 토큰은 공급사 청구서에만 남고 원장에는 0줄이다(`UsageMetrics.embedding_tokens`).
+ * 사용량을 따로 뽑는 함수를 하나 더 두지 않는 이유는 그것이 곧 "부르지 않으면 사라지는 자리"가
+ * 되기 때문이다 — 벡터를 받는 쪽은 반드시 실측도 함께 받는다.
+ */
+export function parseEmbeddingResponse(
+  raw: unknown,
+  expected: number,
+): { vectors: number[][]; usage?: UsageMetrics } {
   const o = obj(raw, 'embedding');
   const arr = o['embeddings'];
   if (!Array.isArray(arr)) throw new EngineError('E_PROTOCOL', 'embedding', '임베딩 응답에 embeddings 배열이 없습니다.');
   if (arr.length !== expected) {
     throw new EngineError('E_PROTOCOL', 'embedding', `임베딩 개수 불일치: 요청 ${expected}건, 응답 ${arr.length}건.`);
   }
-  return arr.map((v, i) => {
+  const vectors = arr.map((v, i) => {
     if (!Array.isArray(v) || v.some((x) => typeof x !== 'number' || !Number.isFinite(x))) {
       throw new EngineError('E_PROTOCOL', 'embedding', `임베딩 ${i}번이 숫자 배열이 아닙니다.`);
     }
     return v as number[];
   });
+  const usage = toUsageMetrics(o['usage']);
+  return usage === undefined ? { vectors } : { vectors, usage };
 }
 
 // ── 전송 계층 (승인 게이트·비밀값·타임아웃·오류 분류를 한 곳에) ─────────────────
@@ -552,7 +570,13 @@ export function createHttpEngineSet(cfg: HttpEngineConfig): HttpEngineSet {
         if (texts.length === 0) return [];   // 빈 입력에 네트워크를 쓰지 않는다
         const body = { texts: texts.map((t) => (maskOutbound ? maskPii(t).text : t)) };
         const { json } = await post('embedding', body);
-        return parseEmbeddingResponse(json, texts.length);
+        const parsed = parseEmbeddingResponse(json, texts.length);
+        // stt·tts·llm 과 **같은 한 칸**에 적는다(§6.2 `lastUsage` = 마지막 호출의 실측).
+        // 조각마다 칸을 따로 두면 임베딩을 부르지 않은 턴이 **직전 턴의 임베딩 토큰을 한 번 더**
+        // 싣는다 — 그 이중 계상은 예외가 아니라 과다청구 방향의 그럴듯한 숫자다. 한 턴에 두 번
+        // 이상 불러 앞 호출이 덮인 경우는 런타임이 호출 횟수로 세어 사실대로 적는다(§11.2).
+        if (parsed.usage) lastUsage = parsed.usage;
+        return parsed.vectors;
       },
     };
   }

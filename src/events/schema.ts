@@ -36,6 +36,21 @@ export interface UsageMetrics {
   stt_audio_ms?: number;
   /** TTS가 합성한 오디오 길이(ms) */
   tts_audio_ms?: number;
+  /**
+   * 임베딩 엔진이 처리한 토큰 수(§5.2 RAG 색인·질의).
+   *
+   * 이 칸이 없던 동안 임베딩 비용은 **어디에도 실리지 않았다**. 규격 어댑터
+   * (`adapters/openaiCompat.ts`)는 응답의 `usage` 를 아예 읽지 않았고, 그 머리말은 그 이유를
+   * "UsageMetrics 에 자리가 없어 기록하지 않는다 … 자리가 생기기 전까지는 비워 둔다"로 적어
+   * 두었다. 결과는 예외가 아니다 — 그 토큰은 **공급사 청구서에만** 남고 §8.1 원장에는 0줄이며,
+   * 몇 주 뒤 §11.2 대사에서 '미설명' 차이로 돌아온다. 방향이 과소청구라 과다청구 차단
+   * (`blocked`)에도 걸리지 않아, 아무도 보지 않으면 영원히 그대로다.
+   *
+   * **LLM 토큰 칸에 섞어 넣지 않는다**: 두 모델은 단가가 다르고 공급사 리포트도 따로 나오므로,
+   * 합쳐 적는 순간 대사는 "둘 다 맞지 않는다"만 말할 수 있다. 입력/출력으로 나누지도 않는다 —
+   * 임베딩은 출력 토큰이 없고, 없는 칸을 0 으로 채우면 "0 을 실측했다"가 된다(§13-3).
+   */
+  embedding_tokens?: number;
 }
 
 /**
@@ -47,7 +62,7 @@ export interface UsageMetrics {
  * 집계에서 빠져 몇 주 뒤 대사에서 '미설명' 차이로 돌아온다(그 방향은 과소청구라 청구도 막히지 않는다).
  */
 const USAGE_METRIC_KEY_TUPLE = [
-  'llm_prompt_tokens', 'llm_completion_tokens', 'stt_audio_ms', 'tts_audio_ms',
+  'llm_prompt_tokens', 'llm_completion_tokens', 'stt_audio_ms', 'tts_audio_ms', 'embedding_tokens',
 ] as const;
 
 /** 없는 키·오타를 막는다. */

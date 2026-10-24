@@ -205,6 +205,35 @@ test('응답 형식 위반은 조용히 넘기지 않는다', b, async () => {
   assert.throws(() => h.parseSttResponse('문자열'), (err) => err.code === 'E_PROTOCOL');
 });
 
+// ── §11.2 임베딩 실측 ─────────────────────────────────────────────────────────
+// 중립 JSON 규약에도 `usage` 를 실을 자리가 있었는데 **읽는 코드가 한 줄도 없었다**.
+// 그 토큰은 공급사 청구서에만 남고 §8.1 원장에는 0줄이라, 몇 주 뒤 대사에서 '미설명' 차이로만
+// 돌아온다(방향이 과소청구라 과다청구 차단에도 걸리지 않는다).
+
+test('임베딩 토큰이 lastUsage 로 올라온다 — 자리가 없던 동안은 통째로 사라졌다(§11.2)', b, async () => {
+  const f = fakeFetch(() => jsonRes({ embeddings: [[0.1, 0.2]], usage: { embedding_tokens: 14 } }));
+  const e = h.createHttpEngineSet({ ...BASE, activation: 'live', approvalRef: 'T', fetchImpl: f, resolveSecret: () => 'k' });
+  assert.deepEqual(await e.embedding.embed(['가']), [[0.1, 0.2]]);
+  assert.deepEqual(e.lastUsage(), { embedding_tokens: 14 });
+});
+
+test('임베딩 실측 실패 경로: 없거나 못 쓰는 값은 만들지 않는다(§13-3)', b, async () => {
+  // 실측이 없으면 `usage` 키 자체가 없다 — 빈 객체는 "0 토큰을 실측했다"로 읽힌다.
+  assert.deepEqual(h.parseEmbeddingResponse({ embeddings: [[1]] }, 1), { vectors: [[1]] });
+  assert.equal('usage' in h.parseEmbeddingResponse({ embeddings: [[1]] }, 1), false);
+  assert.equal('usage' in h.parseEmbeddingResponse({ embeddings: [[1]], usage: { embedding_tokens: 'x' } }, 1), false);
+  // 벡터 검증이 먼저다 — 실측이 멀쩡해도 어긋난 벡터는 색인에 들어가지 않는다(§5.2).
+  assert.throws(
+    () => h.parseEmbeddingResponse({ embeddings: [[1], [2]], usage: { embedding_tokens: 3 } }, 1),
+    (err) => err.code === 'E_PROTOCOL',
+  );
+  // 엔진이 주지 않은 턴은 직전 호출 값을 되풀이하지 않는다(그 되풀이가 곧 이중 계상이다).
+  const f = fakeFetch(() => jsonRes({ embeddings: [[0.1]] }));
+  const e = h.createHttpEngineSet({ ...BASE, activation: 'live', approvalRef: 'T', fetchImpl: f, resolveSecret: () => 'k' });
+  await e.embedding.embed(['가']);
+  assert.equal(e.lastUsage(), undefined);
+});
+
 test('활성화 상태는 환경변수로 실수로 켜지지 않는다', b, () => {
   assert.equal(h.activationFromEnv({}), 'dry_run');
   assert.equal(h.activationFromEnv({ AICC_ENGINE_ACTIVATION: 'true' }), 'dry_run');

@@ -19,8 +19,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
-let D = null, S = null, BR = null, R = null, F = null, P = null, BP = null, A = null, TU = null, ES = null;
+let D = null, S = null, BR = null, R = null, F = null, P = null, BP = null, A = null, TU = null, ES = null, BL = null;
 try {
+  BL = await import('../src/billing/usage.ts');
   D = await import('../src/domain/types.ts');
   S = await import('../src/events/schema.ts');
   BR = await import('../src/channels/bridge.ts');
@@ -63,7 +64,9 @@ test('LATENCY_KEYS 가 LatencyBreakdown 의 키와 정확히 일치한다(§8.1�
 test('USAGE_METRIC_KEYS 가 UsageMetrics 의 키와 정확히 일치한다(§11.2)', b, () => {
   const declared = optionalFieldsOf(read('../src/events/schema.ts'), 'UsageMetrics');
   assert.deepEqual([...S.USAGE_METRIC_KEYS].sort(), declared.slice().sort());
-  assert.equal(declared.length, 4);
+  assert.equal(declared.length, 5);
+  // §5.2 임베딩 토큰 — 칸이 없던 동안 그 비용은 공급사 청구서에만 남았다(§11.2).
+  assert.ok(S.USAGE_METRIC_KEYS.includes('embedding_tokens'));
 });
 
 test('ENTRY_POINTS 가 EntryPoint 유니온의 값과 정확히 일치한다', b, () => {
@@ -86,6 +89,22 @@ test('turnUsage 의 USAGE_UNITS·엔진셋 수집 목록이 같은 선언이다(
   // 엔진셋은 목록을 내보내지 않으므로 소스로 확인한다.
   assert.match(read('../src/adapters/engineSet.ts'), /USAGE_KEYS: readonly \(keyof UsageMetrics\)\[\] = USAGE_METRIC_KEYS;/);
   assert.ok(ES.assembleEngineSet, '엔진셋 조립기가 없다');
+});
+
+test('§11.2 과금 단위 목록이 집계 수량에서 파생된다 — 유니온과 칸이 두 벌이 아니다', b, () => {
+  // 두 벌이던 동안 어긋나는 날의 결말이 양쪽 다 조용하다: 수량만 늘면 외부 명세가 그 단위를
+  // 선언할 수 없어 **대조 줄이 아예 생기지 않고**(한 번도 검증되지 않은 채 청구로 나간다),
+  // 유니온만 늘면 core 가 undefined 라 diff 가 NaN 이 되어 그 버킷이 통째로 mismatch 가 된다.
+  assert.match(read('../src/billing/usage.ts'), /export type BillableUnit = keyof UsageQuantities;/);
+  // 임베딩 토큰이 양쪽에 실제로 닿는지 — 파생이 말뿐이 아닌지 값으로 확인한다.
+  const q = BL.totalQuantities(BL.aggregateUsage([], {
+    scope: { tenantId: 't1' }, granularity: 'total',
+    rounding: { unitSeconds: 60, mode: 'ceil', minimumUnits: 0 },
+  }));
+  assert.deepEqual(
+    Object.keys(q).sort(),
+    ['embedding_tokens', 'llm_completion_tokens', 'llm_prompt_tokens', 'sessions', 'stt_seconds', 'tts_seconds', 'voice_seconds', 'voice_units'],
+  );
 });
 
 // ── 2) 실패 경로: 소비처가 사본을 다시 만들면 잡는다 ────────────────────────

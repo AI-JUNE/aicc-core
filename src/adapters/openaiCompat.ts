@@ -12,8 +12,9 @@
 //  - 모델 id·온도·토큰 상한에 기본값을 두지 않는다(§13-3). 주지 않은 값은 요청에 실리지 않는다.
 //  - 도구 호출(tool_calls)·스트리밍(SSE)은 지원하지 않는다. 도구 호출 응답이 오면 조용히 빈 문자열을 내지 않고
 //    E_PROTOCOL 로 드러낸다 — Core 시나리오는 Flow 가 밀지, 엔진이 밀지 않는다(§5.3).
-//  - 임베딩 사용량은 UsageMetrics 에 자리가 없어 기록하지 않는다. LLM 프롬프트 토큰 칸에 섞어 넣으면
-//    과금 대사(§11.2)에서 원인 불명 차이로 나타나므로, 자리가 생기기 전까지는 비워 둔다.
+//  - (2026-10-24 해소) 임베딩 사용량은 `UsageMetrics.embedding_tokens` 에 싣는다. 그 칸이 없던 동안
+//    응답의 usage 를 읽는 코드가 한 줄도 없었고, 그 토큰은 공급사 청구서에만 남았다(§11.2).
+//    LLM 프롬프트 토큰 칸에는 여전히 섞지 않는다 — 단가도 공급사 리포트도 따로다.
 //
 // STT(`audio/transcriptions`)·TTS(`audio/speech`)는 멀티파트·바이너리 응답이라 이 전송 계층(JSON)으로는
 // 붙지 않는다. 음성은 http.ts 의 중립 규약(게이트웨이) 또는 별도 어댑터로 붙인다 — 이 파일의 범위 밖이다.
@@ -133,11 +134,38 @@ export function parseChatCompletion(raw: unknown): Omit<ChatCompletionResult, 'l
 }
 
 /**
- * `embeddings` 응답 → 입력 순서대로 정렬된 벡터 배열.
+ * 임베딩 응답의 `usage` → §11.2 `embedding_tokens`.
+ *
+ * **`toUsageMetrics` 를 쓰지 않는다**: 그쪽은 `prompt_tokens` 를 `llm_prompt_tokens` 로 읽는데,
+ * 임베딩 응답도 같은 이름을 쓴다 — 그대로 통과시키면 임베딩 토큰이 **LLM 칸에 쌓이고**,
+ * 두 모델은 단가도 공급사 리포트도 따로라 대사(§11.2)는 "둘 다 맞지 않는다"까지만 말할 수 있다.
+ * 규격마다 이름이 다른 것을 흡수하는 것이 §6.2 어댑터의 일이고, 그 자리가 바로 여기다.
+ *
+ * `prompt_tokens` 를 먼저 본다(규격이 실제로 내는 값이고, `total_tokens` 와 같다).
+ * 둘 다 없거나 실측으로 볼 수 없는 값이면 **만들지 않는다**(§13-3) — 0 은 "0 토큰을 실측했다"다.
+ */
+function embeddingUsageOf(raw: unknown): UsageMetrics | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined;
+  const u = raw as Record<string, unknown>;
+  for (const key of ['prompt_tokens', 'total_tokens']) {
+    const v = u[key];
+    if (typeof v === 'number' && Number.isInteger(v) && v >= 0) return { embedding_tokens: v };
+  }
+  return undefined;
+}
+
+/**
+ * `embeddings` 응답 → 입력 순서대로 정렬된 벡터 배열 + §11.2 실측.
  * 엔진은 `index` 로 순서를 알려 주므로 배열 순서를 믿지 않고 index 로 되돌린다.
  * 개수·index 누락/중복·차원 불일치는 전부 오류다 — 어긋난 벡터가 지식 색인에 들어가면 검색이 조용히 틀린다(§5.2).
+ *
+ * 사용량을 **같은 반환값에** 싣는 이유는 `parseChatCompletion` 과 같다: 따로 뽑는 함수를 두면
+ * 그것은 곧 "부르지 않으면 사라지는 자리"가 되고, 사라진 실측은 예외 없이 과소청구로만 나타난다.
  */
-export function parseEmbeddings(raw: unknown, expected: number): number[][] {
+export function parseEmbeddings(
+  raw: unknown,
+  expected: number,
+): { vectors: number[][]; usage?: UsageMetrics } {
   const o = asObject(raw, 'embedding');
   const data = o['data'];
   if (!Array.isArray(data)) throw new EngineError('E_PROTOCOL', 'embedding', 'embeddings 응답에 data 배열이 없습니다.');
@@ -166,7 +194,9 @@ export function parseEmbeddings(raw: unknown, expected: number): number[][] {
     }
     out[idx as number] = vec as number[];
   }
-  return out as number[][];   // 개수 검사 + 중복 거부로 빈 칸은 남을 수 없다
+  const vectors = out as number[][];   // 개수 검사 + 중복 거부로 빈 칸은 남을 수 없다
+  const usage = embeddingUsageOf(o['usage']);
+  return usage === undefined ? { vectors } : { vectors, usage };
 }
 
 // ── 어댑터 본체 ───────────────────────────────────────────────────────────────
@@ -248,7 +278,13 @@ export function createOpenAiCompatEngines(cfg: OpenAiCompatConfig): OpenAiCompat
         }
         const body = { model, input: texts.map(outbound), encoding_format: 'float' };
         const { json } = await transport.post('embedding', embeddingsPath, body);
-        return parseEmbeddings(json, texts.length);
+        const parsed = parseEmbeddings(json, texts.length);
+        // 채팅과 **같은 한 칸**이다(§6.2 `lastUsage` = 마지막 호출의 실측). 조각마다 칸을 나누면
+        // 임베딩을 부르지 않은 턴이 직전 턴의 토큰을 한 번 더 싣는다 — 그 이중 계상은 예외가
+        // 아니라 과다청구 방향의 그럴듯한 숫자다. 한 턴에 둘 다 불러 앞 호출이 덮인 경우는
+        // 런타임이 호출 횟수로 세어 사실대로 적는다(`channels/runtime.ts` attachUsage).
+        if (parsed.usage) lastUsage = parsed.usage;
+        return parsed.vectors;
       },
     };
   }

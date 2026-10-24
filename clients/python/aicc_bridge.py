@@ -29,6 +29,14 @@ Callbot 의 음성 에이전트는 파이썬 프로세스다. Node 로 된 채�
    청구서에 남는다. 보낼 방법이 없으면 그 수량은 Core 원장에 들어가지 않고, 과소청구 방향이라
    청구를 막지도 않은 채 몇 주 뒤 대사에서 '미설명' 차이로만 나타난다(§11.2).
    **없는 값을 만들지는 않는다**(§13-3): 주지 않으면 키 자체를 싣지 않는다.
+9. **Core 의 판정은 파내지 않고 읽는다.** 큐 배정(§9.3 `queued`·`handoff_action`)·장애 폴백
+   (`fallback`)·전환 초대(`switch_invite`)·커넥터 대기(`pending_connector_id`)는 전부 **Core 가
+   이미 끝낸 판정**이다. 호스트가 응답 본문을 손으로 파게 두면 저장소마다 다르게 파고, 가장 흔한
+   오답이 `handoff["queue"]` 만 보는 것이다 — 대안(콜백·음성사서함)으로 간 건은 놓을 큐 id 가
+   없어 `queue` 가 비고, 그 모양은 "큐를 선언하지 않은 이관"과 똑같다. 그래서 큐에 못 들어간
+   고객에게 "상담사를 연결해 드리겠습니다"가 나가고, 예외도 오류 응답도 없다.
+   **모르는 것은 None 이다**(§13-3) — 배선이 없어 판정 자체가 없는 상태를 False 로 적으면
+   종전까지 되던 안내가 그 테넌트 전체에서 사라진다.
 
 무엇을 하지 않는가 (build now, activate on approval)
 ---------------------------------------------------
@@ -144,6 +152,75 @@ class BridgeResponse:
             return None
         invite = self.result.get("switchInvite")
         return invite if isinstance(invite, dict) else None
+
+    @property
+    def handoff(self) -> Optional[Dict[str, Any]]:
+        """상담사 이관 정보(§9.3). 이관이 일어나지 않은 턴에는 None."""
+        if not self.ok or not isinstance(self.result, dict):
+            return None
+        handoff = self.result.get("handoff")
+        return handoff if isinstance(handoff, dict) else None
+
+    @property
+    def handoff_placement(self) -> Optional[Dict[str, Any]]:
+        """큐 배정 판정(§9.3). Core 에 라우팅이 배선된 경우에만 실린다 — 아니면 None."""
+        handoff = self.handoff
+        if handoff is None:
+            return None
+        placement = handoff.get("placement")
+        return placement if isinstance(placement, dict) else None
+
+    @property
+    def queued(self) -> Optional[bool]:
+        """고객이 **정말로 상담 큐에 들어갔는가**. 셋 중 하나다 — True·False·None(모름).
+
+        읽지 않으면 큐에 못 들어간 고객에게 "상담사를 연결해 드리겠습니다"를 안내하게 된다.
+        `handoff["queue"]` 만 보면 구분이 되지 않기 때문이다: 대안(콜백·음성사서함·기존 IVR)으로
+        간 건은 놓을 큐 id 를 아예 들고 있지 않아 `queue` 가 비고, 그 모양은 "큐를 선언하지 않은
+        이관"과 똑같다. 음성이 바로 그 대안이 선언되는 채널이고, 그 호스트가 파이썬이다.
+        예외도 오류 응답도 없다 — 고객은 오지 않는 상담사를 기다리다 끊는다.
+
+        **모름(None)을 False 로 적지 않는다**(§13-3). 라우팅이 배선되지 않은 테넌트에는 판정
+        자체가 없는데, 그것을 "큐에 못 들어갔다"로 읽으면 종전까지 되던 이관 안내가 그 테넌트
+        전체에서 사라진다. 반대로 True 로 읽으면 오지 않는 상담사를 안내한다. 둘 다 조용하다.
+
+        True 가 아닐 때 호스트가 해야 하는 일은 `handoff_action` 이며, 그 값도 없으면
+        (`unavailable` — 전부 설정 결함이다) 안내를 지어내지 말고 운영에 알린다.
+        """
+        placement = self.handoff_placement
+        if placement is None:
+            return None
+        value = placement.get("placement")
+        if not isinstance(value, str):
+            return None
+        return value == "queued"
+
+    @property
+    def handoff_action(self) -> Optional[str]:
+        """큐 대신 수행해야 하는 대안(`callback`·`voicemail`·`legacy_ivr`·`reject`).
+
+        `placement == "alternative"` 에서만 실린다. Core 가 만들지 않고 **큐 설정에 선언된 값**을
+        그대로 돌려준다(§13-3) — 없는 대안을 호스트가 골라 주면 그 선택이 곧 정책이 된다.
+        """
+        placement = self.handoff_placement
+        if placement is None:
+            return None
+        action = placement.get("action")
+        return action if isinstance(action, str) and action else None
+
+    @property
+    def fallback(self) -> Optional[Dict[str, Any]]:
+        """§9.3 장애 폴백 판정. 없으면 None(= 이번 턴에 폴백 판정이 내려지지 않았다).
+
+        Node 호스트는 `port.routeToLegacyIvr`·`port.transfer`·`port.end` 로 같은 지시를 받지만
+        비-Node 호스트에는 그 자리가 없다 — 이 값이 회선을 내릴지 상담사로 넘길지를 아는
+        유일한 경로다. 판정은 Core 가 끝냈으므로 호스트는 **고쳐 읽지 않는다**: `disable` 에
+        담긴 구성요소를 계속 부르면 폴백은 걸린 채로 엔진 호출만 이어진다.
+        """
+        if not self.ok or not isinstance(self.result, dict):
+            return None
+        fallback = self.result.get("fallback")
+        return fallback if isinstance(fallback, dict) else None
 
 
 @dataclass
