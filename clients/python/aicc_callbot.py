@@ -55,6 +55,25 @@ agent.py 에 넣을 것은 훅마다 한 줄이다(이 파일은 agent.py 를 im
    대기 시간을 주지 않았으면 대기하지 않는다(없는 근거를 만들지 않는다, §13-3).
    **종료(`on_call_end`)·`close()` 는 어떤 경우에도 미루지 않는다** — 브리지도 end 를 제한하지 않고,
    닫히지 않은 세션은 장애가 아니라 요금으로 먼저 나타난다.
+8. **업무시스템 조회 대기(§6.1)를 끝까지 꿴다.** Api 노드에 닿은 턴의 응답에는 발화가 아니라
+   **조회 결과를 기다린다는 사실**(`pending_connector_id`)이 실려 온다. 그 자리가 없던 동안
+   음성 호스트에는 답을 되돌려줄 방법이 아예 없었고, 증상은 예외가 아니라 **무음**이다:
+   고객이 무슨 말을 해도 `steps` 0건·`events` 0건이 돌아오고 오류도 아니라서 통화는 끊기지도
+   않은 채 멈추고 어떤 알림도 울리지 않는다("그 메뉴만 안 된다"로만 나타난다).
+   `on_connector_result` 는 **어댑터가 본 대기 id 를 함께 선언한다** — 호스트가 그 값을 들고
+   다니며 상관짓지 않아도 되고(들고 다니게 하면 통화 두 건이 겹치는 순간 섞인다), 선언이
+   어긋나면 Core 가 반영하지 않는다. 대기를 본 적이 없으면 **보내지 않고 알린다**: 서지 않은
+   대기에 답하는 것은 호스트 버그이고, 조용히 보내면 그 응답은 성공으로 돌아온다.
+   조회 결과는 **한도 대기에 걸려도 미루지 않는다** — 미루면 그 통화는 답을 받지 못해 무음으로
+   멈춘다(종료를 미루지 않는 것과 같은 이유다).
+9. **§9.3 지시가 도착할 자리를 둔다.** 이관·폴백 판정은 Core 가 끝내고 **수행은 호스트가** 한다.
+   그런데 비-Node 호스트에 그 지시가 닿는 경로는 턴 응답 하나뿐이어서, 응답 원문을 그대로
+   넘겨 두면 저장소마다 `result["handoff"]["placement"]["placement"]` 를 각자 파싱하다 각자
+   다르게 틀린다 — 가장 비싼 오답은 **큐에 들어가지 못한 고객에게 "상담사를 연결해
+   드리겠습니다"를 안내하는 것**이다(대안으로 간 건은 놓을 큐 id 가 없어 `queue` 가 비고,
+   그 모양은 "큐를 선언하지 않은 이관"과 같다). 그래서 판정된 값만 `on_handoff`·`on_fallback`
+   으로 넘긴다: **모름(None)을 False 로 적지 않고**(§13-3), 상담사용 요약은 담지 않으며
+   (§2·§10.3), 같은 폴백 모드를 턴마다 다시 알리지 않는다(알리면 같은 안내가 반복된다).
 
 무엇을 하지 않는가 (build now, activate on approval)
 ---------------------------------------------------
@@ -78,6 +97,11 @@ _TRUTHY = ("1", "true", "yes", "on")
 
 ErrorHook = Callable[[str, str], None]          # (code, message_ko)
 TurnHook = Callable[[str, Any], None]           # (call_id, result payload)
+#: (call_id, {"queued": bool|None, "action": str|None, "queue": str|None}) — §9.3 이관 지시.
+#: 상담사용 요약·슬롯 값은 담기지 않는다(§2·§10.3).
+HandoffHook = Callable[[str, Dict[str, Any]], None]
+#: (call_id, mode, disable) — §9.3 폴백 판정. mode 가 바뀐 턴에만 불린다.
+FallbackHook = Callable[[str, str, tuple], None]
 ClientFactory = Callable[[], BridgeClient]
 
 
@@ -120,6 +144,24 @@ class HookStats:
     #: `ends_missing_billable_ms`(선언 자체가 없음)와 나눠 센다 — 합치면 "회선이 값을 주지 않았다"와
     #: "준 값이 버려졌다"가 같은 숫자가 되고, 둘의 고칠 곳은 서로 다른 저장소다.
     ends_billable_ms_unrecorded: int = 0
+    #: §6.1 Api 대기가 **새로 선** 턴 수(= 호스트가 업무시스템을 부를 차례가 된 횟수).
+    #: 이 값이 올라가는데 `connector_results_sent` 가 따라오지 않으면, 그 통화들은 조회 결과를
+    #: 기다리다 **무음으로** 멈춘 것이다 — 예외도 오류 응답도 없으므로 이 두 수의 차이가 유일한 신호다.
+    connector_waits: int = 0
+    connector_results_sent: int = 0
+    #: 대기를 본 적이 없는데 조회 결과를 되돌려주려 한 횟수. **보내지 않았다**(머리말 8번).
+    connector_results_unexpected: int = 0
+    #: 보냈는데 Core 가 **반영하지 않은** 건수(`connector.resultApplied == False`).
+    #: 늦게·중복 도착했거나 선언한 커넥터가 서 있는 대기와 다른 경우다. 사유는 응답에 있다.
+    connector_results_not_applied: int = 0
+    #: §9.3 이관이 일어난 통화 수(통화당 한 번만 센다 — 끝난 통화의 응답에는 이관이 계속 실려 온다).
+    handoffs_requested: int = 0
+    #: 그중 **큐에 들어가지 못한** 건수(대안·거절). 이 수만큼 "상담사 연결" 안내를 하면 안 된다.
+    handoffs_not_queued: int = 0
+    #: 큐 배정 판정 자체가 없던 건수(라우팅 미배선). **못 들어갔다로 세지 않는다**(§13-3).
+    handoffs_placement_unknown: int = 0
+    #: §9.3 폴백 모드가 바뀐 횟수(정상 → 폴백 → 정상 전부 포함).
+    fallback_changes: int = 0
 
     def as_dict(self) -> Dict[str, int]:
         return dict(self.__dict__)
@@ -132,6 +174,13 @@ class _Call:
     turns: int = field(default=0)
     #: 이 시각(단조 시계, 초) 전에는 턴을 보내지 않는다. 0 이면 대기 없음.
     blocked_until: float = 0.0
+    #: Core 가 마지막 응답에서 말한 §6.1 대기 커넥터 id. **Core 의 마지막 말이지 추정이 아니다.**
+    pending_connector: Optional[str] = None
+    #: 이관을 이미 알렸는가. 끝난 통화의 응답에는 이관이 서 있는 상태로 계속 실려 오므로
+    #: 이 표시가 없으면 같은 이관을 턴마다 다시 알린다(호스트는 안내·기록을 되풀이한다).
+    handoff_notified: bool = False
+    #: 마지막으로 알린 §9.3 폴백 모드. 'normal' 은 판정이 실리지 않은 상태다.
+    fallback_mode: str = "normal"
 
 
 class CallbotCoreHooks:
@@ -152,6 +201,8 @@ class CallbotCoreHooks:
         entry_point: str = "inbound_call",
         on_error: Optional[ErrorHook] = None,
         on_turn: Optional[TurnHook] = None,
+        on_handoff: Optional[HandoffHook] = None,
+        on_fallback: Optional[FallbackHook] = None,
         disabled_reason_ko: str = "",
         monotonic: Optional[Callable[[], float]] = None,
     ) -> None:
@@ -163,6 +214,8 @@ class CallbotCoreHooks:
         self._entry_point = entry_point
         self._on_error = on_error
         self._on_turn = on_turn
+        self._on_handoff = on_handoff
+        self._on_fallback = on_fallback
         self._client: Optional[BridgeClient] = None
         self._calls: Dict[str, _Call] = {}
         self._lock = threading.RLock()
@@ -186,6 +239,8 @@ class CallbotCoreHooks:
         adapter: str = "callbot",
         on_error: Optional[ErrorHook] = None,
         on_turn: Optional[TurnHook] = None,
+        on_handoff: Optional[HandoffHook] = None,
+        on_fallback: Optional[FallbackHook] = None,
         node_bin: str = "node",
     ) -> "CallbotCoreHooks":
         """환경변수로 만든다. 조건이 하나라도 빠지면 **꺼진 어댑터**를 돌려주며 예외를 던지지 않는다."""
@@ -212,7 +267,8 @@ class CallbotCoreHooks:
                 node_bin=node_bin, max_line_bytes=max_line,
             )
 
-        return cls(factory, flow_id=flow_id, entry_point=entry, on_error=on_error, on_turn=on_turn)
+        return cls(factory, flow_id=flow_id, entry_point=entry, on_error=on_error, on_turn=on_turn,
+                   on_handoff=on_handoff, on_fallback=on_fallback)
 
     # ── 상태 ─────────────────────────────────────────────────────────────
     @property
@@ -226,6 +282,17 @@ class CallbotCoreHooks:
     def open_call_ids(self) -> list:
         with self._lock:
             return [cid for cid, c in self._calls.items() if not c.ended]
+
+    def pending_connector_id(self, call_id: str) -> Optional[str]:
+        """이 통화가 기다리는 §6.1 커넥터 id. 없으면 None.
+
+        Core 가 마지막 응답에서 말한 값이며 **어댑터가 추정하지 않는다**(§13-3). 값이 있으면
+        보내야 하는 다음 입력은 발화가 아니라 `on_connector_result(...)` 다 — 대기 중에 발화를
+        보내면 응답은 `steps` 0건·`events` 0건이고 오류도 아니다(통화는 무음으로 멈춘다).
+        """
+        with self._lock:
+            call = self._calls.get(call_id)
+            return None if call is None else call.pending_connector
 
     # ── 훅 ───────────────────────────────────────────────────────────────
     def on_call_start(self, call_id: str, *, correlation_id: Optional[str] = None) -> Optional[str]:
@@ -251,8 +318,15 @@ class CallbotCoreHooks:
                 self._report(res.error.code if res.error else "E_START_FAILED",
                              "Core 세션을 열지 못해 이 통화는 Core 없이 진행합니다.")
                 return None
-            self._calls[call_id] = _Call(interaction_id=res.interaction_id)
+            call = _Call(interaction_id=res.interaction_id)
+            self._calls[call_id] = call
             self.stats.calls_started += 1
+            # 첫 응답도 §6.1 대기·§9.3 이관을 들고 올 수 있다(첫 노드가 Api·Transfer 인 시나리오).
+            # 턴에서만 읽으면 그 통화는 **시작부터** 지시를 놓치고, 고객은 무음을 듣는다.
+            call.pending_connector = res.pending_connector_id
+            if call.pending_connector is not None:
+                self.stats.connector_waits += 1
+            self._notify_routing(call_id, call, res)
             return res.interaction_id
 
     def on_transcript(
@@ -342,6 +416,58 @@ class CallbotCoreHooks:
             lambda c, i: c.send_timeout(i, **facts),
             usage_declared=bool(usage),
         )
+
+    def on_connector_result(
+        self,
+        call_id: str,
+        ok: bool,
+        *,
+        slots: Optional[Dict[str, str]] = None,
+        error_code: Optional[str] = None,
+    ) -> Optional[BridgeResponse]:
+        """업무시스템 조회 결과를 되돌려준다(§6.1 — `pending_connector_id` 가 섰을 때).
+
+        `ok` 는 **명시해야 한다** — 빠진 값을 성공으로 읽으면 실패한 조회가 성공으로 흘러간다.
+        `slots` 는 커넥터 계층에서 허용목록·마스킹을 마친 값만 넣는다(§10.3). 실패면 `error_code`
+        를 주면 시나리오의 `onError` 분기가 그 코드를 근거로 갈라지고, 분기가 없으면 Core 가
+        상담사로 내린다 — 조회 실패로 콜을 끊지 않는다(§9.3).
+
+        **어느 대기에 답하는지는 어댑터가 선언한다**(머리말 8번): 호스트가 커넥터 id 를 들고
+        다니며 상관짓게 두면 통화 두 건이 겹치는 순간 섞이고, 섞인 결과는 **다른 조회의 값으로
+        채워진 안내**가 되어 예외 없이 지나간다. 대기를 본 적이 없으면 보내지 않고 알린다.
+
+        **한도 대기(`blocked_until`)에 걸려도 미루지 않는다**: 이 통화는 답을 받지 못하면
+        진행할 방법이 없어 무음으로 멈춘다(종료를 미루지 않는 것과 같은 이유다). 한도로
+        거절되면 사실대로 돌려주므로 호스트가 다시 부를 수 있다.
+
+        **`usage` 를 받지 않는다**: 커넥터 재개 턴에는 고객 발화 이벤트가 없어 Core 가 실측을
+        실을 자리가 없다 — 받아서 보내면 응답에 "실을 자리가 없었다"만 적힌다(§11.2).
+        """
+        with self._lock:
+            call = self._calls.get(call_id)
+            pending = None if call is None else call.pending_connector
+            if call is not None and not call.ended and pending is None:
+                # 서 있지 않은 대기에 답하려 한다. 보내면 Core 는 늦게 온 응답으로 보고 버리는데
+                # 그 응답이 `ok: True` 라 호스트는 반영됐다고 읽는다 — 세고, 알리고, 보내지 않는다.
+                self.stats.connector_results_unexpected += 1
+                self._report("E_CONNECTOR_NO_WAIT",
+                             "서 있는 업무시스템 조회 대기가 없어 조회 결과를 보내지 않았습니다.")
+                return None
+        res = self._turn(
+            call_id,
+            lambda c, i: c.send_connector_result(i, ok, slots=slots, error_code=error_code,
+                                                 connector_id=pending),
+            usage_capable=False,
+            defer_on_limit=False,
+        )
+        if res is not None and res.ok:
+            self.stats.connector_results_sent += 1
+            # **보냈다와 반영됐다는 다른 질문이다**(§6.1). Core 의 판정을 그대로 읽는다.
+            if res.connector_result_applied is False:
+                self.stats.connector_results_not_applied += 1
+                self._report("E_CONNECTOR_NOT_APPLIED",
+                             "되돌려준 조회 결과가 대기에 반영되지 않았습니다. 사유는 응답에 있습니다.")
+        return res
 
     def on_call_end(
         self,
@@ -467,7 +593,18 @@ class CallbotCoreHooks:
         fn: Callable[[BridgeClient, str], BridgeResponse],
         *,
         usage_declared: bool = False,
+        usage_capable: bool = True,
+        defer_on_limit: bool = True,
     ) -> Optional[BridgeResponse]:
+        """한 턴을 보낸다.
+
+        `usage_capable=False` 인 입력(커넥터 결과)은 **실측 누락으로 세지 않는다**: Core 에
+        실을 자리가 애초에 없으므로 그 턴을 "근거 없는 턴"에 더하면 `turns_missing_usage` 가
+        고칠 수 없는 건수로 부풀고, 그 수를 보고 회선 계측을 뒤지게 된다(§11.2·§13-3).
+
+        `defer_on_limit=False` 는 한도 대기를 **건너뛰고** 보낸다 — 미루면 그 통화가 멈추는
+        입력(조회 결과)에만 쓴다(`on_connector_result` 주석).
+        """
         if not self._ready():
             return None
         with self._lock:
@@ -479,7 +616,7 @@ class CallbotCoreHooks:
                 self.stats.late_after_end += 1  # 끝난 통화의 지연 전사. 보내지 않는다
                 return None
             now = self._now()
-            if call.blocked_until > now:
+            if defer_on_limit and call.blocked_until > now:
                 # 한도가 풀릴 때까지는 보내지 않는다. 통화는 계속되고, 건수로만 남는다.
                 self.stats.turns_deferred += 1
                 return None
@@ -489,9 +626,16 @@ class CallbotCoreHooks:
             if res.ok:
                 self.stats.turns_sent += 1
                 call.turns += 1
+                # Core 가 말한 §6.1 대기 상태를 그대로 기록한다(추정하지 않는다). 새로 선 대기만
+                # 센다 — 같은 대기가 서 있는 턴마다 세면 "부를 차례"가 턴 수만큼 부풀어 보인다.
+                pending = res.pending_connector_id
+                if pending is not None and pending != call.pending_connector:
+                    self.stats.connector_waits += 1
+                call.pending_connector = pending
+                self._notify_routing(call_id, call, res)
                 # 보낸 턴 중 §11.2 실측 선언이 없던 건수. 통화 구간(`ends_missing_billable_ms`)과
                 # 같은 이유로 센다 — 그 턴의 엔진 비용은 원장에 없고 청구서에만 남는다.
-                if not usage_declared:
+                if usage_capable and not usage_declared:
                     self.stats.turns_missing_usage += 1
                 # **보냈다와 실렸다는 다른 질문이다**(§11.2). 선언 건수만 세던 동안 이 어댑터의
                 # 카운터는 "근거 있는 턴"을 과대 보고했다 — 실을 자리가 없어 버려진 실측도
@@ -527,6 +671,55 @@ class CallbotCoreHooks:
         if retry_after_ms is None or retry_after_ms <= 0:
             return 0.0
         return now + retry_after_ms / 1000.0
+
+    def _notify_routing(self, call_id: str, call: _Call, res: BridgeResponse) -> None:
+        """§9.3 이관·폴백 지시를 호스트에 넘긴다(머리말 9번). **판정은 Core 가 끝냈다.**
+
+        여기서 지키는 것:
+        - **모름을 못 들어갔다로 적지 않는다**(§13-3): 라우팅이 배선되지 않은 테넌트에는 큐
+          배정 판정 자체가 없다. False 로 읽으면 종전까지 되던 이관 안내가 그 테넌트 전체에서
+          사라지고, True 로 읽으면 오지 않는 상담사를 안내한다 — 둘 다 조용하다.
+        - **요약·슬롯은 담지 않는다**(§2·§10.3): 상담사용 요약은 고객 접점 프로세스로 나가면
+          안 되는 값이라 응답에도 기본적으로 실리지 않는다. 여기서 되살리지 않는다.
+        - **한 통화에 한 번만 알린다**: 끝난 통화의 응답에는 이관이 서 있는 상태로 계속 실려
+          오므로, 턴마다 알리면 호스트는 같은 이관을 여러 번 안내·기록한다.
+        - **폴백은 모드가 바뀐 턴에만 알린다**: 장애 중에는 턴마다 같은 판정이 실려 온다.
+        콜백이 던지는 예외는 통화를 끊지 않는다(어댑터의 다른 콜백과 같은 규칙).
+        """
+        handoff = res.handoff
+        if handoff is not None and not call.handoff_notified:
+            call.handoff_notified = True
+            self.stats.handoffs_requested += 1
+            queued = res.queued
+            if queued is False:
+                self.stats.handoffs_not_queued += 1
+            elif queued is None:
+                self.stats.handoffs_placement_unknown += 1
+            if self._on_handoff is not None:
+                queue = handoff.get("queue")
+                payload: Dict[str, Any] = {
+                    "queued": queued,
+                    "action": res.handoff_action,
+                    "queue": queue if isinstance(queue, str) and queue else None,
+                }
+                try:
+                    self._on_handoff(call_id, payload)
+                except Exception:  # noqa: BLE001 - 호출자 콜백 오류가 통화를 끊으면 안 된다
+                    pass
+
+        fallback = res.fallback
+        mode = fallback.get("mode") if isinstance(fallback, dict) else None
+        mode = mode if isinstance(mode, str) and mode else "normal"
+        if mode != call.fallback_mode:
+            call.fallback_mode = mode
+            self.stats.fallback_changes += 1
+            if self._on_fallback is not None:
+                raw = fallback.get("disable") if isinstance(fallback, dict) else None
+                disable = tuple(str(c) for c in raw) if isinstance(raw, list) else ()
+                try:
+                    self._on_fallback(call_id, mode, disable)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _report(self, code: str, message_ko: str) -> None:
         if self._on_error is None:
@@ -608,6 +801,16 @@ class AsyncCallbotCoreHooks:
 
     async def on_timeout(self, call_id: str, **kw: Any) -> Optional[BridgeResponse]:
         return await self._run(call_id, lambda: self.inner.on_timeout(call_id, **kw))
+
+    # 같은 체인을 쓴다 — 조회 결과가 다음 발화를 앞지르면 그 발화가 **대기 중의 발화**로
+    # 취급돼 조용히 버려지고(§6.1 구간), 반대 순서면 조회 결과가 먼저 반영돼야 할 자리를
+    # 발화가 차지한다. 둘 다 예외가 아니다.
+    async def on_connector_result(self, call_id: str, ok: bool, **kw: Any) -> Optional[BridgeResponse]:
+        return await self._run(call_id, lambda: self.inner.on_connector_result(call_id, ok, **kw))
+
+    def pending_connector_id(self, call_id: str) -> Optional[str]:
+        """§6.1 대기 조회는 동기다 — 체인에 넣지 않는다(기다리는 동안 상태가 바뀌지 않는다)."""
+        return self.inner.pending_connector_id(call_id)
 
     async def on_call_end(
         self,

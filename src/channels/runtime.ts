@@ -27,6 +27,8 @@ import type { TenantScope, TenantVectorStore } from '../core/tenancy.ts';
 import { assertTenantScope } from '../core/tenancy.ts';
 import type { DataClass, RetentionPolicy } from '../core/retention.ts';
 import { canStore } from '../core/retention.ts';
+// 호스트가 선언한 문자열(커넥터 id)을 사유 문구에 그대로 보간하지 않는다(§10.3).
+import { maskPii } from '../core/policyGuard.ts';
 import type { EventMeta, InteractionEvent, LatencyMs, TurnCompletedEvent, HandoffRequestedEvent, UsageMetrics } from '../events/schema.ts';
 import { measuredDurationMs, sessionStarted, sessionEnded, handoffRequested, turnCompleted } from '../events/schema.ts';
 import type { EventBus, PublishResult } from '../events/bus.ts';
@@ -95,7 +97,7 @@ import {
 import type {
   ChannelAdapterId, ChannelEndInput, ChannelHealthReport, ChannelRegistration, ChannelSessionRequest,
   ChannelTurnInput, ChannelTurnResult, ConversationCorePort, ContractIssue, ChannelCapabilities,
-  HealthIntakeReceipt, SwitchInviteNote,
+  ConnectorResultNote, HealthIntakeReceipt, SwitchInviteNote,
 } from './contract.ts';
 import { ADAPTER_CHANNEL, CHANNEL_CONTRACT_VERSION, checkFlowSupported, registrationOk, validateRegistration } from './contract.ts';
 
@@ -435,6 +437,10 @@ function withoutSwitchToken(result: ChannelTurnResult): ChannelTurnResult {
  *    없던 갈래와 `end` 재호출은 그대로 새고 있었다** — 호스트가 응답의 과금 근거로 자기 장부를
  *    쓰면 원장에 없는 수량이 장부에만 생긴다. 빠진 항목(`usageConflicts`·`usageRejected`)도
  *    같이 되풀이돼, 한 번 일어난 이중 출처를 운영이 재시도마다 다시 쫓는다.
+ *  - `connector`(§6.1): 아무 조회 결과도 반영하지 않은 호출이 `resultApplied: true` 를 들고
+ *    돌아온다. 호스트는 "답은 들어갔다"로 읽고 다음 발화를 기다리는데 대기는 그대로 서 있거나
+ *    (끝난 세션이라) 아무 안내도 나가지 않는다 — 조회 결과를 되돌려주는 쪽이 바로 재시도가
+ *    가장 많은 자리다(업무시스템 호출이 느려 타임아웃으로 재전송된다).
  *
  * **남기는 것은 상태다**: `state`·`steps`·`status`·`handoff`·`fallback` 은 세션에 서 있는 사실이고
  * (되풀이해도 거짓이 아니다), `consent.pendingRequired` 도 지금 미획득인 목적이라 서 있는 값이다.
@@ -442,13 +448,46 @@ function withoutSwitchToken(result: ChannelTurnResult): ChannelTurnResult {
  */
 function withoutTurnFacts(result: ChannelTurnResult): ChannelTurnResult {
   const {
-    billing: _billing, disclosure: _disclosure, switchInvite: _invite, consent, ...standing
+    billing: _billing, disclosure: _disclosure, switchInvite: _invite,
+    connector: _connector, consent, ...standing
   } = result;
   if (consent === undefined) return standing;
   // 확정 사실(`recorded`)과 그 사실을 적지 못한 사유만 뺀다 — 남는 것이 없으면 칸 자체를
   // 만들지 않는다(빈 객체는 "확인했는데 아무것도 없음"으로 읽힌다).
   const { recorded: _recorded, notRecordedKo: _notRecorded, ...standingConsent } = consent;
   return Object.keys(standingConsent).length === 0 ? standing : { ...standing, consent: standingConsent };
+}
+
+/**
+ * 되돌려받은 §6.1 조회 결과가 반영됐는지를 **관측으로만** 판정한다(`ConnectorResultNote`).
+ *
+ * 판정 규칙을 따로 만들지 않고 턴 전후의 대기 id 만 본다(§13-3): 대기가 서 있지 않았으면
+ * Runner 가 늦게 온 응답으로 보고 버린 것이고(멱등, §8.1), 같은 대기가 그대로 서 있으면
+ * 반영되지 않은 것이다. 지금까지 그 둘은 `ok: true` · `steps` 0건 · `events` 0건으로 돌아가
+ * **반영된 턴과 와이어에서 구분되지 않았다** — 호스트는 다음 발화를 기다리고 고객은 아무
+ * 안내도 듣지 못한다(§6.1 무음).
+ */
+function connectorNote(before: string | undefined, after: string | undefined): ConnectorResultNote {
+  if (before === undefined) {
+    return {
+      resultApplied: false,
+      reasonKo: '서 있는 Api 대기가 없어 늦게 도착한 조회 결과로 보고 반영하지 않았습니다'
+        + '(멱등, §8.1) — 이 턴은 시나리오를 진행시키지 않았습니다.',
+      ...(after !== undefined ? { pendingConnectorId: after } : {}),
+    };
+  }
+  if (after === before) {
+    return {
+      resultApplied: false,
+      reasonKo: '조회 결과를 보냈으나 같은 대기가 그대로 서 있습니다 — 반영되지 않았습니다(§6.1).',
+      pendingConnectorId: after,
+    };
+  }
+  return {
+    resultApplied: true,
+    // 연달아 있는 Api 노드. 이 값이 있으면 **한 번 더 답해야 한다**.
+    ...(after !== undefined ? { pendingConnectorId: after } : {}),
+  };
 }
 
 /**
@@ -3528,6 +3567,43 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
         };
       }
 
+      // §6.1 — 되돌려준 조회 결과가 **어느 대기에 대한 답인지** 호스트가 선언했으면 여기서
+      // 대조한다(`W_CONNECTOR_STALE`). 선언이 없으면 이 블록은 아무것도 하지 않는다(§13-3).
+      // 대조를 Runner 가 아니라 경계에 둔 이유는 판정을 두 벌로 두지 않기 위해서다(§2) —
+      // 그리고 **반영하지 않았다는 사실을 돌려줄 수 있는 자리가 여기뿐**이다.
+      const answeredConnectorId = turn.input.kind === 'connectorResult' ? turn.input.connectorId : undefined;
+      const pendingConnectorBefore = rec.state.pendingConnectorId;
+      if (answeredConnectorId !== undefined && answeredConnectorId !== pendingConnectorBefore) {
+        const whichKo = pendingConnectorBefore === undefined
+          ? '지금 서 있는 Api 대기가 없습니다'
+          : `지금 서 있는 대기는 ${maskPii(pendingConnectorBefore).text} 입니다`;
+        warnOnce('W_CONNECTOR_STALE',
+          `호스트가 ${maskPii(answeredConnectorId).text} 커넥터의 결과라고 선언했으나 ${whichKo} — `
+          + '그 결과를 반영하지 않았습니다. 반영하면 다른 조회의 값이 이 대기의 답으로 슬롯에 '
+          + '들어가고, 고객은 엉뚱한 값으로 채워진 안내를 듣습니다(§6.1).');
+        // 상태는 손대지 않는다. 대기가 서 있으면 그대로 서 있고(호스트는 다시 답할 수 있다)
+        // 없으면 없는 그대로다 — 반영하지 않은 사유만 돌려준다.
+        return {
+          ...withoutTurnFacts(rec.lastResult),
+          events: [],
+          connector: {
+            resultApplied: false,
+            reasonKo: `선언한 커넥터(${maskPii(answeredConnectorId).text})가 서 있는 대기와 달라 결과를 반영하지 않았습니다 — ${whichKo}(§6.1).`,
+            ...(pendingConnectorBefore !== undefined ? { pendingConnectorId: pendingConnectorBefore } : {}),
+          },
+          // 이 턴에는 고객 발화 이벤트가 만들어지지 않는다 — 실측을 선언했으면 실리지 않았다는
+          // 사실을 그대로 돌려준다(끝난 세션의 늦은 입력과 같은 규칙, §11.2).
+          ...(turn.usage === undefined ? {} : {
+            billing: {
+              usageAttached: false,
+              usageReasonKo: '선언한 커넥터가 서 있는 대기와 달라 이 턴을 시나리오에 넣지 않았고 '
+                + '고객 발화 이벤트도 만들어지지 않아 실측을 실을 자리가 없었습니다 — '
+                + '그 사용량은 과금 집계에 들어가지 않습니다(§6.1·§11.2).',
+            },
+          }),
+        };
+      }
+
       const prevChannel = rec.state.channel;
       // 이 턴이 **기다리던** 노드. 동의 확정 판정의 기준이다(§10.1) — 턴 뒤의 슬롯만 보면
       // 확정된 Confirm 값이 세션에 영구히 남아 이후 모든 턴에서 같은 동의가 다시 쌓인다.
@@ -3570,6 +3646,9 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
         ...(billing !== undefined ? { billing } : {}),
         ...(invitePlan !== undefined ? { switchInvite: invitePlan.note } : {}),
         ...complianceSlot(rec, events),
+        ...(turn.input.kind === 'connectorResult'
+          ? { connector: connectorNote(pendingConnectorBefore, rec.state.pendingConnectorId) }
+          : {}),
       };
       rec.lastResult = withoutSwitchToken(result);
       sessions.put(rec);

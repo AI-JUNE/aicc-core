@@ -27,6 +27,20 @@ export const flows = [{
     // 조회 실패는 고객 잘못이 아니다 — 계약에 있는 사유(`error`)로 적는다(§8.1 집계가 센다).
     n_tr: { id: 'n_tr', kind: 'Transfer', queue: 'q_default', reason: 'error' },
   },
+}, {
+  // 조회가 **연달아** 있는 흐름(조회형 시나리오에서 가장 흔한 모양: 본인 확인 → 잔액 조회).
+  // 이 흐름이 없으면 "앞 조회의 결과가 뒤 조회의 답으로 적용된다"는 사고를 재현할 수 없다 —
+  // 업무시스템 호출이 느려 결과를 재전송하는 호스트가 정확히 그 모양을 만든다(§6.1).
+  id: 'f_reference_api_chain',
+  version: 1,
+  startNodeId: 'n_ask',
+  nodes: {
+    n_ask: { id: 'n_ask', kind: 'Collect', slot: 'purpose', prompt: '용건을 말씀해 주세요.', next: 'n_verify' },
+    n_verify: { id: 'n_verify', kind: 'Api', connectorId: 'c_reference_verify', waitText: '확인 중입니다.', next: 'n_lookup', onError: 'n_tr' },
+    n_lookup: { id: 'n_lookup', kind: 'Api', connectorId: 'c_reference_lookup', waitText: '조회 중입니다.', next: 'n_done', onError: 'n_tr' },
+    n_done: { id: 'n_done', kind: 'Say', text: '조회가 끝났습니다.' },
+    n_tr: { id: 'n_tr', kind: 'Transfer', queue: 'q_default', reason: 'error' },
+  },
 }];
 
 export default function createCore() {

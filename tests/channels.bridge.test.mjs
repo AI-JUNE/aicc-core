@@ -985,3 +985,86 @@ test('Core 계약 버전이 브리지와 다르면 기동을 거절한다 — No
   // 버전이 맞으면 종전과 완전히 같다.
   assert.ok(BR.createBridge({ core: wrap(core.contractVersion), adapter: 'callbot', scope: SCOPE }));
 });
+
+// ── §6.1 조회 결과: 어느 대기의 답인가, 반영은 됐는가 ────────────────────────
+//
+// 와이어에는 "조회 결과를 보냈다"만 있었고 **어느 대기에 대한 답인지도, 반영됐는지도** 실릴
+// 자리가 없었다. 둘 다 증상이 조용하다: 앞 조회의 결과가 재전송되면 뒤 조회의 답으로 적용되고
+// (고객은 다른 조회의 값으로 채워진 안내를 듣는다), 반영되지 않은 결과는 `ok` 로 돌아가
+// 호스트가 다음 발화를 기다리는 동안 통화는 무음으로 멈춘다.
+
+const chainFlow = {
+  id: 'chain', version: 1, startNodeId: 'ask',
+  nodes: {
+    ask: { id: 'ask', kind: 'Collect', slot: 'account_no', prompt: '계좌번호를 말씀해 주세요.', next: 'verify' },
+    verify: { id: 'verify', kind: 'Api', connectorId: 'c_verify', waitText: '확인 중입니다.', next: 'lookup' },
+    lookup: { id: 'lookup', kind: 'Api', connectorId: 'c_balance', waitText: '조회 중입니다.', next: 'tell' },
+    tell: { id: 'tell', kind: 'Say', text: '조회가 끝났습니다.' },
+  },
+};
+
+async function atChainWait() {
+  const { bridge } = build({}, { flows: R.createMemoryFlowRegistry([chainFlow]) });
+  await bridge.handleLine(line({ id: '1', op: 'start', req: { flowId: 'chain', entryPoint: 'inbound_call' } }));
+  const w = await bridge.handleLine(line({
+    id: '2', op: 'send', interactionId: 'i_bridge1', turn: { input: { kind: 'utterance', text: '110-1234' } },
+  }));
+  assert.equal(w.result.state.pendingConnectorId, 'c_verify');
+  return { bridge };
+}
+
+test('§6.1 조회 결과의 반영 사실이 와이어로 나간다 — 대기가 또 서면 그 id 도 함께', b, async () => {
+  const { bridge } = await atChainWait();
+  const r = await bridge.handleLine(line({
+    id: '3', op: 'send', interactionId: 'i_bridge1',
+    turn: { input: { kind: 'connectorResult', ok: true, connectorId: 'c_verify', slots: { verified: 'Y' } } },
+  }));
+  assert.equal(r.ok, true, JSON.stringify(r.error));
+  assert.equal(r.result.connector.resultApplied, true);
+  assert.equal(r.result.connector.pendingConnectorId, 'c_balance');
+  assert.equal(r.result.connector.reasonKo, undefined);
+});
+
+test('어긋난 커넥터 선언은 반영되지 않고 사유가 와이어로 돌아온다(실패 경로)', b, async () => {
+  const { bridge } = await atChainWait();
+  const r = await bridge.handleLine(line({
+    id: '3', op: 'send', interactionId: 'i_bridge1',
+    turn: { input: { kind: 'connectorResult', ok: true, connectorId: 'c_balance', slots: { balance: '0' } } },
+  }));
+  // 거절이 아니다 — 통화는 계속되고 대기는 그대로 서 있다(§9.3).
+  assert.equal(r.ok, true, JSON.stringify(r.error));
+  assert.equal(r.result.connector.resultApplied, false);
+  assert.match(r.result.connector.reasonKo, /c_verify/);
+  assert.equal(r.result.state.pendingConnectorId, 'c_verify');
+  assert.deepEqual(r.result.state.slotKeys, ['account_no'], '반영하지 않은 결과의 슬롯이 들어갔다');
+});
+
+test('빈 커넥터 선언은 선언이 아니다 — 받지 않는다(§13-3)', b, async () => {
+  const { bridge } = await atChainWait();
+  const r = await bridge.handleLine(line({
+    id: '3', op: 'send', interactionId: 'i_bridge1',
+    turn: { input: { kind: 'connectorResult', ok: true, connectorId: '' } },
+  }));
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, 'E_BAD_REQUEST');
+  // 선언하지 않으면 종전과 완전히 같다 — 그 턴은 반영된다.
+  const plain = await bridge.handleLine(line({
+    id: '4', op: 'send', interactionId: 'i_bridge1',
+    turn: { input: { kind: 'connectorResult', ok: true } },
+  }));
+  assert.equal(plain.result.connector.resultApplied, true);
+});
+
+test('호스트가 고친 반영 사실이 Core 의 판정으로 남지 않는다 — 투영은 복사다', b, async () => {
+  const { bridge } = await atChainWait();
+  const r = await bridge.handleLine(line({
+    id: '3', op: 'send', interactionId: 'i_bridge1',
+    turn: { input: { kind: 'connectorResult', ok: true, connectorId: 'c_balance' } },
+  }));
+  r.result.connector.resultApplied = true;             // 호스트가 고쳐 본다
+  const again = await bridge.handleLine(line({
+    id: '4', op: 'send', interactionId: 'i_bridge1',
+    turn: { input: { kind: 'connectorResult', ok: true, connectorId: 'c_balance' } },
+  }));
+  assert.equal(again.result.connector.resultApplied, false, 'Core 의 판정이 호스트 쪽 수정에 흔들렸다');
+});

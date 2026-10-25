@@ -394,6 +394,51 @@ c.close(); c2.close()
   assert.ok(resultLine.includes('"ok":true'), `ok 를 명시하지 않았다: ${resultLine}`);
 });
 
+test('§6.1 어느 대기에 답하는지 선언할 수 있고, 어긋나면 반영되지 않는다', b, () => {
+  // 조회가 연달아 있는 흐름에서 **앞 조회의 결과가 재전송되면** 뒤 조회의 답으로 적용된다 —
+  // 업무시스템 호출이 느린 호스트가 정확히 그 모양을 만들고, 고객은 다른 조회의 값으로
+  // 채워진 안내를 듣는다. 예외도 오류 응답도 없으므로 선언과 판정이 유일한 방어다.
+  const source = `${PRELUDE}
+API_CORE = os.path.join(ROOT, "fixtures", "reference-core-connector.mjs")
+c = BridgeClient(core_module=API_CORE, adapter="callbot", core_root=ROOT, cwd=ROOT,
+                 max_line_bytes=65536, keep_transcript=True)
+c.hello()
+s = c.start(flow_id="f_reference_api_chain", entry_point="inbound_call")
+i = s.interaction_id
+first = c.send_utterance(i, "잔액 조회요")
+# 첫 대기(확인)를 옳게 답한다 — 다음 대기(조회)가 선다.
+ok = c.send_connector_result(i, True, slots={"verified": "Y"},
+                             connector_id=first.pending_connector_id)
+# 같은 결과가 **다시** 도착했다(재전송). 선언이 어긋나므로 반영되지 않아야 한다.
+stale = c.send_connector_result(i, True, slots={"verified": "N"}, connector_id="c_reference_verify")
+# 선언 없이 보내면 종전과 완전히 같다 — 서 있는 대기에 반영된다.
+plain = c.send_connector_result(i, True, slots={"balance": "10,000원"})
+json.dump({"first_pending": first.pending_connector_id,
+           "ok_applied": ok.connector_result_applied, "ok_pending": ok.pending_connector_id,
+           "stale_ok": stale.ok, "stale_applied": stale.connector_result_applied,
+           "stale_reason": stale.connector_reason_ko, "stale_pending": stale.pending_connector_id,
+           "plain_applied": plain.connector_result_applied,
+           "plain_status": plain.result["status"],
+           "lines": c.transcript.requests}, sys.stdout, ensure_ascii=False)
+c.close()
+`;
+  const run = withDriver(source, (f) => runPython(f));
+  assert.equal(run.status, 0, run.stderr);
+  const out = JSON.parse(run.stdout);
+  assert.equal(out.first_pending, 'c_reference_verify');
+  assert.equal(out.ok_applied, true);
+  assert.equal(out.ok_pending, 'c_reference_lookup', '다음 대기가 섰다는 사실이 와이어로 오지 않았다');
+  // 반영되지 않은 것은 **오류가 아니다** — 통화는 계속되고 대기는 그대로 서 있다(§9.3).
+  assert.equal(out.stale_ok, true);
+  assert.equal(out.stale_applied, false, '앞 조회의 재전송이 뒤 조회의 답으로 적용됐다');
+  assert.match(out.stale_reason, /c_reference_lookup/);
+  assert.equal(out.stale_pending, 'c_reference_lookup');
+  assert.equal(out.plain_applied, true, '선언하지 않은 결과가 반영되지 않았다(종전 동작이 깨졌다)');
+  assert.equal(out.plain_status, 'completed');
+  const declared = out.lines.find((l) => l.includes('c_reference_verify') && l.includes('connectorResult'));
+  assert.ok(declared.includes('"connectorId"'), `선언이 줄에 실리지 않았다: ${declared}`);
+});
+
 test('§5.2 합류 토큰을 보낼 수 있고, 주지 않으면 만들어 넣지 않는다', b, () => {
   // 전환 배선을 켜는 순간 **비-Node 호스트만** 합류하지 못하는 비대칭을 막는다. 토큰은 고객이
   // 누른 링크에 실려 오는 값이며 클라이언트가 만들지 않는다(§10.3).

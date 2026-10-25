@@ -748,3 +748,218 @@ h.close()
   assert.deepEqual(out.errors, []);
   assert.equal(out.degraded, false);
 });
+
+// ── §6.1 업무시스템 조회 대기 ────────────────────────────────────────────────
+// 브리지에는 대기 사실도 결과 경로도 열려 있었지만 **훅 어댑터에는 답할 자리가 없었다**.
+// 그 상태에서 Api 노드에 닿은 통화의 증상은 예외가 아니라 무음이다 — 고객이 무슨 말을 해도
+// `steps` 0건·`events` 0건이 돌아오고 어떤 알림도 울리지 않는다.
+
+test('§6.1 Api 대기가 선 통화에 조회 결과를 되돌려준다 — 대기 id 는 어댑터가 선언한다', b, () => {
+  const out = parse(runDriver(`${PRELUDE}
+API_CORE = os.path.join(ROOT, "fixtures", "reference-core-connector.mjs")
+def api_factory():
+    return BridgeClient(core_module=API_CORE, adapter="callbot", core_root=ROOT, cwd=ROOT,
+                        max_line_bytes=65536, keep_transcript=True)
+h = CallbotCoreHooks(api_factory, flow_id="f_reference_api", entry_point="inbound_call",
+                     on_error=lambda c, m: errors.append(c))
+h.on_call_start("c1")
+h.on_transcript("c1", "user", "잔액 조회요", usage={"stt_audio_ms": 700})
+waiting = h.pending_connector_id("c1")
+applied = h.on_connector_result("c1", True, slots={"balance": "10,000원"})
+after = h.pending_connector_id("c1")
+# 대기가 없는데 또 답한다 — 보내지 않고 알린다(머리말 8번).
+again = h.on_connector_result("c1", True)
+h.on_call_end("c1", billable_ms=4200)
+dump(h, waiting=waiting, after=after,
+     applied=applied.connector_result_applied if applied else None,
+     applied_status=applied.result["status"] if applied else None,
+     again=again is None)
+h.close()
+`));
+  const report = verifyBridgeTranscript(out.transcript, { adapter: 'callbot', maxLineBytes: 65536 });
+  assert.equal(report.verdict, 'passed', JSON.stringify(report.issues));
+  assert.equal(out.waiting, 'c_reference_lookup', '호스트가 "부를 차례"를 알 길이 없었다(§6.1)');
+  assert.equal(out.after, null, '반영된 뒤에도 대기가 남아 있다고 적혔다');
+  assert.equal(out.applied, true);
+  assert.equal(out.applied_status, 'completed');
+  assert.equal(out.stats.connector_waits, 1);
+  assert.equal(out.stats.connector_results_sent, 1);
+  assert.equal(out.stats.connector_results_not_applied, 0);
+  // 대기를 본 적이 없는데 답한 건은 보내지 않고 센다 — 보내면 성공으로 돌아와 호스트를 속인다.
+  assert.equal(out.again, true);
+  assert.equal(out.stats.connector_results_unexpected, 1);
+  assert.deepEqual(out.errors, ['E_CONNECTOR_NO_WAIT']);
+  // **커넥터 결과는 실측 누락으로 세지 않는다**: Core 에 실을 자리가 애초에 없다(§11.2·§13-3).
+  assert.equal(out.stats.turns_missing_usage, 0, '실을 자리가 없는 턴이 "근거 없는 턴"으로 집계됐다');
+  assert.equal(out.stats.turns_sent, 2);
+  const resultLine = out.transcript.requests.find((l) => l.includes('connectorResult'));
+  assert.ok(resultLine.includes('"connectorId":"c_reference_lookup"'), `선언이 실리지 않았다: ${resultLine}`);
+});
+
+test('§6.1 반영되지 않은 결과를 성공으로 세지 않는다(실패 경로)', b, () => {
+  const out = parse(runDriver(`${PRELUDE}
+from aicc_bridge import BridgeResponse
+
+class Stale:
+    """대기는 서 있다고 말하면서 반영은 거부하는 Core(재전송된 결과의 모양)."""
+    def __init__(self):
+        self.transcript = None
+        self.sent = []
+    def hello(self): return BridgeResponse(id="1", ok=True, result={})
+    def start(self, **kw):
+        return BridgeResponse(id="2", ok=True, result={
+            "interactionId": "i1", "state": {"pendingConnectorId": "c_verify"}})
+    def send_connector_result(self, i, ok, **kw):
+        self.sent.append(kw.get("connector_id"))
+        return BridgeResponse(id="3", ok=True, result={
+            "interactionId": i, "state": {"pendingConnectorId": "c_verify"},
+            "connector": {"resultApplied": False, "reasonKo": "선언한 커넥터가 서 있는 대기와 다릅니다."}})
+    def end(self, i, reason, **kw): return BridgeResponse(id="9", ok=True, result={"interactionId": i})
+    def close(self): pass
+
+c = Stale()
+h = CallbotCoreHooks(lambda: c, flow_id="f", on_error=lambda code, m: errors.append(code))
+h.on_call_start("c1")
+res = h.on_connector_result("c1", True, slots={"balance": "0"})
+pending = h.pending_connector_id("c1")
+h.on_call_end("c1")
+json.dump({"transcript": None, "stats": h.stats.as_dict(), "errors": errors,
+           "enabled": h.enabled, "degraded": h.degraded, "reason": h.disabled_reason_ko,
+           "sent": c.sent, "applied": res.connector_result_applied if res else None,
+           "reason_ko": res.connector_reason_ko if res else None, "pending": pending},
+          sys.stdout, ensure_ascii=False)
+h.close()
+`));
+  assert.deepEqual(out.sent, ['c_verify'], '어댑터가 본 대기를 선언하지 않았다');
+  assert.equal(out.applied, false);
+  assert.match(out.reason_ko, /대기/);
+  assert.equal(out.stats.connector_results_sent, 1, '보낸 건수는 보낸 건수다');
+  assert.equal(out.stats.connector_results_not_applied, 1, '반영되지 않은 건을 세지 않으면 무음이 드러나지 않는다');
+  assert.deepEqual(out.errors, ['E_CONNECTOR_NOT_APPLIED']);
+  // 대기는 그대로 서 있다 — 호스트는 다시 답할 수 있다(어댑터가 상태를 지어내지 않는다).
+  assert.equal(out.pending, 'c_verify');
+  // 첫 응답(start)에 이미 대기가 있었으므로 새로 센 대기는 한 건이다.
+  assert.equal(out.stats.connector_waits, 1);
+});
+
+// ── §9.3 이관·폴백 지시가 도착할 자리 ────────────────────────────────────────
+// 판정은 Core 가 끝내고 수행은 호스트가 한다. 응답 원문을 넘겨 두면 저장소마다 각자 파싱하다
+// 각자 다르게 틀리는데, 가장 비싼 오답이 **큐에 들어가지 못한 고객에게 "상담사를 연결해
+// 드리겠습니다"를 안내하는 것**이다 — 고객은 오지 않는 상담사를 기다리다 끊는다.
+
+test('비동기 훅에도 조회 결과 자리가 있다 — 한쪽만 열면 권장 경로에서만 통화가 멈춘다', b, () => {
+  const out = parse(runDriver(`${PRELUDE}
+API_CORE = os.path.join(ROOT, "fixtures", "reference-core-connector.mjs")
+def api_factory():
+    return BridgeClient(core_module=API_CORE, adapter="callbot", core_root=ROOT, cwd=ROOT,
+                        max_line_bytes=65536, keep_transcript=True)
+async def main():
+    h = AsyncCallbotCoreHooks(CallbotCoreHooks(
+        api_factory, flow_id="f_reference_api", entry_point="inbound_call",
+        on_error=lambda c, m: errors.append(c)))
+    await h.on_call_start("call-A")
+    await h.on_transcript("call-A", "user", "잔액 조회요")
+    waiting = h.pending_connector_id("call-A")
+    r = await h.on_connector_result("call-A", True, slots={"balance": "10,000원"})
+    await h.on_call_end("call-A", billable_ms=3000)
+    await h.drain()
+    dump(h.inner, waiting=waiting,
+         applied=(r.connector_result_applied if r else None),
+         status=(r.result["status"] if r and r.ok else None))
+    await h.close()
+asyncio.run(main())
+`));
+  assert.equal(out.waiting, 'c_reference_lookup');
+  assert.equal(out.applied, true, 'asyncio 가 권장 경로다 — 여기서 빠지면 음성 통화가 무음으로 멈춘다');
+  assert.equal(out.status, 'completed');
+  assert.equal(out.stats.connector_results_sent, 1);
+  assert.deepEqual(out.errors, []);
+});
+
+test('§9.3 이관 지시가 통화당 한 번 도착하고, 큐 배정 "모름"을 못 들어갔다로 적지 않는다', b, () => {
+  const out = parse(runDriver(`${PRELUDE}
+handoffs = []
+h = CallbotCoreHooks(factory, flow_id="f_reference_voice", entry_point="inbound_call",
+                     on_error=lambda c, m: errors.append(c),
+                     on_handoff=lambda cid, p: handoffs.append([cid, p]))
+h.on_call_start("c1")
+h.on_transcript("c1", "user", "상담사 연결해 주세요")   # n_tr(Transfer) 로 간다
+h.on_transcript("c1", "user", "여보세요")               # 끝난 세션의 늦은 전사
+h.on_call_end("c1")
+dump(h, handoffs=handoffs)
+h.close()
+`));
+  assert.equal(out.handoffs.length, 1, '같은 이관을 턴마다 다시 알렸다(안내·기록이 되풀이된다)');
+  assert.equal(out.handoffs[0][0], 'c1');
+  assert.equal(out.handoffs[0][1].queue, 'q_default');
+  // 라우팅이 배선되지 않은 테넌트에는 판정 자체가 없다 — False 로 적으면 이관 안내가 사라진다(§13-3).
+  assert.equal(out.handoffs[0][1].queued, null);
+  assert.equal(out.handoffs[0][1].action, null);
+  assert.equal(out.stats.handoffs_requested, 1);
+  assert.equal(out.stats.handoffs_placement_unknown, 1);
+  assert.equal(out.stats.handoffs_not_queued, 0, '모름을 못 들어갔다로 셌다');
+  // 상담사용 요약은 어떤 경우에도 넘기지 않는다(§2·§10.3).
+  assert.deepEqual(Object.keys(out.handoffs[0][1]).sort(), ['action', 'queue', 'queued']);
+});
+
+test('§9.3 큐에 실제로 들어간 건은 들어갔다고 알린다(라우팅 배선 경로)', b, () => {
+  const out = parse(runDriver(`${PRELUDE}
+MAINT = os.path.join(ROOT, "fixtures", "reference-core-maintained.mjs")
+def maint_factory():
+    return BridgeClient(core_module=MAINT, adapter="callbot", core_root=ROOT, cwd=ROOT,
+                        max_line_bytes=65536, keep_transcript=True)
+handoffs = []
+h = CallbotCoreHooks(maint_factory, flow_id="f_reference_voice", entry_point="inbound_call",
+                     on_error=lambda c, m: errors.append(c),
+                     on_handoff=lambda cid, p: handoffs.append(p))
+h.on_call_start("c1")
+h.on_transcript("c1", "user", "상담사 연결해 주세요")
+h.on_call_end("c1")
+dump(h, handoffs=handoffs)
+h.close()
+`));
+  assert.equal(out.handoffs.length, 1);
+  assert.equal(out.handoffs[0].queued, true, '큐에 들어갔는데 모름으로 읽었다');
+  assert.equal(out.stats.handoffs_not_queued, 0);
+  assert.equal(out.stats.handoffs_placement_unknown, 0);
+});
+
+test('§9.3 폴백 지시는 모드가 바뀐 턴에만 알린다(경계 경로)', b, () => {
+  const out = parse(runDriver(`${PRELUDE}
+from aicc_bridge import BridgeResponse
+
+class Modes:
+    """턴마다 미리 정한 §9.3 판정을 돌려준다. 회선·엔진을 만지지 않는다."""
+    def __init__(self, modes):
+        self.modes = list(modes)
+        self.transcript = None
+    def hello(self): return BridgeResponse(id="1", ok=True, result={})
+    def start(self, **kw): return BridgeResponse(id="2", ok=True, result={"interactionId": "i1"})
+    def send_utterance(self, i, text, **kw):
+        body = {"interactionId": i}
+        mode = self.modes.pop(0)
+        if mode is not None:
+            body["fallback"] = {"mode": mode, "disable": ["llm"]}
+        return BridgeResponse(id="3", ok=True, result=body)
+    def end(self, i, reason, **kw): return BridgeResponse(id="9", ok=True, result={"interactionId": i})
+    def close(self): pass
+
+seen = []
+c = Modes([None, "degraded_ai", "degraded_ai", None])
+h = CallbotCoreHooks(lambda: c, flow_id="f", on_error=lambda code, m: errors.append(code),
+                     on_fallback=lambda cid, mode, disable: seen.append([mode, list(disable)]))
+h.on_call_start("c1")
+for _ in range(4):
+    h.on_transcript("c1", "user", "네")
+h.on_call_end("c1")
+json.dump({"transcript": None, "stats": h.stats.as_dict(), "errors": errors,
+           "enabled": h.enabled, "degraded": h.degraded, "reason": h.disabled_reason_ko,
+           "seen": seen}, sys.stdout, ensure_ascii=False)
+h.close()
+`));
+  // 정상 턴에는 아무 지시도 없다 — 없는 판정을 알리지 않는다(§13-3).
+  assert.deepEqual(out.seen, [['degraded_ai', ['llm']], ['normal', []]],
+    '같은 모드를 턴마다 다시 알리면 호스트는 같은 안내를 반복한다');
+  assert.equal(out.stats.fallback_changes, 2);
+  assert.deepEqual(out.errors, []);
+});

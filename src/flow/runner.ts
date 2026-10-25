@@ -32,8 +32,15 @@ export type FlowInput =
    * 외부 연동 호출 결과(§6.1). Runner는 순수·동기 함수이므로 커넥터를 직접 부르지 않는다.
    * 호스트가 Api 단계를 보고 호출한 뒤, 결과만 이 입력으로 되돌려준다.
    * slots 는 applyResponse()를 통과한 값이어야 한다 — 마스킹 책임은 커넥터 계층에 있다(§10.3).
+   *
+   * `connectorId` 는 **호스트가 "어느 대기에 답하는가"를 선언하는 칸**이고 Runner 는 읽지 않는다.
+   * 대조는 경계 한 곳(`channels/runtime.ts` 의 `send`)에서 서 있는 `pendingConnectorId` 와
+   * 이루어진다 — 판정을 두 벌로 두지 않기 위해서다(§2). 선언하지 않으면 종전과 완전히 같다(§13-3).
    */
-  | { kind: 'connectorResult'; ok: boolean; slots?: Record<string, string>; errorCode?: string; latency?: LatencyMs };
+  | {
+    kind: 'connectorResult'; ok: boolean; slots?: Record<string, string>; errorCode?: string;
+    latency?: LatencyMs; connectorId?: string;
+  };
 
 export interface FlowState {
   flowId: string;

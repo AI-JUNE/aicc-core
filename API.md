@@ -149,6 +149,24 @@ Callbot 저장소에 **복사**되어 산다 — 어긋남은 `scripts/client-dr
   로 되돌려준다. 그 자리가 없으면 대기 중에 발화를 보내게 되고 응답은 `steps` 0건·`events` 0건에
   오류도 아니다 — 통화는 끊기지 않은 채 멈춘다. 커넥터 재개 턴에는 고객 발화 이벤트가 없어
   `usage` 를 받지 않는다(실을 자리가 없다). 예시: `fixtures/reference-core-connector.mjs`.
+  훅 어댑터에는 `on_connector_result(call_id, ok, slots=…, error_code=…)`(비동기 래퍼 포함)과
+  `pending_connector_id(call_id)` 가 있다(2026-10-25) — **대기 id 는 어댑터가 선언한다**(호스트가
+  들고 다니면 통화 두 건이 겹치는 순간 섞인다). 대기를 본 적이 없으면 보내지 않고
+  `connector_results_unexpected` 로 세며 `E_CONNECTOR_NO_WAIT` 를 알린다. 조회 결과는 한도 대기에
+  걸려도 미루지 않고(미루면 그 통화가 무음으로 멈춘다), **실측 누락으로 세지 않는다**(실을 자리가
+  애초에 없다). 대기 건수와 보낸 건수는 `connector_waits`·`connector_results_sent` 로 나눠 센다 —
+  두 수의 차이가 "조회 결과를 기다리다 멈춘 통화"의 유일한 신호다.
+- **조회 결과의 반영 사실(§6.1)** 은 `ChannelTurnResult.connector`·브리지 `result.connector`·
+  `BridgeResponse.connector_result_applied`·`connector_reason_ko` 로 읽는다(2026-10-25).
+  반영되지 않은 결과도 `ok: true`·`steps` 0건·`events` 0건으로 돌아가므로 그 구분이 없으면
+  호스트는 다음 발화를 기다리고 고객은 아무 안내도 듣지 못한다. 반영되지 않는 경우는 둘이다 —
+  서 있는 대기가 없거나(늦게·중복 도착: 멱등하게 버린다, §8.1), **선언한 커넥터가 서 있는 대기와
+  다른 경우**다. 선언은 `connectorResult.connectorId`(`send_connector_result(connector_id=…)`)이고
+  **선택**이다: 주지 않으면 종전과 완전히 같다(§13-3). 주면 Core 가 대조해 어긋난 결과를 반영하지
+  않고 `W_CONNECTOR_STALE` 로 적는다 — Runner 는 Api 노드에 도착한 결과를 어느 커넥터의 답인지
+  묻지 않으므로, 조회가 연달아 있는 흐름에서 앞 조회 결과의 재전송이 **뒤 조회의 답으로 적용된다**
+  (고객은 다른 조회의 값으로 채워진 안내를 듣고 예외도 오류 응답도 없다). 반영 뒤에 또 대기가
+  서면 그 id 가 `connector.pendingConnectorId` 로 함께 온다.
 - **합류 토큰(§5.2)** 은 `start(join_interaction_id=…, join_token=…)` 로 넘긴다. 고객이 누른 링크에
   실려 온 값이며 클라이언트가 만들지 않는다(§10.3) — 넘길 자리가 없으면 전환 배선을 켜는 순간
   **비-Node 호스트만** 합류하지 못한다. 배선이 없는 Core 는 이 값을 보지 않는다(§13-3).
@@ -178,6 +196,12 @@ Callbot 저장소에 **복사**되어 산다 — 어긋남은 `scripts/client-dr
   없다). `None` 을 `False` 로 적으면 종전까지 되던 이관 안내가 그 테넌트 전체에서 사라지고, `True`
   로 적으면 오지 않는 상담사를 안내한다(§13-3). §9.3 장애 폴백 판정은 `BridgeResponse.fallback` 이며
   비-Node 호스트에는 이것이 회선을 내릴지 상담사로 넘길지를 아는 유일한 경로다.
+  훅 어댑터에서는 그 둘이 `on_handoff(call_id, {queued, action, queue})`·
+  `on_fallback(call_id, mode, disable)` 콜백으로 온다(2026-10-25) — 응답 원문을 넘겨 두면 저장소마다
+  같은 자리를 각자 파싱하다 각자 다르게 틀린다(§2). **이관은 통화당 한 번만** 알린다(끝난 세션의
+  응답에는 이관이 서 있는 상태로 계속 실려 와 턴마다 알리면 안내·기록이 되풀이된다), **폴백은
+  모드가 바뀐 턴에만** 알린다. 상담사용 요약은 어떤 경우에도 담기지 않는다(§2·§10.3).
+  건수는 `handoffs_requested`·`handoffs_not_queued`·`handoffs_placement_unknown`·`fallback_changes`.
 - **과금 근거(§11.2)** 는 `BridgeResponse.billing`·`usage_attached`·`billable_ms_recorded`·
   `billing_reasons_ko`·`billing_dropped_units` 로 읽는다(2026-10-24). **보냈다와 실렸다는 다른
   질문이다** — `usage`·`billable_ms` 를 선언해도 실릴 자리가 없으면(장애 폴백으로 조기 종료된

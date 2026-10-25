@@ -241,6 +241,15 @@ export interface BridgeTurnPayload {
    * `reviewed: false` 를 "위반 없음"으로 읽지 않도록 사유(`reasonKo`)를 함께 내보낸다.
    */
   compliance?: unknown;
+  /**
+   * §6.1 조회 결과가 **반영됐는가**. `connectorResult` 를 보낸 응답에만 실린다.
+   *
+   * 노출 스위치와 무관하게 나간다 — 커넥터 id 와 Core 가 쓴 사유뿐이고 개인정보가 없다.
+   * 감추면 비-Node 호스트는 "답이 들어갔다"와 "버려졌다"를 구분할 수 없는데, 그 둘의 다음
+   * 행동은 정반대다(다음 발화를 기다린다 vs 다시 답한다). 구분이 없던 동안 증상은 예외가
+   * 아니라 **무음**이었다.
+   */
+  connector?: { resultApplied: boolean; reasonKo?: string; pendingConnectorId?: string };
 }
 
 /** 처리 기록. 발화 원문·개인정보를 담지 않는다 — op·판정·마스킹된 사유만 남는다(§10.3). */
@@ -629,6 +638,12 @@ function toFlowInput(v: unknown): FlowInput {
         if (typeof v.errorCode !== 'string') bad('connectorResult.errorCode 는 문자열이어야 합니다.');
         input.errorCode = v.errorCode;
       }
+      // **어느 대기에 답하는가**(§6.1). 선언은 선택이고(없으면 종전과 완전히 같다, §13-3) 대조는
+      // 런타임이 한다 — 빈 문자열은 선언이 아니다(실어 보내면 "대기 없음"과 대조돼 반영되지 않는다).
+      if (v.connectorId !== undefined) {
+        if (!nonEmptyString(v.connectorId)) bad('connectorResult.connectorId 는 비어 있지 않은 문자열이어야 합니다.');
+        input.connectorId = v.connectorId;
+      }
       return input;
     }
     default:
@@ -838,6 +853,15 @@ function projectTurn(r: ChannelTurnResult, opts: BridgeOptions): BridgeTurnPaylo
   // 여기에는 개인정보가 없고, 감추면 "고지했다"를 증명할 길이 호스트에 남지 않는다(§10.1).
   if (r.disclosure !== undefined) payload.disclosure = { ...r.disclosure };
   if (r.billing !== undefined) payload.billing = { ...r.billing };
+  // §6.1 반영 사실도 **필드별로 다시 적는다**(이관·전환 투영과 같은 규칙).
+  if (r.connector !== undefined) {
+    payload.connector = {
+      resultApplied: r.connector.resultApplied,
+      ...(r.connector.reasonKo !== undefined ? { reasonKo: r.connector.reasonKo } : {}),
+      ...(r.connector.pendingConnectorId !== undefined
+        ? { pendingConnectorId: r.connector.pendingConnectorId } : {}),
+    };
+  }
   // 동의 사실도 그대로 내보낸다. `pendingRequired` 는 **복사한 배열**이다 — 결과 객체를 그대로
   // 넘기면 호스트가 정렬·push 로 Core 가 돌려준 판정을 고칠 수 있다(JSON 직렬화 전까지).
   if (r.consent !== undefined) {

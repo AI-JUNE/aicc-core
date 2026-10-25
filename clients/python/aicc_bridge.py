@@ -142,6 +142,40 @@ class BridgeResponse:
         return value if isinstance(value, str) and value else None
 
     @property
+    def connector_result_applied(self) -> Optional[bool]:
+        """되돌려준 조회 결과가 **대기에 반영됐는가**. 셋 중 하나다 — True·False·None(해당 없음).
+
+        `None` 은 "이 호출은 커넥터 결과가 아니었다"이고 실패가 아니다. `False` 는 **오류가
+        아닌 실패**다: 서 있는 대기가 없거나(늦게·중복 도착) 선언한 커넥터가 서 있는 대기와
+        달라 Core 가 반영하지 않은 것이다. 응답은 `ok: True` · `steps` 0건 · `events` 0건이라
+        읽지 않으면 반영된 턴과 구분되지 않는다 — 호스트는 다음 발화를 기다리고 고객은 아무
+        안내도 듣지 못한다(§6.1 무음). 사유는 `connector_reason_ko`, 다시 답할 대기는
+        `pending_connector_id` 에 있다.
+        """
+        if not self.ok or not isinstance(self.result, dict):
+            return None
+        note = self.result.get("connector")
+        if not isinstance(note, dict):
+            return None
+        value = note.get("resultApplied")
+        return value if isinstance(value, bool) else None
+
+    @property
+    def connector_reason_ko(self) -> Optional[str]:
+        """조회 결과를 반영하지 않은 사유(한국어). **Core 가 쓴 문구 그대로** 돌려준다.
+
+        호스트가 사유를 지어내면 운영은 "왜 조회가 반영되지 않았는지"를 저장소마다 다르게
+        읽는다(§2). 반영된 경우·커넥터 결과가 아닌 호출에는 None 이다.
+        """
+        if not self.ok or not isinstance(self.result, dict):
+            return None
+        note = self.result.get("connector")
+        if not isinstance(note, dict):
+            return None
+        value = note.get("reasonKo")
+        return value if isinstance(value, str) and value else None
+
+    @property
     def switch_invite(self) -> Optional[Dict[str, Any]]:
         """§5.2 채널 전환 초대가 **이번 턴에 일어났다는 사실**. 없으면 None.
 
@@ -599,6 +633,7 @@ class BridgeClient:
         *,
         slots: Optional[Dict[str, str]] = None,
         error_code: Optional[str] = None,
+        connector_id: Optional[str] = None,
     ) -> BridgeResponse:
         """업무시스템 조회 결과를 되돌려준다(§6.1 — `pending_connector_id` 가 섰을 때).
 
@@ -610,12 +645,23 @@ class BridgeClient:
         **`usage` 는 받지 않는다**: 커넥터 재개 턴에는 고객 발화 이벤트가 없어 Core 가 실측을
         실을 자리가 없다(그 턴의 §6.1 커넥터 실측을 어디에 집계할지는 지표 정의 문제이며 Core 가
         정하지 않는다). 받아서 보내면 응답 `billing` 에 "실을 자리가 없었다"만 적힌다.
+
+        `connector_id` 는 **어느 대기에 답하는가**를 선언하는 칸이고, 넘기려면 그 턴의
+        `pending_connector_id` 를 그대로 넘긴다(직접 적지 않는다 — 적으면 그 문자열이 곧
+        두 번째 설정이 된다). 선언하면 Core 가 서 있는 대기와 대조해 **다르면 반영하지 않고**
+        사유를 돌려준다. 선언하지 않으면 종전과 완전히 같다(§13-3): Core 는 Api 노드에 도착한
+        결과를 어느 커넥터의 답인지 묻지 않고 수락하므로, 조회 A 의 결과가 늦게·중복으로
+        도착하면 그때 서 있는 조회 B 의 답으로 적용된다 — 고객은 **다른 조회의 값으로 채워진
+        안내**를 듣고 예외도 오류 응답도 없다. 업무시스템 호출이 느려 재전송하는 호스트가
+        정확히 그 모양을 만든다.
         """
         payload: Dict[str, Any] = {"kind": "connectorResult", "ok": bool(ok)}
         if slots:
             payload["slots"] = slots
         if error_code:
             payload["errorCode"] = error_code
+        if connector_id:
+            payload["connectorId"] = connector_id
         return self.send(interaction_id, {"input": payload})
 
     def end(
