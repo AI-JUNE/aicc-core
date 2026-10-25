@@ -924,6 +924,326 @@ h.close()
   assert.equal(out.stats.handoffs_placement_unknown, 0);
 });
 
+// ── 유지 루프(§9.3·§2) ──────────────────────────────────────────────────────
+// `aicc_bridge.py` 에는 유지 루프 여섯 자리가 다 있었는데 `agent.py` 가 손에 쥐는 것은 이
+// 훅 어댑터이고 브리지 클라이언트는 그 안에서 **지연 생성되는 비공개 필드**였다 — 즉 권장
+// 경로로 붙인 음성 배치에서는 복구 확인·만료 수렴·readiness·헬스 보고를 부를 방법이 아예
+// 없었고 **한 번도 돌지 않았다**. 증상은 하나도 예외가 아니다: 한 번 폴백으로 내려간
+// 테넌트는 엔진이 돌아와도 영구히 그대로 남고, `/health` 는 모든 통화가 상담사 직결로
+// 떨어진 순간에도 초록이다.
+
+const MAINT_PRELUDE = `${PRELUDE}
+MAINT_CORE = os.path.join(ROOT, "fixtures", "reference-core-maintained.mjs")
+def maint_hooks(**kw):
+    def f():
+        return BridgeClient(core_module=MAINT_CORE, adapter="callbot", core_root=ROOT, cwd=ROOT,
+                            max_line_bytes=65536, keep_transcript=True)
+    return CallbotCoreHooks(f, flow_id="f_reference_voice", entry_point="inbound_call",
+                            on_error=lambda c, m: errors.append(c), **kw)
+`;
+
+test('§9.3 유지 루프를 훅 어댑터에서 부를 수 있다 — 열린 op 는 돌고 닫힌 op 는 거절된다', b, () => {
+  const out = parse(runDriver(`${MAINT_PRELUDE}
+h = maint_hooks()
+ops = h.maintenance_ops()
+w = h.warnings()
+r = h.readiness()
+p = h.run_recovery_probe()
+e = h.run_offer_expiry()
+# 브리지가 열지 않은 op — 빈 보고서가 아니라 거절이 와야 한다(§13-3).
+o = h.observability()
+# 만료는 건별로 받지 않는다(§2) — 허용값 목록을 어댑터가 다시 적지 않으므로 브리지가 거절한다.
+t = h.settle_offer("o_reference_1", "tick")
+dump(h, ops=ops,
+     ok=[bool(x and x.ok) for x in (w, r, p, e)],
+     obs_code=(o.error.code if o and o.error else None),
+     tick_code=(t.error.code if t and t.error else None),
+     has_ready=bool(r and r.ok and isinstance(r.result, dict) and "status" in r.result),
+     has_issues=bool(w and w.ok and isinstance(w.result, dict) and isinstance(w.result.get("issues"), list)))
+h.close()
+`));
+  // 무엇이 열렸는지는 찔러 보지 않고 hello 에서 읽는다(§2).
+  assert.deepEqual([...out.ops].sort(),
+    ['offerExpiry', 'readiness', 'recoveryProbe', 'settleOffer', 'warnings'].sort());
+  assert.ok(!out.ops.includes('observability'), '열지 않은 op 가 열린 것으로 보고됐다');
+  assert.deepEqual(out.ok, [true, true, true, true], '유지 루프가 어댑터에서 돌지 않는다(§9.3)');
+  assert.equal(out.has_ready, true, 'readiness 판정이 호스트에 닿지 않았다');
+  assert.equal(out.has_issues, true, '계약 경고 전문이 호스트에 닿지 않았다');
+  // 배선 누락은 **실패로 적되 브리지 사망이 아니다** — degraded 로 올리면 유지 루프 설정
+  // 하나가 그 프로세스의 모든 통화에서 Core 를 떼어 간다(§9.3).
+  assert.equal(out.obs_code, 'E_NOT_WIRED');
+  assert.equal(out.tick_code, 'E_BAD_REQUEST');
+  assert.equal(out.degraded, false, '유지 루프 거절을 브리지 사망으로 다뤘다');
+  assert.equal(out.stats.maintenance_runs, 5, 'hello(목록 조회) + 열린 op 4건');
+  assert.equal(out.stats.maintenance_failed, 2);
+  assert.equal(out.stats.maintenance_skips, 0);
+  assert.deepEqual(out.errors, ['E_NOT_WIRED', 'E_BAD_REQUEST']);
+  // 유지 루프는 통화 경로의 카운터를 건드리지 않는다.
+  assert.equal(out.stats.turns_sent, 0);
+  assert.equal(out.stats.calls_started, 0);
+});
+
+test('유지 루프 배선이 전혀 없는 Core 에서는 전부 거절된다 — 조용한 0건으로 적지 않는다', b, () => {
+  const out = parse(runDriver(`${PRELUDE}
+h = hooks()
+ops = h.maintenance_ops()
+codes = []
+for call in (h.warnings, h.readiness, h.run_recovery_probe, h.run_offer_expiry, h.observability):
+    res = call()
+    codes.append(res.error.code if res and res.error else None)
+codes.append((lambda r: r.error.code if r and r.error else None)(h.settle_offer("o1", "accept")))
+dump(h, ops=ops, codes=codes)
+h.close()
+`));
+  assert.deepEqual(out.ops, [], '열지 않은 유지 루프가 열린 것으로 보고됐다');
+  assert.deepEqual(out.codes, Array(6).fill('E_NOT_WIRED'),
+    '배선 없음을 빈 보고서로 돌려주면 호스트는 "수렴 0건"으로 읽는다(§13-3)');
+  assert.equal(out.stats.maintenance_failed, 6);
+  assert.equal(out.stats.maintenance_runs, 1, 'hello 한 번만 성공해야 한다');
+  assert.equal(out.degraded, false);
+});
+
+test('브리지가 죽으면 유지 루프를 보내지 않고 통화 경로와 나눠 센다(§9.3)', b, () => {
+  const out = parse(runDriver(`${MAINT_PRELUDE}
+h = maint_hooks()
+assert h.readiness().ok
+h._client._proc.kill(); h._client._proc.wait()
+dead = h.readiness()                    # 끊김은 예외가 아니라 None
+assert dead is None and h.degraded is True
+assert h.run_recovery_probe() is None   # 이후로는 보내지 않는다
+assert h.run_offer_expiry() is None
+assert h.on_call_start("c1") is None    # 통화 경로는 degraded_skips 로 센다
+dump(h)
+h.close()
+`));
+  assert.equal(out.degraded, true);
+  // 유지 루프 주기는 초 단위일 수 있다 — 통화 경로와 합쳐 세면 "통화가 Core 를 잃은 횟수"가
+  // 그 주기만큼 부풀어 읽을 수 없게 된다.
+  assert.equal(out.stats.maintenance_skips, 2);
+  assert.equal(out.stats.degraded_skips, 1);
+  assert.equal(out.stats.maintenance_runs, 1);
+  assert.deepEqual(out.errors, ['E_BRIDGE_DOWN'], '끊김은 정확히 한 번 보고한다');
+});
+
+// ── §9.3 헬스 보고 — 보냈다 ≠ 접수됐다 ─────────────────────────────────────
+// 음성의 L1 은 `telephony` 이고 그 상태를 아는 것은 회선뿐이다(Core 는 매체를 직접 찌르지
+// 않는다, §6.2). 보고할 자리가 없던 동안 음성 배치의 §9.3 레지스트리에는 회선 샘플이 한 건도
+// 없었고, 그러면 `treatUnknownAsDown` 에 따라 결말이 둘인데 둘 다 조용하다.
+
+test('§9.3 헬스를 올리고 접수 범위를 나눠 센다 — 보낸 수를 접수된 수로 읽지 않는다', b, () => {
+  const out = parse(runDriver(`${PRELUDE}
+h = hooks()
+res = h.report_health(
+    [{"component": "telephony", "state": "up"},
+     {"component": "messaging", "state": "up"}],   # 음성이 의존하지 않는 컴포넌트 — 버려진다
+    "2026-10-25T00:00:00.000Z")
+dump(h, offered=res.health_offered, accepted=res.health_accepted, ignored=res.health_ignored,
+     registered=res.health_registered, known=res.health_intake_known,
+     declared=res.health_declared, reason_ko=res.health_reason_ko)
+h.close()
+`));
+  assert.equal(out.known, true);
+  assert.equal(out.registered, true);
+  assert.equal(out.offered, 2);
+  // 선언되지 않은 컴포넌트의 샘플은 조용히 버려진다 — 그 응답도 `ok: True` 다(§9.3).
+  assert.equal(out.accepted, 1, '올린 수를 접수된 수로 읽으면 유실이 정상으로 집계된다');
+  assert.equal(out.ignored, 1);
+  assert.equal(out.reason_ko, null);
+  // 호스트가 보낸 이름은 되돌려 오지 않는다(§10.3) — Core 가 가진 선언 목록이 온다.
+  assert.ok(out.declared.includes('telephony'));
+  assert.ok(!out.declared.includes('messaging'));
+  assert.equal(out.stats.health_reports_sent, 1);
+  assert.equal(out.stats.health_samples_offered, 2);
+  assert.equal(out.stats.health_samples_accepted, 1);
+  assert.equal(out.stats.health_samples_ignored, 1);
+  assert.equal(out.stats.health_intake_unknown, 0);
+  assert.deepEqual(out.errors, ['E_HEALTH_UNDECLARED_COMPONENT'],
+    '버려진 샘플을 조용히 두면 선언 오타가 영구히 남는다');
+});
+
+test('§9.3 접수 범위를 알 수 없는 응답을 접수됨으로 세지 않는다(실패·경계 경로)', b, () => {
+  // 접수 범위를 돌려주지 않는 Core 구현(종전 `void` 반환)과, 형태가 틀린 응답.
+  // 둘 다 "모름"이며 0 도 offered 도 아니다 — 0 으로 읽으면 멀쩡한 보고가 전부 유실로,
+  // offered 로 읽으면 한 건도 닿지 않는 상태가 정상으로 집계된다(§13-3).
+  const out = parse(runDriver(`${PRELUDE}
+from aicc_bridge import BridgeError, BridgeResponse
+
+class Intake:
+    def __init__(self, bodies):
+        self.bodies = list(bodies)
+        self.transcript = None
+        self.sent = 0
+    def hello(self): return BridgeResponse(id="1", ok=True, result={})
+    def report_health(self, samples, observed_at):
+        self.sent += 1
+        body = self.bodies.pop(0)
+        if body is None:
+            return BridgeResponse(id="2", ok=False, error=BridgeError("E_BAD_REQUEST", "형태 위반"))
+        return BridgeResponse(id="2", ok=True, result=body)
+    def close(self): pass
+
+c = Intake([
+    {"offered": 3, "acceptedKnown": False,
+     "reasonKo": "Core 구현이 접수 범위를 돌려주지 않습니다."},        # 모름
+    {"registered": False, "offered": 2, "accepted": 0, "ignored": 0,
+     "declared": [], "acceptedKnown": True},                           # 미등록 — 한 건도 없다
+    {"offered": "3", "accepted": True, "acceptedKnown": True},          # 형태 위반 — 세지 않는다
+    None,                                                               # 거절
+])
+h = CallbotCoreHooks(lambda: c, flow_id="f", on_error=lambda code, m: errors.append(code))
+reads = []
+for _ in range(4):
+    r = h.report_health([{"component": "telephony", "state": "up"}], "2026-10-25T00:00:00.000Z")
+    reads.append([r.health_intake_known, r.health_accepted, r.health_offered] if r else None)
+json.dump({"transcript": None, "stats": h.stats.as_dict(), "errors": errors,
+           "enabled": h.enabled, "degraded": h.degraded, "reason": h.disabled_reason_ko,
+           "reads": reads, "sent": c.sent}, sys.stdout, ensure_ascii=False)
+h.close()
+`));
+  assert.equal(out.sent, 4);
+  assert.deepEqual(out.reads[0], [false, null, 3], '모름을 0 으로 읽었다(§13-3)');
+  assert.deepEqual(out.reads[1], [true, 0, 2]);
+  assert.deepEqual(out.reads[2], [true, null, null], '형태 위반을 숫자로 읽었다');
+  assert.equal(out.reads[3][0], null, '거절된 보고에 접수 범위가 있다고 읽었다');
+  assert.equal(out.stats.health_reports_sent, 3, '거절된 보고를 보냈다고 셌다');
+  assert.equal(out.stats.health_intake_unknown, 1);
+  // 미등록 보고의 offered 는 실측이다(2) — 모름 응답의 3 과 합쳐 5 가 되고 accepted 는 0 이다.
+  assert.equal(out.stats.health_samples_offered, 5);
+  assert.equal(out.stats.health_samples_accepted, 0, '접수되지 않은 샘플을 접수됨으로 셌다');
+  assert.equal(out.stats.health_samples_ignored, 0);
+  assert.equal(out.stats.maintenance_failed, 1);
+  assert.equal(out.degraded, false, '헬스 거절을 브리지 사망으로 다뤘다');
+  assert.deepEqual(out.errors, ['E_HEALTH_NOT_REGISTERED', 'E_BAD_REQUEST']);
+});
+
+test('§9.3 헬스 한도 초과는 장애가 아니며 통화의 대기와 섞이지 않는다', b, () => {
+  const out = parse(runDriver(`${PRELUDE}
+from aicc_bridge import BridgeError, BridgeResponse
+
+class HealthLimited:
+    def __init__(self):
+        self.sent = 0
+        self.transcript = None
+    def hello(self): return BridgeResponse(id="1", ok=True, result={})
+    def start(self, **kw): return BridgeResponse(id="2", ok=True, result={"interactionId": "i1"})
+    def send_utterance(self, i, text, **kw): return BridgeResponse(id="3", ok=True, result={})
+    def report_health(self, samples, observed_at):
+        self.sent += 1
+        return BridgeResponse(id="4", ok=False, error=BridgeError("E_RATE_LIMITED", "한도", 5000))
+    def end(self, i, reason, **kw): return BridgeResponse(id="9", ok=True, result={})
+    def close(self): pass
+
+now = [0.0]
+c = HealthLimited()
+h = CallbotCoreHooks(lambda: c, flow_id="f", monotonic=lambda: now[0],
+                     on_error=lambda code, m: errors.append(code))
+sample = [{"component": "telephony", "state": "up"}]
+h.report_health(sample, "t0")      # 거절 → 대기 시작
+h.report_health(sample, "t1")      # 대기 중 → 보내지 않는다
+# 헬스 대기가 통화를 막지 않는다 — 막으면 샘플 주기 하나가 통화를 멈춘다.
+h.on_call_start("c1")
+turn = h.on_transcript("c1", "user", "여보세요")
+now[0] += 6.0
+h.report_health(sample, "t2")      # 대기가 풀렸다
+h.on_call_end("c1")
+json.dump({"transcript": None, "stats": h.stats.as_dict(), "errors": errors,
+           "enabled": h.enabled, "degraded": h.degraded, "reason": h.disabled_reason_ko,
+           "sent": c.sent, "turn_ok": bool(turn and turn.ok)}, sys.stdout, ensure_ascii=False)
+h.close()
+`));
+  assert.equal(out.sent, 2, '대기 중에도 헬스를 보냈다(또는 대기가 안 풀렸다)');
+  assert.equal(out.stats.health_reports_rate_limited, 2);
+  assert.equal(out.stats.health_reports_deferred, 1);
+  assert.equal(out.stats.health_reports_sent, 0);
+  assert.equal(out.degraded, false, '한도 초과를 브리지 사망으로 다뤘다');
+  // 헬스 대기와 통화 대기는 다른 변수다 — 섞으면 폭주가 §9.3 샘플까지 멈춘다.
+  assert.equal(out.turn_ok, true);
+  assert.equal(out.stats.turns_deferred, 0);
+  assert.equal(out.stats.calls_ended, 1);
+  assert.deepEqual(out.errors, ['E_RATE_LIMITED', 'E_RATE_LIMITED']);
+});
+
+// ── 브리지 사망 래치 해제(§9.3) ─────────────────────────────────────────────
+// `degraded` 는 한 번 서면 프로세스가 끝날 때까지 풀리지 않았다 — 음성 에이전트는 며칠을
+// 산다. 줄 하나를 깨뜨린 일시적 예외가 그 프로세스의 **남은 모든 통화**에서 Core 를 떼어
+// 가고, 그 상태는 조용하다: 통화는 정상으로 끝나고 원장·과금 근거·이벤트만 0건이 된다.
+
+test('recover() 가 래치를 풀고 다음 통화는 새 브리지에서 돈다 — 멀쩡한 브리지는 건드리지 않는다', b, () => {
+  const out = parse(runDriver(`${PRELUDE}
+h = hooks()
+# 멀쩡한 상태에서는 풀 것이 없다. 여기서 내리면 진행 중인 세션이 통째로 사라진다.
+healthy = h.recover()
+h.on_call_start("c1")
+h.on_transcript("c1", "user", "첫 턴")
+h._client._proc.kill(); h._client._proc.wait()
+assert h.on_transcript("c1", "user", "죽은 뒤") is None
+assert h.degraded is True
+assert h.readiness() is None
+first = h.recover()
+again = h.recover()                     # 멱등 — 풀 것이 없다
+assert h.degraded is False
+new_id = h.on_call_start("c2")
+turn = h.on_transcript("c2", "user", "새 브리지")
+# 장애를 건너 살아 있던 통화는 새 브리지가 모르는 세션이다 — 사실대로 실패해야 한다.
+stale = h.on_transcript("c1", "user", "예전 세션")
+h.on_call_end("c2")
+dump(h, healthy=healthy, first=first, again=again,
+     new_ok=bool(new_id), turn_ok=bool(turn and turn.ok),
+     stale_ok=(None if stale is None else stale.ok))
+h.close()
+`));
+  assert.equal(out.healthy, false, '멀쩡한 브리지를 내렸다 — 진행 중인 세션이 사라진다');
+  assert.equal(out.first, true, '래치를 풀 길이 없다 — 남은 모든 통화가 Core 를 잃는다');
+  assert.equal(out.again, false, 'recover() 가 멱등하지 않다');
+  assert.equal(out.degraded, false);
+  assert.equal(out.new_ok, true, '복구 뒤 새 통화가 Core 에 붙지 못했다');
+  assert.equal(out.turn_ok, true);
+  assert.equal(out.stats.bridge_recoveries, 1);
+  assert.equal(out.stats.calls_open_at_recovery, 1, '장애를 건너 열려 있던 통화를 세지 않았다');
+  // **상태를 지어내지 않는다**: 끝나지 않은 통화를 "끝났다"로 적으면 그 턴은 조용히 버려지고
+  // 종료는 중복으로 집계된다 — 둘 다 일어나지 않은 일이다(§13-3).
+  assert.equal(out.stale_ok, false, '모르는 세션의 턴이 성공으로 돌아왔다');
+  assert.equal(out.stats.late_after_end, 0, '끝나지 않은 통화를 끝났다고 적었다');
+  assert.equal(out.stats.turns_failed, 1);
+  assert.equal(out.stats.calls_started, 2);
+  assert.equal(out.stats.maintenance_skips, 1);
+});
+
+test('비동기 호스트에도 유지 루프·복구 자리가 있다 — 한쪽만 열면 권장 경로에서만 사라진다', b, () => {
+  const out = parse(runDriver(`${MAINT_PRELUDE}
+async def main():
+    h = AsyncCallbotCoreHooks(maint_hooks())
+    ops = await h.maintenance_ops()
+    r = await h.readiness()
+    p = await h.run_recovery_probe()
+    hl = await h.report_health([{"component": "telephony", "state": "up"}],
+                               "2026-10-25T00:00:00.000Z")
+    healthy = await h.recover()
+    # 통화와 유지 루프가 같은 체인에 묶이면 턴이 복구 확인을 기다리게 된다 — 묶지 않는다.
+    await h.on_call_start("c1")
+    await asyncio.gather(h.on_transcript("c1", "user", "하나"), h.run_offer_expiry())
+    await h.on_call_end("c1", "통화 종료", 1000)
+    await h.drain()
+    dump(h.inner, ops=ops, ready_ok=bool(r and r.ok), probe_ok=bool(p and p.ok),
+         accepted=(hl.health_accepted if hl else None), healthy=healthy,
+         degraded_prop=h.degraded, stats_prop=h.stats.turns_sent)
+    await h.close()
+asyncio.run(main())
+`));
+  assert.ok(out.ops.includes('recoveryProbe'), 'asyncio 가 권장 경로다 — 여기서 빠지면 음성 전체에서 폴백이 풀리지 않는다');
+  assert.equal(out.ready_ok, true);
+  assert.equal(out.probe_ok, true);
+  assert.equal(out.accepted, 1, '비동기 호스트의 헬스 보고가 접수되지 않았다');
+  assert.equal(out.healthy, false, '멀쩡한 브리지를 내렸다');
+  assert.equal(out.degraded_prop, false);
+  assert.equal(out.stats_prop, 1, '비동기 래퍼가 실측 카운터를 노출하지 않는다');
+  assert.equal(out.stats.maintenance_runs, 4, 'hello + readiness + recoveryProbe + offerExpiry');
+  assert.equal(out.stats.health_reports_sent, 1);
+  assert.equal(out.stats.turns_sent, 1);
+  assert.equal(out.stats.calls_ended, 1);
+  assert.deepEqual(out.errors, []);
+});
+
 test('§9.3 폴백 지시는 모드가 바뀐 턴에만 알린다(경계 경로)', b, () => {
   const out = parse(runDriver(`${PRELUDE}
 from aicc_bridge import BridgeResponse

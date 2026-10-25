@@ -946,3 +946,99 @@ json.dump(out, sys.stdout, ensure_ascii=False)
   assert.deepEqual(out.error.reasons, []);
   assert.deepEqual(out.error.dropped, []);
 });
+
+// ── §9.3 헬스 접수 범위 ─────────────────────────────────────────────────────
+// 헬스 보고의 응답은 "몇 건을 보냈다"가 아니라 **몇 건이 §9.3 판정에 닿았는가**다. Core 는
+// 등록되지 않은 어댑터의 보고와 선언하지 않은 컴포넌트의 샘플을 조용히 버리는데 그 응답도
+// `ok: True` 이므로, 읽지 않으면 샘플을 성실히 올리는 호스트와 한 건도 전달되지 않는 호스트가
+// 바깥에서 구분되지 않는다 — 엔진이 전부 죽어도 판정은 `normal` 이고, 한 번 내려간 테넌트는
+// 샘플이 갱신되지 않아 영구히 폴백에 남는다.
+
+test('§9.3 헬스 접수 범위를 실브리지에서 읽는다 — 올린 수를 접수된 수로 읽지 않는다', b, () => {
+  const source = `${PRELUDE}
+with client() as c:
+    c.hello()
+    res = c.report_health(
+        [{"component": "telephony", "state": "up"},
+         {"component": "stt", "state": "degraded"},
+         {"component": "messaging", "state": "up"}],   # 음성이 의존하지 않는다 — 버려진다
+        observed_at="2026-10-25T00:00:00.000Z")
+    json.dump({"ok": res.ok, "known": res.health_intake_known,
+               "registered": res.health_registered, "offered": res.health_offered,
+               "accepted": res.health_accepted, "ignored": res.health_ignored,
+               "declared": res.health_declared, "reason": res.health_reason_ko},
+              sys.stdout, ensure_ascii=False)
+`;
+  const run = withDriver(source, (f) => runPython(f));
+  assert.equal(run.status, 0, run.stderr);
+  const out = JSON.parse(run.stdout);
+  assert.equal(out.ok, true);
+  assert.equal(out.known, true, '접수 범위를 알 수 있는 응답을 모름으로 읽었다');
+  assert.equal(out.registered, true);
+  assert.equal(out.offered, 3);
+  assert.equal(out.accepted, 2, '버려진 샘플까지 접수됐다고 읽으면 유실이 정상으로 집계된다');
+  assert.equal(out.ignored, 1);
+  assert.equal(out.reason, null);
+  // 호스트가 보낸 이름은 되돌려 오지 않는다(§10.3) — Core 가 가진 선언 목록이 온다.
+  assert.ok(out.declared.includes('telephony') && out.declared.includes('stt'));
+  assert.ok(!out.declared.includes('messaging'));
+});
+
+test('§9.3 접수 범위를 모르는 응답·헬스가 아닌 응답을 숫자로 읽지 않는다(경계 경로)', b, () => {
+  const source = `${PRELUDE}
+from aicc_bridge import BridgeError, BridgeResponse
+
+cases = {
+    # Core 구현이 접수 범위를 돌려주지 않는다(종전 void 반환) — 모름이며 0 이 아니다.
+    "unknown": {"offered": 3, "acceptedKnown": False, "reasonKo": "알 수 없습니다."},
+    "registered_false": {"registered": False, "offered": 2, "accepted": 0, "ignored": 0,
+                         "declared": [], "acceptedKnown": True},
+    # 형태 위반 — 숫자가 아닌 값을 숫자로 읽으면 유실이 정상으로 집계된다.
+    "bad_shape": {"offered": "3", "accepted": True, "ignored": None,
+                  "registered": "yes", "declared": "telephony", "acceptedKnown": True},
+    # 헬스 응답이 아니다(턴 응답) — acceptedKnown 이 없으므로 전부 None 이다.
+    "turn": {"interactionId": "i1", "accepted": 9, "offered": 9},
+}
+out = {}
+for k, body in cases.items():
+    r = BridgeResponse(id="1", ok=True, result=body)
+    out[k] = {"known": r.health_intake_known, "registered": r.health_registered,
+              "offered": r.health_offered, "accepted": r.health_accepted,
+              "ignored": r.health_ignored, "declared": r.health_declared,
+              "reason": r.health_reason_ko}
+err = BridgeResponse(id="1", ok=False, error=BridgeError("E_BAD_REQUEST", "형태 위반"))
+out["error"] = {"known": err.health_intake_known, "registered": err.health_registered,
+                "offered": err.health_offered, "accepted": err.health_accepted,
+                "ignored": err.health_ignored, "declared": err.health_declared,
+                "reason": err.health_reason_ko}
+json.dump(out, sys.stdout, ensure_ascii=False)
+`;
+  const run = withDriver(source, (f) => runPython(f));
+  assert.equal(run.status, 0, run.stderr);
+  const out = JSON.parse(run.stdout);
+  // 모름은 0 이 아니다. 0 으로 읽으면 멀쩡한 보고가 전부 유실로 집계된다(§13-3).
+  assert.equal(out.unknown.known, false);
+  assert.equal(out.unknown.accepted, null, '모름을 0 으로 읽었다');
+  assert.equal(out.unknown.ignored, null);
+  assert.equal(out.unknown.registered, null);
+  assert.equal(out.unknown.offered, 3, '브리지가 해석한 수는 실측이다');
+  assert.match(out.unknown.reason, /알 수 없습니다/);
+  // 미등록은 "한 건도 기록되지 않았다"이며 모름과 다르다 — 접수 0건을 분명히 적는다.
+  assert.equal(out.registered_false.registered, false);
+  assert.equal(out.registered_false.accepted, 0);
+  // 형태 위반은 전부 모름이다.
+  assert.equal(out.bad_shape.offered, null, '문자열을 샘플 수로 읽었다');
+  assert.equal(out.bad_shape.accepted, null, 'True 를 1 로 읽었다');
+  assert.equal(out.bad_shape.ignored, null);
+  assert.equal(out.bad_shape.registered, null, '문자열을 참으로 읽었다');
+  assert.deepEqual(out.bad_shape.declared, [], '문자열을 선언 목록으로 풀어 적었다');
+  // 턴 응답의 같은 이름 필드를 헬스 접수 범위로 읽지 않는다.
+  assert.equal(out.turn.known, null);
+  assert.equal(out.turn.offered, null);
+  assert.equal(out.turn.accepted, null);
+  assert.deepEqual(out.turn.declared, []);
+  // 거부된 응답의 본문은 읽지 않는다.
+  assert.equal(out.error.known, null);
+  assert.equal(out.error.offered, null);
+  assert.deepEqual(out.error.declared, []);
+});

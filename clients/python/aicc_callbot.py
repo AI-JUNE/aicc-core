@@ -74,6 +74,35 @@ agent.py 에 넣을 것은 훅마다 한 줄이다(이 파일은 agent.py 를 im
    그 모양은 "큐를 선언하지 않은 이관"과 같다). 그래서 판정된 값만 `on_handoff`·`on_fallback`
    으로 넘긴다: **모름(None)을 False 로 적지 않고**(§13-3), 상담사용 요약은 담지 않으며
    (§2·§10.3), 같은 폴백 모드를 턴마다 다시 알리지 않는다(알리면 같은 안내가 반복된다).
+10. **유지 루프를 부를 자리를 둔다(§9.3·§2).** Core 는 **타이머를 돌리지 않는다**(몰래 켠
+   인터벌은 끌 수도 없고 프로세스 종료를 막는다) — 그래서 만료 수렴·복구 확인·readiness·
+   상담사 응답·헬스 보고는 **호스트가 부른다**. `aicc_bridge.py` 에는 그 여섯 자리가 다
+   있었는데 `agent.py` 가 손에 쥐는 것은 이 어댑터이고 브리지 클라이언트는 어댑터 안에서
+   **지연 생성되는 비공개 필드**였다 — 즉 권장 경로로 붙인 음성 배치에서는 유지 루프를
+   부를 방법이 아예 없었고, **한 번도 돌지 않았다**. 증상은 하나도 예외가 아니다:
+     - 복구 확인 미호출 → 한 번 `degraded_ai`·`agent_only` 로 내려간 테넌트는 엔진이
+       돌아와도 **영구히** 폴백에 남는다(통화가 내려가 엔진 호출이 멈추므로 새 샘플을
+       만들 주체가 프로브뿐인데, 그 프로브를 아무도 부르지 않는다).
+     - 헬스 보고 미호출 → §9.3 레지스트리에 **회선 샘플이 한 건도 없다**. 음성 L1 은
+       `telephony` 이고 그것을 아는 것은 회선뿐이다(Core 는 엔진·매체를 직접 찌르지 않는다).
+     - 만료 수렴 미호출 → 만료된 오퍼가 열린 채 쌓여 같은 콜이 두 번 제안되고, 그 통화는
+       큐에 묶인 채 §9.3 대안(콜백·음성사서함)으로도 가지 않는다.
+     - readiness 미호출 → 모든 통화가 상담사 직결로 떨어진 순간에도 호스트 `/health` 는 초록이다.
+     - 상담사 응답 미반영 → 재배정도 소진 수렴도 없다("상담사가 안 받는다"와 구분되지 않는다).
+     - 관측 미조회 → 로거·수집기가 전부 던지는 상태(`failed`)가 "로그를 붙였다"와 구분되지 않는다.
+   **주기는 이 어댑터가 정하지 않는다**(§13-3 — 회선 수·상담사 수에 따라 다르다). 자리만 열고,
+   유지 루프의 실패는 **통화 경로를 건드리지 않는다**: 배선되지 않은 op(`E_NOT_WIRED`)는
+   브리지 사망이 아니므로 `degraded` 로 올리지 않는다(올리면 유지 루프 설정 하나가 그
+   프로세스의 모든 통화에서 Core 를 떼어 간다).
+11. **브리지 사망 래치를 풀 길을 둔다(§9.3).** 3번의 `degraded` 는 한 번 서면 프로세스가
+   끝날 때까지 풀리지 않았다 — 음성 에이전트는 며칠을 산다. 즉 줄 하나를 깨뜨린 일시적
+   예외가 **그 프로세스의 남은 모든 통화**에서 Core 를 떼어 가고, 그 상태는 조용하다(통화는
+   정상으로 끝나고 §8.1 원장·과금 근거·이벤트만 0건이 된다). `recover()` 가 죽은 클라이언트를
+   버리고 래치를 푼다 — **호스트가 부르며 어댑터가 재시도 루프를 만들지 않는다**(턴마다 다시
+   붙으려 하면 죽은 브리지를 통화마다 다시 띄운다). 멀쩡한 브리지는 **건드리지 않는다**:
+   그때 내리면 진행 중인 세션이 통째로 사라진다. 통화의 interactionId 도 지어내 고치지 않는다 —
+   장애를 건너 살아 있던 통화의 턴은 새 브리지가 모르는 세션이라 **사실대로 실패**하고, 그것을
+   "끝난 통화의 지연 전사"로 바꿔 적으면 끝나지 않은 통화를 끝났다고 적는 것이 된다(§13-3).
 
 무엇을 하지 않는가 (build now, activate on approval)
 ---------------------------------------------------
@@ -162,6 +191,35 @@ class HookStats:
     handoffs_placement_unknown: int = 0
     #: §9.3 폴백 모드가 바뀐 횟수(정상 → 폴백 → 정상 전부 포함).
     fallback_changes: int = 0
+    #: 유지 루프 호출이 **성공한** 횟수(복구 확인·만료 수렴·readiness·경고·관측·상담사 응답).
+    #: 0 인 채 통화가 쌓이면 그 배치는 수렴이 한 번도 돌지 않은 상태다(머리말 10번).
+    maintenance_runs: int = 0
+    #: 유지 루프 호출이 거절된 횟수(가장 흔한 것은 `E_NOT_WIRED` — 그 op 를 호스트가 열지 않았다).
+    #: **브리지 사망과 나눠 센다**: 배선 누락은 기다려도 풀리지 않고 고칠 곳이 설정이다.
+    maintenance_failed: int = 0
+    #: 브리지가 죽어 있어 유지 루프를 **보내지 않은** 횟수. 통화 경로의 `degraded_skips` 와
+    #: 합쳐 세면 "통화가 Core 를 잃은 횟수"가 유지 루프 주기만큼 부풀어 읽을 수 없게 된다.
+    maintenance_skips: int = 0
+    #: §9.3 헬스 보고를 보낸 횟수. 아래 셋과 **반드시 같이 읽는다** — 보낸 수는 접수된 수가 아니다.
+    health_reports_sent: int = 0
+    #: 올린 샘플 수(실측). `health_samples_accepted` 와 벌어지는 차이가 유일한 신호다.
+    health_samples_offered: int = 0
+    #: §9.3 레지스트리에 **실제로 기록된** 샘플 수. 이 값이 0 인 채 offered 가 쌓이면 그
+    #: 테넌트의 폴백 판정은 회선 상태를 한 번도 본 적이 없다(어댑터 미등록·컴포넌트 미선언).
+    health_samples_accepted: int = 0
+    #: 선언되지 않은 컴포넌트라 **버려진** 샘플 수. 0 이 아니면 선언 목록·오타를 봐야 한다.
+    health_samples_ignored: int = 0
+    #: 접수 범위를 **알 수 없었던** 보고 수(Core 구현이 돌려주지 않음). 접수됨으로 세지 않는다(§13-3).
+    health_intake_unknown: int = 0
+    #: 헬스 보고가 한도로 거절된 횟수. 헬스는 통화 경로 op 라 제한 대상이다(유지 루프와 다르다).
+    health_reports_rate_limited: int = 0
+    #: 한도 대기 중이라 **보내지 않은** 헬스 보고 수. 거절과 나눠 센다(턴과 같은 규칙).
+    health_reports_deferred: int = 0
+    #: 브리지 사망 래치를 푼 횟수(`recover()`). 0 이 아니면 그 사이 통화는 Core 없이 돌았다.
+    bridge_recoveries: int = 0
+    #: 래치를 풀 때 **열려 있던** 통화 수(실측). 그 통화의 턴은 새 브리지가 모르는 세션이라
+    #: 사실대로 실패한다 — 상태를 지어내 고치지 않는다(머리말 11번).
+    calls_open_at_recovery: int = 0
 
     def as_dict(self) -> Dict[str, int]:
         return dict(self.__dict__)
@@ -210,6 +268,9 @@ class CallbotCoreHooks:
         # 한도 대기에만 쓰는 단조 시계. 벽시계를 쓰면 NTP 보정에 대기가 늘어나거나 사라진다.
         self._now = monotonic if monotonic is not None else time.monotonic
         self._start_blocked_until = 0.0
+        # 헬스 보고의 한도 대기. start·턴과 **따로** 둔다 — 같은 변수를 쓰면 통화 폭주가
+        # §9.3 샘플까지 멈추고, 그 순간 장애가 정상으로 집계된다(샘플이 낡아 `unknown` 이 된다).
+        self._health_blocked_until = 0.0
         self._flow_id = flow_id
         self._entry_point = entry_point
         self._on_error = on_error
@@ -512,6 +573,195 @@ class CallbotCoreHooks:
                     self.stats.ends_billable_ms_unrecorded += 1
             return res
 
+    # ── 유지 루프(§9.3·§2) ───────────────────────────────────────────────
+    # Core 는 타이머를 돌리지 않고 이 어댑터도 돌리지 않는다 — **주기는 호스트가 정한다**
+    # (§13-3: 회선 수·상담사 수에 따라 다르다). 자리가 없던 동안 무엇이 조용히 멈춰 있었는지는
+    # 머리말 10번에 적었다.
+    #
+    # 공통 규칙 넷이다:
+    #  (1) **통화를 끊지 않는다** — `_guard` 를 지나므로 어떤 예외도 호스트로 올라가지 않는다.
+    #  (2) **한도 대기에 걸리지 않는다** — 브리지는 유지 루프를 제한 대상에서 빼 두었다
+    #      (막으면 만료 수렴·복구 확인이 멈추고, 그 상태는 "상담사가 안 받는다"·"엔진이 안
+    #      돌아온다"와 구분되지 않는다). 헬스만 통화 경로 op 라 제한 대상이며 아래에서 따로 다룬다.
+    #  (3) **배선 누락(`E_NOT_WIRED`)을 브리지 사망으로 올리지 않는다** — 올리면 유지 루프
+    #      설정 하나가 그 프로세스의 모든 통화에서 Core 를 떼어 간다(§9.3).
+    #  (4) **판정 기준을 넘기지 않는다** — 제한 시간·프로브·시각은 브리지 쪽 배선이 준다.
+    #      호스트가 호출마다 주면 같은 `/health` 가 호출마다 다른 기준으로 판정된다(§2).
+    def _maintenance(self, fn: Callable[[BridgeClient], BridgeResponse]) -> Optional[BridgeResponse]:
+        # 잠금을 들고 왕복한다. 놓아도 얻는 것이 없다 — 브리지는 **JSONL 파이프 하나**이고
+        # `BridgeClient.request` 가 그 왕복을 이미 직렬화하므로, 느린 유지 루프는 어느 쪽이든
+        # 그 사이 턴을 기다리게 한다. 대신 잠금 안에서 클라이언트를 만들어 **두 스레드가 브리지
+        # 프로세스를 두 개 띄우는 일**을 막는다.
+        with self._lock:
+            if not self.enabled:
+                return None
+            if self._degraded:
+                self.stats.maintenance_skips += 1
+                return None
+            res = self._guard(fn)
+            if res is None:
+                return None          # 끊김은 _guard 가 이미 한 번 보고했다
+            if res.ok:
+                self.stats.maintenance_runs += 1
+            else:
+                self.stats.maintenance_failed += 1
+                self._report(res.error.code if res.error else "E_MAINTENANCE_FAILED",
+                             "Core 유지 루프 호출이 처리되지 않았습니다. 통화 경로는 영향받지 않습니다.")
+            return res
+
+    def maintenance_ops(self) -> list:
+        """브리지가 **실제로 열어 둔** 유지 op. 열리지 않은 op 를 부르면 `E_NOT_WIRED` 다.
+
+        호스트가 op 를 하나씩 찔러 보고 알아내게 두면 저장소마다 다르게 알아내고(§2), 더
+        나쁜 것은 **아무도 찔러 보지 않는 것**이다 — 그러면 그 배치는 수렴이 돌지 않는 채로
+        조용히 운영된다. 브리지가 `hello` 에 실어 주므로 그대로 읽는다.
+        """
+        res = self._maintenance(lambda c: c.hello())
+        if res is None or not res.ok or not isinstance(res.result, dict):
+            return []
+        ops = res.result.get("maintenanceOps")
+        return [str(o) for o in ops] if isinstance(ops, list) else []
+
+    def warnings(self) -> Optional[BridgeResponse]:
+        """등록 시점 계약 경고 전문(§9.3·§10.1). 코드가 아니라 사유까지 온다."""
+        return self._maintenance(lambda c: c.warnings())
+
+    def readiness(self) -> Optional[BridgeResponse]:
+        """§9.3 폴백 상태를 포함한 readiness. 호스트 `/health` 가 이 값을 합쳐 쓴다."""
+        return self._maintenance(lambda c: c.readiness())
+
+    def run_recovery_probe(self) -> Optional[BridgeResponse]:
+        """§9.3 복구 확인 1회. **폴백에서 빠져나오는 유일한 길이다**(머리말 10번).
+
+        보고서의 `unprobed` 가 비어 있지 않으면 그 컴포넌트는 **확인할 길이 없다** —
+        "확인했고 정상"이 아니다(§13-3).
+        """
+        return self._maintenance(lambda c: c.run_recovery_probe())
+
+    def run_offer_expiry(self) -> Optional[BridgeResponse]:
+        """배정 오퍼 만료 수렴 1회. `issues` 가 비어 있지 않으면 `expired` 는 판정 결과가 아니다."""
+        return self._maintenance(lambda c: c.run_offer_expiry())
+
+    def settle_offer(self, offer_id: str, event: str) -> Optional[BridgeResponse]:
+        """상담사 수락·거절·취소 반영. `event` 는 accept·decline·cancel 이다.
+
+        `tick`(만료)은 여기서 보내지 않는다 — 건별로 만료시키면 만료 판정이 두 곳이 되므로
+        `run_offer_expiry` 가 수행한다(§2). 형태 판정은 브리지 한 곳이 하고 이 어댑터는
+        다시 적지 않는다(적으면 허용값 목록이 두 벌이 된다).
+        """
+        return self._maintenance(lambda c: c.settle_offer(offer_id, event))
+
+    def observability(self) -> Optional[BridgeResponse]:
+        """관측 실측. 수치만 온다 — 로그 본문·오류 원문은 어떤 경로로도 오지 않는다(§10.3)."""
+        return self._maintenance(lambda c: c.observability())
+
+    def report_health(
+        self,
+        samples: Any,
+        observed_at: str,
+    ) -> Optional[BridgeResponse]:
+        """§9.3 헬스 보고. **회선이 아는 것을 Core 에 알리는 유일한 경로다.**
+
+        음성의 L1 은 `telephony` 이고 그 상태를 아는 것은 회선뿐이다 — Core 는 엔진·매체를
+        직접 찌르지 않는다(§6.2). 이 자리가 없던 동안 음성 배치의 §9.3 레지스트리에는 회선
+        샘플이 **한 건도** 없었고, 그러면 `treatUnknownAsDown` 설정에 따라 결말이 둘인데
+        둘 다 조용하다: `false` 면 회선이 죽어도 판정은 영구히 `normal` 이고(고객은 통화가
+        안 된다고 겪는다), `true` 면 전부 정상인데도 그 채널이 **영구히** 폴백에 남는다.
+
+        **관측 시각은 호출자가 준다**(§13-3) — 어댑터가 시각을 만들어 넣지 않는다.
+        **샘플 형태는 판정하지 않는다**: 브리지가 한 곳에서 판정하고 사유를 돌려준다(§2).
+
+        응답은 "보냈다"가 아니라 **접수 범위**다. 보낸 수를 접수된 수로 읽으면 어댑터 미등록·
+        컴포넌트 미선언으로 **한 건도 닿지 않는 상태가 정상으로** 집계된다(§11.2 의
+        `usage_attached` 와 같은 규칙) — 그래서 나눠 센다.
+        """
+        with self._lock:
+            if not self.enabled:
+                return None
+            if self._degraded:
+                self.stats.maintenance_skips += 1
+                return None
+            now = self._now()
+            if self._health_blocked_until > now:
+                # 한도 대기 중에 계속 던지면 한도를 더 밀어붙인다. 샘플은 다음 주기에 다시 온다.
+                self.stats.health_reports_deferred += 1
+                return None
+            res = self._guard(lambda c: c.report_health(samples, observed_at))
+            if res is None:
+                return None
+            if res.ok:
+                self.stats.health_reports_sent += 1
+                # Core 의 판정을 그대로 읽는다(지어내지 않는다). 모름을 0 으로도 offered 로도
+                # 적지 않는다 — 전자는 멀쩡한 보고를 유실로, 후자는 유실을 정상으로 집계한다.
+                offered = res.health_offered
+                if offered is not None:
+                    self.stats.health_samples_offered += offered
+                accepted = res.health_accepted
+                ignored = res.health_ignored
+                if res.health_intake_known is not True:
+                    self.stats.health_intake_unknown += 1
+                else:
+                    if accepted is not None:
+                        self.stats.health_samples_accepted += accepted
+                    if ignored is not None:
+                        self.stats.health_samples_ignored += ignored
+                    if res.health_registered is False:
+                        self._report("E_HEALTH_NOT_REGISTERED",
+                                     "이 어댑터가 Core 에 등록돼 있지 않아 헬스 샘플이 한 건도 "
+                                     "기록되지 않았습니다(§9.3).")
+                    elif ignored:
+                        self._report("E_HEALTH_UNDECLARED_COMPONENT",
+                                     "선언되지 않은 컴포넌트의 헬스 샘플이 버려졌습니다 — "
+                                     "선언 목록은 응답의 declared 에 있습니다(§9.3).")
+            elif res.rate_limited:
+                # 한도 초과는 장애가 아니다(턴과 같은 규칙) — degraded 로 올리지 않는다.
+                self.stats.health_reports_rate_limited += 1
+                self._health_blocked_until = self._deadline(now, res.retry_after_ms)
+                self._report("E_RATE_LIMITED",
+                             "Core 요청 한도를 넘어 이 헬스 보고는 보내지 않았습니다.")
+            else:
+                self.stats.maintenance_failed += 1
+                self._report(res.error.code if res.error else "E_HEALTH_FAILED",
+                             "Core 가 헬스 보고를 처리하지 못했습니다. 통화 경로는 영향받지 않습니다.")
+            return res
+
+    # ── 브리지 사망 래치 해제(§9.3) ──────────────────────────────────────
+    def recover(self) -> bool:
+        """`degraded` 래치를 풀고 다음 호출에서 브리지를 새로 띄운다. 멱등이며 던지지 않는다.
+
+        돌려주는 값은 **래치를 실제로 풀었는가**다. `False` 는 풀 것이 없었다는 뜻이며
+        실패가 아니다.
+
+        **호스트가 부른다** — 어댑터가 턴마다 다시 붙으려 하면 죽은 브리지를 통화마다 다시
+        띄우고, 그 재시도가 곧 장애를 길게 만든다. 주기는 어댑터가 정하지 않는다(§13-3).
+
+        **멀쩡한 브리지는 건드리지 않는다**: 내리면 진행 중인 세션이 통째로 사라진다 —
+        복구를 부른 대가로 멀쩡한 통화를 잃는 일이 생기면 안 된다.
+
+        **통화 상태를 고치지 않는다**: 장애를 건너 살아 있던 통화의 interactionId 는 죽은
+        브리지 프로세스의 것이므로 새 브리지가 모를 수 있고, 그때 그 턴은 **사실대로 실패**한다
+        (`turns_failed` + 오류 코드). 끝나지 않은 통화를 "끝났다"로 적으면 그 뒤의 턴이 전부
+        `late_after_end` 로 조용히 버려지고, 종료는 `duplicate_ends` 로 집계된다 — 둘 다
+        일어나지 않은 일이다(§13-3). 열려 있던 건수만 실측으로 남긴다.
+        """
+        with self._lock:
+            if self._closed or not self._degraded:
+                return False
+            self.stats.bridge_recoveries += 1
+            self.stats.calls_open_at_recovery += len(
+                [c for c in self._calls.values() if not c.ended]
+            )
+            client, self._client = self._client, None
+            self._degraded = False
+        # 죽은 프로세스 정리는 잠금 밖에서 한다 — `close()` 는 최대 5초를 기다릴 수 있고,
+        # 그 동안 잠금을 들고 있으면 멀쩡해진 턴들이 같이 멈춘다.
+        if client is not None:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001 - 죽은 프로세스를 닫다 난 오류가 복구를 막으면 안 된다
+                pass
+        return True
+
     def close(self) -> None:
         """열린 통화를 전부 닫고 브리지를 내린다. 멱등."""
         with self._lock:
@@ -757,6 +1007,16 @@ class AsyncCallbotCoreHooks:
     def disabled_reason_ko(self) -> str:
         return self.inner.disabled_reason_ko
 
+    @property
+    def degraded(self) -> bool:
+        """브리지가 죽어 Core 없이 돌고 있는가. `recover()` 를 부를 판단 근거다(머리말 11번)."""
+        return self.inner.degraded
+
+    @property
+    def stats(self) -> HookStats:
+        """실측 카운터. 비동기 호스트가 `h.inner.stats` 를 파게 두지 않는다(§2)."""
+        return self.inner.stats
+
     async def _run(self, call_id: str, fn: Callable[[], Any]) -> Any:
         loop = asyncio.get_running_loop()
         done: "asyncio.Future[None]" = loop.create_future()
@@ -825,6 +1085,49 @@ class AsyncCallbotCoreHooks:
             (lambda: self.inner.on_call_end(call_id, reason_ko)) if billable_ms is None
             else (lambda: self.inner.on_call_end(call_id, reason_ko, billable_ms)),
         )
+
+    # ── 유지 루프·복구(§9.3·§2) ───────────────────────────────────────────
+    # **통화 체인에 넣지 않는다**: 유지 루프에는 call_id 가 없고 통화 상태를 건드리지도 않는다.
+    # 아무 통화의 체인에 끼우면 그 통화의 턴이 복구 확인·만료 수렴을 기다리게 되고, 그 선택은
+    # 어댑터가 할 일이 아니다. 직렬화는 이미 두 겹으로 되어 있다 — `CallbotCoreHooks._lock` 과
+    # 브리지의 JSONL 파이프다.
+    #
+    # 동기 쪽에만 열면 **asyncio 호스트에서만** 유지 루프가 사라진다. asyncio 가 권장 경로이므로
+    # 그 비대칭의 증상은 "음성 채널 전체에서 폴백이 풀리지 않는다"다(실측·미인식 자리와 같은 교훈).
+    async def _detached(self, fn: Callable[[], Any]) -> Any:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, fn)
+
+    async def maintenance_ops(self) -> list:
+        return await self._detached(self.inner.maintenance_ops)
+
+    async def warnings(self) -> Optional[BridgeResponse]:
+        return await self._detached(self.inner.warnings)
+
+    async def readiness(self) -> Optional[BridgeResponse]:
+        return await self._detached(self.inner.readiness)
+
+    async def run_recovery_probe(self) -> Optional[BridgeResponse]:
+        return await self._detached(self.inner.run_recovery_probe)
+
+    async def run_offer_expiry(self) -> Optional[BridgeResponse]:
+        return await self._detached(self.inner.run_offer_expiry)
+
+    async def settle_offer(self, offer_id: str, event: str) -> Optional[BridgeResponse]:
+        return await self._detached(lambda: self.inner.settle_offer(offer_id, event))
+
+    async def observability(self) -> Optional[BridgeResponse]:
+        return await self._detached(self.inner.observability)
+
+    async def report_health(self, samples: Any, observed_at: str) -> Optional[BridgeResponse]:
+        return await self._detached(lambda: self.inner.report_health(samples, observed_at))
+
+    async def recover(self) -> bool:
+        """예약된 훅을 먼저 비운 뒤 래치를 푼다 — 먼저 풀면 죽은 브리지로 향하던 턴들이
+        **새 브리지를 띄우며** 깨어나고, 그 통화의 세션은 거기 없다(머리말 11번).
+        """
+        await self.drain()
+        return await self._detached(self.inner.recover)
 
     async def close(self) -> None:
         """예약된 훅을 먼저 비운 뒤 닫는다 — 먼저 닫으면 남은 턴이 "끝난 통화"로 버려진다."""

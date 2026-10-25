@@ -213,6 +213,44 @@ Callbot 저장소에 **복사**되어 산다 — 어긋남은 `scripts/client-dr
   `stats.turns_usage_unattached`·`turns_usage_dropped`·`ends_billable_ms_unrecorded` 로 **센다** —
   선언 누락(`turns_missing_usage`·`ends_missing_billable_ms`)과 나눠 세는 이유는 둘의 고칠 곳이
   서로 다른 저장소이기 때문이다(회선이 값을 주지 않았다 vs 준 값이 버려졌다).
+- **유지 루프(§9.3·§2)** 는 훅 어댑터에서 부른다(2026-10-25): `maintenance_ops()`·`warnings()`·
+  `readiness()`·`run_recovery_probe()`·`run_offer_expiry()`·`settle_offer(offer_id, event)`·
+  `observability()`·`report_health(samples, observed_at)`(비동기 래퍼 포함). 브리지 클라이언트에는
+  그 자리가 있었지만 `agent.py` 가 손에 쥐는 것은 **훅 어댑터**이고 브리지 클라이언트는 그 안에서
+  지연 생성되는 비공개 필드였다 — 즉 권장 경로로 붙인 음성 배치에서는 유지 루프가 **한 번도 돌지
+  않았고** 증상은 하나도 예외가 아니다: 복구 확인이 없으면 한 번 내려간 테넌트는 엔진이 돌아와도
+  **영구히** 폴백에 남고(통화가 내려가 엔진 호출이 멈추므로 새 샘플을 만들 주체가 프로브뿐이다),
+  헬스 보고가 없으면 §9.3 레지스트리에 **회선 샘플이 한 건도 없고**(음성 L1 은 `telephony` 이고
+  그것을 아는 것은 회선뿐이다, §6.2), 만료 수렴이 없으면 같은 콜이 두 번 제안되며, `readiness` 가
+  없으면 모든 통화가 상담사 직결로 떨어진 순간에도 호스트 `/health` 는 초록이다.
+  **주기는 어댑터가 정하지 않는다**(§13-3) — Core 도 어댑터도 타이머를 돌리지 않는다.
+  유지 루프는 **한도 대기에 걸리지 않고**(브리지가 제한 대상에서 빼 두었다), 배선되지 않은 op 는
+  `E_NOT_WIRED` 로 거절되며 그것을 **브리지 사망으로 올리지 않는다**(올리면 유지 루프 설정 하나가
+  그 프로세스의 모든 통화에서 Core 를 떼어 간다). 건수는 `maintenance_runs`·`maintenance_failed`·
+  `maintenance_skips` 이며 통화 경로의 `degraded_skips` 와 **나눠 센다**(합치면 "통화가 Core 를
+  잃은 횟수"가 유지 루프 주기만큼 부풀어 읽을 수 없다).
+- **헬스 접수 범위(§9.3)** 는 `BridgeResponse.health_intake_known`·`health_registered`·
+  `health_offered`·`health_accepted`·`health_ignored`·`health_declared`·`health_reason_ko` 로
+  읽는다(2026-10-25). 과금 근거와 **같은 질문**이다 — 보냈다와 접수됐다는 다르다. Core 는
+  등록되지 않은 어댑터의 보고와 선언하지 않은 컴포넌트의 샘플을 조용히 버리는데 그 응답도
+  `ok: true` 이므로, 읽지 않으면 샘플을 성실히 올리는 호스트와 **한 건도 전달되지 않는** 호스트가
+  바깥에서 구분되지 않는다. **모름을 0 으로도 `offered` 로도 읽지 않는다**(§13-3): 0 으로 읽으면
+  멀쩡한 보고가 전부 유실로 집계되고, `offered` 로 읽으면 한 건도 닿지 않는 상태가 정상으로
+  집계된다. 훅 어댑터는 그 판정을 읽어 `health_samples_offered`·`health_samples_accepted`·
+  `health_samples_ignored`·`health_intake_unknown` 으로 나눠 세고, 미등록·버려진 샘플은
+  `E_HEALTH_NOT_REGISTERED`·`E_HEALTH_UNDECLARED_COMPONENT` 로 알린다. 헬스는 통화 경로 op 라
+  한도 대상이며 그 대기는 **통화의 대기와 다른 변수**다(섞으면 통화 폭주가 §9.3 샘플까지 멈춰
+  장애가 정상으로 집계된다) — `health_reports_rate_limited`·`health_reports_deferred`.
+- **브리지 사망 래치 해제(§9.3)** 는 `recover()`(비동기 래퍼 포함)다(2026-10-25). `degraded` 는
+  한 번 서면 프로세스가 끝날 때까지 풀리지 않았고 음성 에이전트는 며칠을 산다 — 줄 하나를
+  깨뜨린 일시적 예외가 그 프로세스의 **남은 모든 통화**에서 Core 를 떼어 가며, 그 상태는 조용하다
+  (통화는 정상으로 끝나고 원장·과금 근거·이벤트만 0건이 된다). **호스트가 부르며 어댑터가 재시도
+  루프를 만들지 않는다**(턴마다 다시 붙으려 하면 죽은 브리지를 통화마다 다시 띄운다, §13-3).
+  멀쩡한 브리지는 **건드리지 않고**(내리면 진행 중인 세션이 통째로 사라진다) 돌려주는 값은
+  "래치를 실제로 풀었는가"다. **통화 상태를 고치지 않는다**: 장애를 건너 살아 있던 통화의 턴은
+  새 브리지가 모르는 세션이라 사실대로 실패하고(`turns_failed`), 끝나지 않은 통화를 "끝났다"로
+  적으면 그 뒤의 턴이 전부 `late_after_end` 로 조용히 버려진다. 건수는 `bridge_recoveries`·
+  `calls_open_at_recovery`.
 
 Core 런타임 배선:
 

@@ -44,6 +44,12 @@ Callbot 의 음성 에이전트는 파이썬 프로세스다. Node 로 된 채�
    가 그 자리다. 읽지 않으면 호스트는 보낸 것을 들어간 것으로 세고, 그 턴의 엔진 비용은 공급사
    청구서에만 남는다. 과소청구 방향이라 과다청구 차단에도 걸리지 않고 대사에서 '미설명'으로만
    돌아온다. **선언이 없었던 것(None)과 싣지 못한 것(False)을 같게 적지 않는다**(§13-3).
+11. **헬스도 보냈다와 접수됐다를 구분한다(§9.3).** 10번과 같은 질문이 폴백 쪽에도 있다.
+   Core 는 등록되지 않은 어댑터의 보고와 **선언하지 않은 컴포넌트**의 샘플을 조용히 버리는데
+   (아무 채널이나 전체 폴백을 유발할 수 없게 하는 규칙이다) 그 응답도 `ok: True` 다. 그래서
+   `health_accepted`·`health_ignored`·`health_registered`·`health_intake_known` 이 있고,
+   **모름을 0 으로도 `offered` 로도 읽지 않는다** — 0 으로 읽으면 멀쩡한 보고가 전부 유실로
+   집계되고, `offered` 로 읽으면 **한 건도 닿지 않는 상태가 정상으로** 집계된다(§13-3).
 
 무엇을 하지 않는가 (build now, activate on approval)
 ---------------------------------------------------
@@ -345,6 +351,97 @@ class BridgeResponse:
             return None
         fallback = self.result.get("fallback")
         return fallback if isinstance(fallback, dict) else None
+
+    # ── §9.3 헬스 접수 범위 ────────────────────────────────────────────────
+    # `report_health` 의 응답은 "몇 건을 보냈다"가 아니라 **몇 건이 §9.3 판정에 닿았는가**다.
+    # 그 차이를 읽지 않으면 샘플을 성실히 올리는 호스트와 **한 건도 전달되지 않는** 호스트가
+    # 바깥에서 구분되지 않는다: Core 는 등록되지 않은 어댑터의 보고와 **선언하지 않은
+    # 컴포넌트**의 샘플을 조용히 버리는데(아무 채널이나 전체 폴백을 유발할 수 없게 하는 §9.3
+    # 의 규칙이다), 그 상태에서도 응답은 `ok: True` 다. 증상은 양쪽 다 조용하다 — 엔진이 전부
+    # 죽어도 판정은 `normal` 이고(고객은 "말을 못 알아듣는다"로 겪는다), 한 번 내려간 테넌트는
+    # 샘플이 갱신되지 않아 **영구히** 폴백에 남는다.
+    #
+    # **보낸 수를 접수된 수로 읽지 않는다**(§13-3·§11.2 의 `usage_attached` 와 같은 규칙).
+    def _health_intake(self) -> Optional[Dict[str, Any]]:
+        """헬스 접수 범위 응답인가. 판정은 `acceptedKnown` 하나로 한다 — 브리지가 그 키를
+        **항상** 싣기 때문이고(아는 경우·모르는 경우 둘 다), 다른 키로 추측하면 종전 응답과
+        구분되지 않는다.
+        """
+        if not self.ok or not isinstance(self.result, dict):
+            return None
+        return self.result if isinstance(self.result.get("acceptedKnown"), bool) else None
+
+    @property
+    def health_intake_known(self) -> Optional[bool]:
+        """접수 범위를 **알 수 있는가**. 셋 중 하나다 — True·False·None(헬스 응답이 아님).
+
+        `False` 는 Core 구현이 접수 범위를 돌려주지 않는다는 뜻이고(종전 `void` 반환),
+        그 상태를 "접수됨"으로 적어서는 안 된다. 사유는 `health_reason_ko` 에 있다.
+        """
+        intake = self._health_intake()
+        return None if intake is None else bool(intake.get("acceptedKnown"))
+
+    @property
+    def health_offered(self) -> Optional[int]:
+        """올린 샘플 수(브리지가 해석한 수). **접수된 수가 아니다.**"""
+        intake = self._health_intake()
+        if intake is None:
+            return None
+        value = intake.get("offered")
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    @property
+    def health_accepted(self) -> Optional[int]:
+        """§9.3 헬스 레지스트리에 **실제로 기록된** 샘플 수. 모르면 None — **0 이 아니다.**
+
+        모르는 것을 0 으로 읽으면 "접수 0건"이 되어 멀쩡한 보고가 전부 유실로 집계되고,
+        `offered` 로 읽으면 반대로 **한 건도 닿지 않는 상태가 정상으로** 집계된다(§13-3).
+        """
+        intake = self._health_intake()
+        if intake is None or intake.get("acceptedKnown") is not True:
+            return None
+        value = intake.get("accepted")
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    @property
+    def health_ignored(self) -> Optional[int]:
+        """선언되지 않은 컴포넌트라 **버려진** 샘플 수. 0 이 아니면 선언 목록·오타를 봐야 한다."""
+        intake = self._health_intake()
+        if intake is None or intake.get("acceptedKnown") is not True:
+            return None
+        value = intake.get("ignored")
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    @property
+    def health_registered(self) -> Optional[bool]:
+        """이 어댑터가 Core 에 등록돼 있는가. `False` 면 **한 건도** 기록되지 않았다."""
+        intake = self._health_intake()
+        if intake is None or intake.get("acceptedKnown") is not True:
+            return None
+        value = intake.get("registered")
+        return value if isinstance(value, bool) else None
+
+    @property
+    def health_declared(self) -> List[str]:
+        """이 채널이 올릴 수 있다고 **등록 시 선언한** 컴포넌트(Core 가 가진 값).
+
+        호스트가 보낸 이름은 되돌려 오지 않는다(§10.3 — 그 자리에는 임의 문자열이 들어올 수
+        있다). 대신 이 목록으로 오타를 호스트가 스스로 맞춰 본다.
+        """
+        intake = self._health_intake()
+        if intake is None:
+            return []
+        value = intake.get("declared")
+        return [str(c) for c in value] if isinstance(value, list) else []
+
+    @property
+    def health_reason_ko(self) -> Optional[str]:
+        """접수 범위를 알 수 없는 사유(한국어). **Core·브리지가 쓴 문구 그대로** 돌려준다."""
+        intake = self._health_intake()
+        if intake is None:
+            return None
+        value = intake.get("reasonKo")
+        return value if isinstance(value, str) and value else None
 
 
 @dataclass
