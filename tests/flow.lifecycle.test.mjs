@@ -184,3 +184,95 @@ test('레지스트리는 불변 — 변경 함수는 원본을 건드리지 않�
   lc.publish(reg, { scope, flowId: 'greeting', version: 1, channels: ['voice'], by: 'ops', at: '2026-09-01T03:00:00Z' });
   assert.equal(JSON.stringify(reg), before);
 });
+
+// ── 전이표가 판정인가(§2) ────────────────────────────────────────────────────
+// 종전에는 표와 코드가 양방향으로 어긋나 있었고 대조하는 코드가 한 줄도 없었다:
+// `rollback` 은 `archived → published` 를 수행하는데 표에는 archived 가 종착으로 적혀 있었고
+// (표를 믿은 스튜디오는 장애 시각에 롤백 버튼을 감춘다), 반대로 표가 광고한
+// `draft → archived`·`approved → draft`·`approved → archived` 는 수행하는 함수가 없었다.
+
+function ok(r) {
+  assert.equal(r.ok, true, r.ok ? '' : `${r.code}: ${r.message}`);
+  return r.value;
+}
+
+/** 기존 레지스트리 위에 버전을 하나 더 올려 approved 까지 끌고 간다. */
+function approvedOn(reg, version) {
+  const ref = { scope, flowId: 'greeting', version };
+  let next = ok(lc.createDraft(reg, { scope, flow: flow(version), by: 'writer', at: '2026-09-10T00:00:00Z' }));
+  next = ok(lc.submitForReview(next, ref, 'writer', '2026-09-10T01:00:00Z'));
+  return ok(lc.approve(next, ref, 'reviewer', '2026-09-10T02:00:00Z'));
+}
+
+const stageOf = (reg, version) => lc.findRevision(reg, scope, 'greeting', version).stage;
+
+test('전이표가 광고하는 전이는 모두 이 모듈이 실제로 수행하는 것이다(§2·§13-3)', behavioral, () => {
+  const performed = new Set();
+  const ref = (version) => ({ scope, flowId: 'greeting', version });
+
+  let reg = ok(lc.submitForReview(draft(1), ref(1), 'writer', '2026-09-01T01:00:00Z'));
+  performed.add('draft→in_review');
+
+  // 반려는 같은 in_review 에서 갈라지는 다른 길이므로 결과를 이어받지 않는다.
+  const back = ok(lc.reject(reg, ref(1), 'reviewer', '문안 수정 필요'));
+  assert.equal(stageOf(back, 1), 'draft');
+  performed.add('in_review→draft');
+
+  reg = ok(lc.approve(reg, ref(1), 'reviewer', '2026-09-01T02:00:00Z'));
+  performed.add('in_review→approved');
+
+  reg = ok(lc.publish(reg, { scope, flowId: 'greeting', version: 1, channels: ['voice'], by: 'ops', at: '2026-09-01T03:00:00Z' }));
+  performed.add('approved→published');
+
+  // 단계적 배포 — 같은 리비전에 채널만 늘린다(재승인 없음).
+  reg = ok(lc.publish(reg, { scope, flowId: 'greeting', version: 1, channels: ['chat'], by: 'ops', at: '2026-09-02T03:00:00Z' }));
+  assert.equal(stageOf(reg, 1), 'published');
+  performed.add('published→published');
+
+  // 새 버전이 두 채널을 다 가져가면 v1 은 어디에도 남지 않아 내려간다.
+  reg = approvedOn(reg, 2);
+  reg = ok(lc.publish(reg, { scope, flowId: 'greeting', version: 2, channels: ['voice', 'chat'], by: 'ops', at: '2026-09-11T00:00:00Z' }));
+  assert.equal(stageOf(reg, 1), 'archived');
+  performed.add('published→archived');
+
+  // 사고 대응 — 내려간 리비전으로 되돌린다.
+  reg = ok(lc.rollback(reg, { scope, flowId: 'greeting', channel: 'voice', toVersion: 1, by: 'ops', at: '2026-09-11T01:00:00Z' }));
+  assert.equal(stageOf(reg, 1), 'published');
+  performed.add('archived→published');
+
+  const declared = new Set();
+  for (const [from, tos] of Object.entries(lc.STAGE_TRANSITIONS)) for (const to of tos) declared.add(`${from}→${to}`);
+  assert.deepEqual([...declared].sort(), [...performed].sort(),
+    '표에만 있는 전이는 눌려도 아무 일이 없는 버튼이고, 코드에만 있는 전이는 감춰진 버튼이다');
+});
+
+test('전이표는 장식이 아니다 — archived → published 를 빼면 롤백이 거절되고 레지스트리는 그대로다', behavioral, () => {
+  let reg = approved(1);
+  reg = ok(lc.publish(reg, { scope, flowId: 'greeting', version: 1, channels: ['voice'], by: 'ops', at: '2026-09-01T03:00:00Z' }));
+  reg = approvedOn(reg, 2);
+  reg = ok(lc.publish(reg, { scope, flowId: 'greeting', version: 2, channels: ['voice'], by: 'ops', at: '2026-09-11T00:00:00Z' }));
+  assert.equal(stageOf(reg, 1), 'archived');
+
+  const before = JSON.stringify(reg);
+  const saved = lc.STAGE_TRANSITIONS.archived;
+  lc.STAGE_TRANSITIONS.archived = [];
+  try {
+    const rb = lc.rollback(reg, { scope, flowId: 'greeting', channel: 'voice', toVersion: 1, by: 'ops', at: '2026-09-11T01:00:00Z' });
+    assert.equal(rb.ok, false);
+    assert.equal(rb.code, 'E_STAGE_INVALID');
+    assert.match(rb.message, /archived → published/);
+  } finally {
+    lc.STAGE_TRANSITIONS.archived = saved;
+  }
+  // 거절된 호출은 레지스트리를 **만들지 못한다** — 절반만 바뀐 상태가 남으면 안 된다.
+  assert.equal(JSON.stringify(reg), before);
+});
+
+test('수행되지 않는 전이는 표에 없다 — 폐기 op 가 없으므로 draft·approved 에서 archived 로 가는 길도 없다', behavioral, () => {
+  assert.equal(lc.canTransition('draft', 'archived'), false);
+  assert.equal(lc.canTransition('approved', 'archived'), false);
+  assert.equal(lc.canTransition('approved', 'draft'), false);
+  // 반대로 코드가 수행하는 두 전이는 표에 있다.
+  assert.equal(lc.canTransition('archived', 'published'), true);
+  assert.equal(lc.canTransition('published', 'published'), true);
+});

@@ -1042,3 +1042,134 @@ json.dump(out, sys.stdout, ensure_ascii=False)
   assert.equal(out.error.offered, null);
   assert.deepEqual(out.error.declared, []);
 });
+
+// ── §10.1 고지·동의 · §7 5.2 준수 점검 ──────────────────────────────────────
+// 세 칸은 어떤 노출 스위치와도 무관하게 와이어로 나오는데(개인정보가 없고, 감추면 호스트가
+// 증명할 길이 없다) **읽을 자리가 이 클라이언트에 없었다** — Core 는 보냈고 권장 경로로 붙인
+// 음성 호스트는 세 사실을 한 번도 손에 쥐지 못했다.
+
+test('§10.1 고지·동의와 §7 5.2 점검을 참조 클라이언트가 읽는다(정상 경로)', b, () => {
+  const source = `${PRELUDE}
+GOV = os.path.join(ROOT, "fixtures", "reference-core-governed.mjs")
+out = {}
+with BridgeClient(core_module=GOV, adapter="callbot", core_root=ROOT, cwd=ROOT,
+                  max_line_bytes=65536, keep_transcript=True) as c:
+    s = c.start(flow_id="f_reference_voice", entry_point="inbound_call")
+    i = s.interaction_id
+    out["start"] = {
+        "disclosure": s.disclosure, "pending": s.consent_pending_required,
+        "recorded": s.consent_recorded, "not_recorded": s.consent_not_recorded_ko,
+        "compliance": s.compliance, "reviewed": s.compliance_reviewed,
+    }
+    t = c.send_utterance(i, "네")
+    out["turn"] = {
+        "disclosure": t.disclosure, "pending": t.consent_pending_required,
+        "recorded": t.consent_recorded, "compliance": t.compliance,
+    }
+    e = c.end(i, "고객 종료")
+    out["end"] = {
+        "reviewed": e.compliance_reviewed, "violations": e.compliance_violations,
+        "skipped": e.compliance_skipped, "reason": e.compliance_reason_ko,
+        "pending": e.consent_pending_required,
+    }
+    out["raw_end"] = e.result
+json.dump(out, sys.stdout, ensure_ascii=False)
+`;
+  const run = withDriver(source, (f) => runPython(f));
+  assert.equal(run.status, 0, run.stderr);
+  const out = JSON.parse(run.stdout);
+
+  // 고지는 **나간 턴에만** 실린다 — 감사 근거는 "어느 매체에 어떤 설정 버전으로"다.
+  assert.deepEqual(out.start.disclosure, { channel: 'voice', placement: 'session_start', configVersion: 3 });
+  assert.equal(out.turn.disclosure, null, '이미 고지한 뒤의 턴에도 근거가 실리면 감사 기록이 턴 수만큼 부푼다');
+  // 필수 동의가 미획득인 동안은 pii 조회가 막힌다 — 그 사실을 읽을 자리가 여기다.
+  assert.deepEqual(out.start.pending, ['recording']);
+  assert.equal(out.start.recorded, null, '아직 아무 동의도 확정되지 않았다');
+  assert.equal(out.start.not_recorded, null);
+  // 확정된 동의는 감사 근거(목적·상태·정책 버전)로 온다. 주체 참조는 어떤 경로로도 오지 않는다.
+  assert.deepEqual(out.turn.recorded, { purpose: 'recording', state: 'granted', policyVersion: 2 });
+  assert.deepEqual(out.turn.pending, [], '동의를 받은 뒤에는 미획득 목록이 비어야 한다');
+  assert.equal(JSON.stringify(out).includes('sha256:reference-subject'), false, '§10.3 동의 주체 참조가 와이어로 나왔다');
+  // 점검은 세션이 끝난 응답에만 실린다.
+  assert.equal(out.start.compliance, null);
+  assert.equal(out.start.reviewed, null, '요약이 없는 응답을 미점검으로 적지 않는다');
+  assert.equal(out.turn.compliance, null);
+  assert.equal(out.end.reviewed, true);
+  assert.deepEqual(out.end.violations, []);
+  assert.deepEqual(out.end.skipped, [], '고지 설정이 배선됐으므로 고지 항목이 건너뛰어지지 않는다');
+  assert.equal(out.end.reason, null);
+  // 금칙어 문구·근거 이벤트 id 는 애초에 요약에 담기지 않는다(§10.3).
+  assert.equal(JSON.stringify(out.raw_end.compliance).includes('무조건 승인'), false);
+});
+
+test('빈 목록을 "다 받았다"로, 없는 칸을 "위반 없음"으로 읽지 않는다(실패·경계 경로)', b, () => {
+  const source = `${PRELUDE}
+from aicc_bridge import BridgeError, BridgeResponse
+
+cases = {
+    # 동의·고지·점검이 하나도 실리지 않은 턴(미배선도 같은 모양이다).
+    "bare": {"interactionId": "i1", "steps": []},
+    # 점검을 **수행하지 못했다** — 위반 0건이 아니다.
+    "unreviewed": {"compliance": {"reviewed": False, "reasonKo": "수집된 이벤트가 없습니다."}},
+    # 위반도 있고 건너뛴 규칙도 있다 — 합쳐 세면 고칠 곳이 섞인다.
+    "violated": {"compliance": {"reviewed": True, "violated": ["forbidden_phrase"],
+                                "skipped": [{"ruleId": "disclosure_missing", "reasonKo": "미배선"}]}},
+    # 확정됐는데 기록되지 않았다 — 동의를 받은 것과 구분되어야 한다.
+    "not_recorded": {"consent": {"notRecordedKo": "이력 저장이 실패했습니다."}},
+    # 형태 위반 — 문자열·숫자를 판정으로 읽으면 미점검이 합격으로 집계된다.
+    "bad_shape": {"compliance": {"reviewed": "yes", "violated": "forbidden_phrase",
+                                 "skipped": [{"reasonKo": "id 없음"}], "reasonKo": ""},
+                  "consent": {"recorded": "granted", "pendingRequired": "recording"},
+                  "disclosure": "AI 상담 안내입니다."},
+}
+out = {}
+for k, body in cases.items():
+    r = BridgeResponse(id="1", ok=True, result=body)
+    out[k] = {"disclosure": r.disclosure, "consent": r.consent, "recorded": r.consent_recorded,
+              "not_recorded": r.consent_not_recorded_ko, "pending": r.consent_pending_required,
+              "compliance_present": r.compliance is not None, "reviewed": r.compliance_reviewed,
+              "violations": r.compliance_violations, "skipped": r.compliance_skipped,
+              "reason": r.compliance_reason_ko}
+err = BridgeResponse(id="1", ok=False, error=BridgeError("E_BAD_REQUEST", "형태 위반"))
+out["error"] = {"disclosure": err.disclosure, "consent": err.consent, "recorded": err.consent_recorded,
+                "not_recorded": err.consent_not_recorded_ko, "pending": err.consent_pending_required,
+                "compliance_present": err.compliance is not None, "reviewed": err.compliance_reviewed,
+                "violations": err.compliance_violations, "skipped": err.compliance_skipped,
+                "reason": err.compliance_reason_ko}
+json.dump(out, sys.stdout, ensure_ascii=False)
+`;
+  const run = withDriver(source, (f) => runPython(f));
+  assert.equal(run.status, 0, run.stderr);
+  const out = JSON.parse(run.stdout);
+
+  // 아무 칸도 없는 턴: 모름은 None 이고 목록은 빈 목록이다(판정을 지어내지 않는다).
+  assert.equal(out.bare.disclosure, null);
+  assert.equal(out.bare.consent, null);
+  assert.equal(out.bare.reviewed, null, '요약이 없는 것을 "점검했고 위반 없음"으로 읽었다');
+  assert.equal(out.bare.compliance_present, false);
+  assert.deepEqual(out.bare.pending, []);
+  // 미점검은 **위반 0건이 아니다** — 둘이 같은 숫자가 되면 마스킹 누락이 합격으로 집계된다.
+  assert.equal(out.unreviewed.reviewed, false);
+  assert.deepEqual(out.unreviewed.violations, []);
+  assert.match(out.unreviewed.reason, /수집된 이벤트가 없습니다/);
+  // 위반과 건너뛴 규칙은 섞지 않는다(고칠 곳이 서로 다르다).
+  assert.deepEqual(out.violated.violations, ['forbidden_phrase']);
+  assert.deepEqual(out.violated.skipped, ['disclosure_missing']);
+  // 확정됐는데 기록되지 않은 동의: 사유가 있고 `recorded` 는 없다.
+  assert.equal(out.not_recorded.recorded, null);
+  assert.match(out.not_recorded.not_recorded, /이력 저장이 실패/);
+  // 형태 위반은 전부 모름·빈 목록이다.
+  assert.equal(out.bad_shape.reviewed, null, '문자열 "yes" 를 점검 수행으로 읽었다');
+  assert.deepEqual(out.bad_shape.violations, [], '문자열을 규칙 목록으로 풀어 적었다');
+  assert.deepEqual(out.bad_shape.skipped, [], 'ruleId 없는 항목을 규칙 id 로 적었다');
+  assert.equal(out.bad_shape.reason, null, '빈 문구를 사유로 적었다');
+  assert.equal(out.bad_shape.recorded, null, '문자열을 동의 기록으로 읽었다');
+  assert.deepEqual(out.bad_shape.pending, [], '문자열을 목적 목록으로 풀어 적었다');
+  assert.equal(out.bad_shape.disclosure, null, '문자열을 고지 근거로 읽었다');
+  // 거부된 응답의 본문은 읽지 않는다.
+  assert.equal(out.error.disclosure, null);
+  assert.equal(out.error.consent, null);
+  assert.equal(out.error.compliance_present, false);
+  assert.equal(out.error.reviewed, null);
+  assert.deepEqual(out.error.pending, []);
+});

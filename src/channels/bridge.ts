@@ -786,6 +786,33 @@ function projectOfferStep(step: AgentOfferStep): Record<string, unknown> {
   return out;
 }
 
+/**
+ * 투영이 다루는 `ChannelTurnResult` 의 칸 — **전부 덮어야 한다**(§2).
+ *
+ * 왜 목록을 두는가: 아래 `projectTurn` 은 칸을 **손으로 하나씩 옮겨 적는다**(객체를 그대로
+ * 흘리지 않는 것이 노출 스위치·판정 복사 방지의 전제다). 그래서 계약에 칸이 하나 늘어나는
+ * 날 이 자리만 모르면 그 값은 **조용히 빠진 채** 나가고, 비-Node 호스트는 없는 칸을
+ * "그 턴에는 없었다"로 읽는다 — 지금까지 §5.2 전환·§9.3 큐 배정·§6.1 반영 사실·§11.2 과금
+ * 근거가 차례로 그 모양으로 빠져 있었고, 증상은 하나도 예외가 아니었다(각 칸의 주석이
+ * 그 사고를 적어 둔 것이다). 계약 버전이 같아도 일어나므로 `BridgeConfigError` 도 걸리지 않는다.
+ *
+ * 목록을 컴파일 검사와 묶어 둔 이유는 `WIRE_INPUT_KINDS` 와 같다: 사람이 기억하는 대신
+ * **빠뜨리면 빌드가 깨지게** 한다. 노출 스위치로 가리는 칸(슬롯 값·상담사용 요약·전환
+ * 토큰)도 **여기에는 적는다** — 가리는 것은 값이고, 칸을 다루지 않는 것과는 다르다.
+ */
+export const PROJECTED_RESULT_KEYS = [
+  'interactionId', 'status', 'steps', 'state', 'events', 'fallback', 'handoff',
+  'switchInvite', 'disclosure', 'billing', 'consent', 'compliance', 'connector',
+] as const;
+
+/** 빠뜨린 칸이 있으면 이 대입이 컴파일 오류가 된다. */
+const _projectedKeysCover: Exclude<keyof ChannelTurnResult, typeof PROJECTED_RESULT_KEYS[number]> extends never
+  ? true : never = true;
+void _projectedKeysCover;
+/** 반대 방향 — 계약에 없는 이름을 적어 두면(오타·삭제된 칸) 여기서 걸린다. */
+const _projectedKeysKnown: readonly (keyof ChannelTurnResult)[] = PROJECTED_RESULT_KEYS;
+void _projectedKeysKnown;
+
 function projectTurn(r: ChannelTurnResult, opts: BridgeOptions): BridgeTurnPayload {
   const slots = r.state.slots ?? {};
   const payload: BridgeTurnPayload = {

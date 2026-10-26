@@ -1283,3 +1283,90 @@ h.close()
   assert.equal(out.stats.fallback_changes, 2);
   assert.deepEqual(out.errors, []);
 });
+
+// ── §10.1 고지·동의 · §7 5.2 준수 점검 ──────────────────────────────────────
+// 세 칸은 판정이 아니라 **남길 근거**라서 Core 는 노출 스위치와 무관하게 내보내는데, 읽을
+// 자리가 없던 동안 세 사실은 음성 호스트에 한 번도 도착하지 않았다: 고지 감사 근거는 `steps`
+// 안에만 있고, 필수 동의 미획득(= pii 조회가 막힌다)은 "그 메뉴만 안 된다"로만 나타나고,
+// `reviewed: False`(점검 못 함)와 요약 없음(점검 미배선)은 "위반 없음"과 구분되지 않았다.
+
+test('§10.1 고지·동의와 §7 5.2 점검이 훅으로 도착한다 — 서 있는 값은 바뀐 턴에만 알린다', b, () => {
+  const out = parse(runDriver(`${PRELUDE}
+GOV = os.path.join(ROOT, "fixtures", "reference-core-governed.mjs")
+def gov_factory():
+    return BridgeClient(core_module=GOV, adapter="callbot", core_root=ROOT, cwd=ROOT,
+                        max_line_bytes=65536, keep_transcript=True)
+disclosures, consents, compliances = [], [], []
+h = CallbotCoreHooks(gov_factory, flow_id="f_reference_voice", entry_point="inbound_call",
+                     on_error=lambda c, m: errors.append(c),
+                     on_disclosure=lambda cid, p: disclosures.append([cid, p]),
+                     on_consent=lambda cid, p: consents.append([cid, dict(p, pending_required=list(p["pending_required"]))]),
+                     on_compliance=lambda cid, p: compliances.append([cid, {"reviewed": p["reviewed"],
+                                                                            "violations": list(p["violations"]),
+                                                                            "skipped": list(p["skipped"]),
+                                                                            "reason_ko": p["reason_ko"]}]))
+h.on_call_start("c1")
+h.on_transcript("c1", "user", "네")              # 녹취 동의 확정
+h.on_transcript("c1", "user", "요금 문의입니다")  # 서 있는 값은 그대로 — 다시 알리지 않는다
+h.on_call_end("c1")
+h.on_call_end("c1")                              # 두 번째 종료 — 점검을 다시 알리지 않는다
+dump(h, disclosures=disclosures, consents=consents, compliances=compliances)
+h.close()
+`));
+  // 고지는 나간 턴에만 — 감사 근거는 판정된 값만 넘긴다(문구는 이미 고객에게 나갔다).
+  assert.equal(out.disclosures.length, 1, '고지 근거를 턴마다 알리면 "몇 번 고지했는가"가 부푼다');
+  assert.equal(out.disclosures[0][0], 'c1');
+  assert.deepEqual(out.disclosures[0][1], { channel: 'voice', placement: 'session_start', config_version: 3 });
+  assert.equal(out.stats.disclosures_seen, 1);
+
+  // 동의: 미획득 목록이 선 턴(start)과 동의가 확정된 턴 두 번만 알린다.
+  assert.equal(out.consents.length, 2, '서 있는 미획득 목록을 턴마다 알리면 같은 안내가 되풀이된다');
+  assert.deepEqual(out.consents[0][1].pending_required, ['recording']);
+  assert.equal(out.consents[0][1].recorded, null);
+  assert.deepEqual(out.consents[1][1].recorded, { purpose: 'recording', state: 'granted', policyVersion: 2 });
+  assert.deepEqual(out.consents[1][1].pending_required, [], '동의를 받았는데 미획득으로 남겼다');
+  assert.equal(out.consents[1][1].not_recorded_ko, null);
+  assert.equal(out.stats.consents_recorded, 1);
+  assert.equal(out.stats.consents_not_recorded, 0);
+  assert.equal(out.stats.calls_pending_consent, 1, '미획득 동의가 있던 통화는 pii 조회가 막힌다 — 세지 않으면 신호가 없다');
+  assert.equal(out.stats.consent_pending_changes, 2);
+
+  // 점검은 통화당 한 번. 끝난 세션의 응답에는 요약이 계속 실려 온다.
+  assert.equal(out.compliances.length, 1, '같은 점검 결과를 두 번째 종료에서 다시 알렸다');
+  assert.equal(out.compliances[0][1].reviewed, true);
+  assert.deepEqual(out.compliances[0][1].violations, []);
+  assert.deepEqual(out.compliances[0][1].skipped, []);
+  assert.equal(out.compliances[0][1].reason_ko, null);
+  assert.equal(out.stats.compliance_reviewed_calls, 1);
+  assert.equal(out.stats.compliance_unreviewed_calls, 0);
+  assert.equal(out.stats.ends_without_compliance, 0);
+  // 동의 주체 참조는 어떤 경로로도 호스트에 오지 않는다(§10.3).
+  assert.equal(JSON.stringify(out).includes('sha256:reference-subject'), false);
+  assert.deepEqual(out.errors, []);
+});
+
+test('고지·동의·점검이 배선되지 않은 Core 에서는 조용한 "위반 없음"이 아니라 미배선 건수다(실패 경로)', b, () => {
+  // `reference-core.mjs` 는 통화 경로만 꿰므로 세 칸이 응답에 아예 실리지 않는다.
+  // 그것을 "고지했다·동의를 다 받았다·위반 없음"으로 적으면 §13-3 위반이다.
+  const out = parse(runDriver(`${PRELUDE}
+disclosures, consents, compliances = [], [], []
+h = hooks(on_disclosure=lambda cid, p: disclosures.append(p),
+          on_consent=lambda cid, p: consents.append(p),
+          on_compliance=lambda cid, p: compliances.append(p))
+h.on_call_start("c1")
+h.on_transcript("c1", "user", "요금 문의입니다")
+h.on_call_end("c1")
+dump(h, disclosures=disclosures, consents=consents, compliances=compliances)
+h.close()
+`));
+  assert.deepEqual(out.disclosures, [], '없는 고지를 알렸다');
+  assert.deepEqual(out.consents, [], '빈 목록을 "다 받았다"로 알렸다');
+  assert.deepEqual(out.compliances, [], '요약이 없는데 점검 결과를 알렸다');
+  assert.equal(out.stats.disclosures_seen, 0, '0 이 곧 "어떤 통화에도 고지가 나가지 않았다"의 신호다');
+  assert.equal(out.stats.consents_recorded, 0);
+  assert.equal(out.stats.calls_pending_consent, 0, '동의 미배선을 "미획득 통화"로 세면 고칠 곳이 바뀐다');
+  assert.equal(out.stats.compliance_reviewed_calls, 0);
+  assert.equal(out.stats.compliance_unreviewed_calls, 0, '요약 없음을 "점검 못 했다"로 셌다 — 둘은 다른 상태다');
+  assert.equal(out.stats.ends_without_compliance, 1, '§7 미배선의 유일한 와이어 신호를 세지 않았다');
+  assert.deepEqual(out.errors, []);
+});

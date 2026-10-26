@@ -104,6 +104,25 @@ agent.py 에 넣을 것은 훅마다 한 줄이다(이 파일은 agent.py 를 im
    장애를 건너 살아 있던 통화의 턴은 새 브리지가 모르는 세션이라 **사실대로 실패**하고, 그것을
    "끝난 통화의 지연 전사"로 바꿔 적으면 끝나지 않은 통화를 끝났다고 적는 것이 된다(§13-3).
 
+12. **§10.1 고지·동의와 §7 5.2 점검이 도착할 자리를 둔다.** 세 칸은 판정이 아니라 **남길
+   근거**이고, 그래서 Core 는 어떤 노출 스위치와도 무관하게 응답에 싣는다(개인정보가 없다 —
+   목적 코드·상태·정책 버전·규칙 id·건수·Core 가 쓴 사유뿐). 그런데 읽을 자리가 없던 동안
+   **세 사실은 음성 호스트에 한 번도 도착하지 않았다**. 증상은 셋 다 예외가 아니다:
+     - 고지(§10.1): 감사 근거가 `steps` 안에만 있어 저장소마다 steps 를 뒤져 각자 다르게
+       찾는다(§2). 못 찾으면 "고지했다"를 증명하는 기록이 그 배치에 **0건**이고, 드러나는
+       시점이 감독기관 점검이면 대상은 지나간 통화 전부다.
+     - 동의(§10.1·§6.1): 필수 동의가 미획득이면 pii 파라미터를 선언한 업무시스템 조회가
+       **통화 중 언제나 막힌다**. 업무시스템은 멀쩡하므로 장애로 보이지 않고 "그 메뉴만
+       안 된다"로만 나타난다 — 미획득 목적 목록이 그 상태의 유일한 신호다. 그리고 답이
+       확정됐는데 **기록되지 않은** 경우(이력 저장 실패)는 동의를 받은 것과 와이어에서
+       구분되지 않았다.
+     - 점검(§7 5.2): `reviewed: False` 는 위반 0건이 아니라 **점검을 못 했다**는 뜻이고,
+       요약이 아예 오지 않는 것은 **점검이 배선되지 않았다**는 뜻이다. 셋을 같게 읽으면
+       고지 누락·녹취 중 마스킹 누락이 "합격"으로 집계된다.
+   `on_disclosure`·`on_consent`·`on_compliance` 로 판정된 값만 넘긴다. **빈 목록을 "다
+   받았다"로, 없는 칸을 "위반 없음"으로 적지 않고**(§13-3), 동의는 **서 있는 값이 바뀐
+   턴에만**, 점검은 **통화당 한 번만** 알린다(되풀이하면 같은 안내·기록이 턴 수만큼 쌓인다).
+
 무엇을 하지 않는가 (build now, activate on approval)
 ---------------------------------------------------
 회선·STT/TTS·전환(transfer)을 만지지 않는다. 브리지는 기본 dry_run 이며 live 는 **[승인 필요]** 다.
@@ -131,6 +150,15 @@ TurnHook = Callable[[str, Any], None]           # (call_id, result payload)
 HandoffHook = Callable[[str, Dict[str, Any]], None]
 #: (call_id, mode, disable) — §9.3 폴백 판정. mode 가 바뀐 턴에만 불린다.
 FallbackHook = Callable[[str, str, tuple], None]
+#: (call_id, {"channel": str|None, "placement": str|None, "config_version": int|None}) — §10.1 고지
+#: 감사 근거. 고지가 나간 턴에만 불린다(문구 자체는 이미 고객에게 나갔다).
+DisclosureHook = Callable[[str, Dict[str, Any]], None]
+#: (call_id, {"recorded": dict|None, "not_recorded_ko": str|None, "pending_required": tuple}) —
+#: §10.1 동의. 이번 턴에 확정된 사실이 있거나 **미획득 필수 목적 목록이 바뀐** 턴에만 불린다.
+ConsentHook = Callable[[str, Dict[str, Any]], None]
+#: (call_id, {"reviewed": bool|None, "violations": tuple, "skipped": tuple, "reason_ko": str|None}) —
+#: §7 5.2 준수 점검 요약. 세션이 끝난 응답에만 실리므로 통화당 한 번 불린다.
+ComplianceHook = Callable[[str, Dict[str, Any]], None]
 ClientFactory = Callable[[], BridgeClient]
 
 
@@ -191,6 +219,35 @@ class HookStats:
     handoffs_placement_unknown: int = 0
     #: §9.3 폴백 모드가 바뀐 횟수(정상 → 폴백 → 정상 전부 포함).
     fallback_changes: int = 0
+    #: §10.1 AI 고지 감사 근거가 응답에 실려 온 횟수. 0 인 채 통화가 쌓이면 그 배치에서는
+    #: **어떤 통화에도 고지가 나가지 않았다**(고지 미배선) — 통화·이벤트·헬스는 전부 정상이고,
+    #: 드러나는 시점이 감독기관 점검이면 대상은 지나간 통화 전부다.
+    disclosures_seen: int = 0
+    #: §10.1 이번 턴에 확정돼 추가 전용 이력에 쌓인 동의 수(감사 근거가 생긴 횟수).
+    consents_recorded: int = 0
+    #: 답은 확정됐는데 **기록되지 않은** 수. 그 동의는 근거가 없고 개인정보 조회는 게이트에서
+    #: 막힌다 — `consents_recorded` 와 합쳐 세면 "동의를 받았다"가 기록 없는 건까지 포함한다.
+    consents_not_recorded: int = 0
+    #: 미획득 필수 동의 목록이 **바뀐** 횟수. 목록은 서 있는 값이라 턴마다 같은 것이 실려 오므로
+    #: 변화만 센다(턴마다 세면 통화 길이만큼 부푼다 — 폴백 모드와 같은 규칙).
+    consent_pending_changes: int = 0
+    #: 미획득 필수 동의가 생긴 **통화 수**(통화당 한 번). 그 통화에서 pii 파라미터를 선언한
+    #: §6.1 업무시스템 조회는 동의 게이트에서 막히는데, 업무시스템은 멀쩡해서 장애로 보이지
+    #: 않고 "그 메뉴만 안 된다"로만 나타난다 — 이 건수가 그 상태의 유일한 신호다.
+    calls_pending_consent: int = 0
+    #: §7 5.2 점검이 **수행된** 통화 수.
+    compliance_reviewed_calls: int = 0
+    #: 점검을 **수행하지 못한** 통화 수(`reviewed == False`). **위반 0건이 아니다**(§13-3) —
+    #: 합쳐 세면 수집 이벤트 0건·스코프 혼입이 "합격"으로 집계된다. 사유는 응답에 있다.
+    compliance_unreviewed_calls: int = 0
+    #: 위반이 하나라도 잡힌 통화 수.
+    compliance_violation_calls: int = 0
+    #: 점검하지 **못한 규칙이 있던** 통화 수. 건너뛴 검사는 합격의 근거가 아니다.
+    compliance_skipped_calls: int = 0
+    #: 종료 응답에 점검 요약이 **아예 없던** 수. 점검이 배선되지 않으면 요약이 실리지 않으므로
+    #: (`reviewed: False` 조차 오지 않는다) 이 건수가 §7 미배선의 유일한 와이어 신호다 —
+    #: 배선 여부 확정은 `warnings` op 의 `W_QA_UNBOUND` 로 한다.
+    ends_without_compliance: int = 0
     #: 유지 루프 호출이 **성공한** 횟수(복구 확인·만료 수렴·readiness·경고·관측·상담사 응답).
     #: 0 인 채 통화가 쌓이면 그 배치는 수렴이 한 번도 돌지 않은 상태다(머리말 10번).
     maintenance_runs: int = 0
@@ -239,6 +296,14 @@ class _Call:
     handoff_notified: bool = False
     #: 마지막으로 알린 §9.3 폴백 모드. 'normal' 은 판정이 실리지 않은 상태다.
     fallback_mode: str = "normal"
+    #: 마지막으로 본 미획득 필수 동의 목적(§10.1). 서 있는 값이라 턴마다 같은 것이 실려 오므로
+    #: **바뀐 턴에만** 알린다. 빈 튜플은 "이 통화에서 아직 미획득 목적을 본 적이 없다"다.
+    consent_pending: tuple = ()
+    #: 미획득 필수 동의를 이 통화에서 한 번이라도 봤는가(통화 수 집계용 래치).
+    consent_pending_seen: bool = False
+    #: §7 5.2 점검 요약을 이미 알렸는가. 끝난 세션의 응답에는 요약이 계속 실려 오므로
+    #: (서 있는 값이다) 이 표시가 없으면 같은 점검 결과를 두 번째 end·늦은 입력마다 다시 알린다.
+    compliance_notified: bool = False
 
 
 class CallbotCoreHooks:
@@ -261,6 +326,9 @@ class CallbotCoreHooks:
         on_turn: Optional[TurnHook] = None,
         on_handoff: Optional[HandoffHook] = None,
         on_fallback: Optional[FallbackHook] = None,
+        on_disclosure: Optional[DisclosureHook] = None,
+        on_consent: Optional[ConsentHook] = None,
+        on_compliance: Optional[ComplianceHook] = None,
         disabled_reason_ko: str = "",
         monotonic: Optional[Callable[[], float]] = None,
     ) -> None:
@@ -277,6 +345,9 @@ class CallbotCoreHooks:
         self._on_turn = on_turn
         self._on_handoff = on_handoff
         self._on_fallback = on_fallback
+        self._on_disclosure = on_disclosure
+        self._on_consent = on_consent
+        self._on_compliance = on_compliance
         self._client: Optional[BridgeClient] = None
         self._calls: Dict[str, _Call] = {}
         self._lock = threading.RLock()
@@ -302,6 +373,9 @@ class CallbotCoreHooks:
         on_turn: Optional[TurnHook] = None,
         on_handoff: Optional[HandoffHook] = None,
         on_fallback: Optional[FallbackHook] = None,
+        on_disclosure: Optional[DisclosureHook] = None,
+        on_consent: Optional[ConsentHook] = None,
+        on_compliance: Optional[ComplianceHook] = None,
         node_bin: str = "node",
     ) -> "CallbotCoreHooks":
         """환경변수로 만든다. 조건이 하나라도 빠지면 **꺼진 어댑터**를 돌려주며 예외를 던지지 않는다."""
@@ -329,7 +403,8 @@ class CallbotCoreHooks:
             )
 
         return cls(factory, flow_id=flow_id, entry_point=entry, on_error=on_error, on_turn=on_turn,
-                   on_handoff=on_handoff, on_fallback=on_fallback)
+                   on_handoff=on_handoff, on_fallback=on_fallback, on_disclosure=on_disclosure,
+                   on_consent=on_consent, on_compliance=on_compliance)
 
     # ── 상태 ─────────────────────────────────────────────────────────────
     @property
@@ -388,6 +463,10 @@ class CallbotCoreHooks:
             if call.pending_connector is not None:
                 self.stats.connector_waits += 1
             self._notify_routing(call_id, call, res)
+            # §10.1 AI 고지는 **대개 이 응답에 실린다**(`placement: session_start`) — 턴에서만
+            # 읽으면 그 통화의 고지 감사 근거가 호스트에 영영 도착하지 않는다. 미획득 필수
+            # 동의도 여기서 처음 선다(인증 전·동의 전이 통화의 시작 상태다).
+            self._notify_governance(call_id, call, res)
             return res.interaction_id
 
     def on_transcript(
@@ -571,6 +650,13 @@ class CallbotCoreHooks:
                 # 싣지 않는다) 그 통화는 통화 분 집계에서 빠진다. 선언 없음(None)과 구분해 센다.
                 if res.billable_ms_recorded is False:
                     self.stats.ends_billable_ms_unrecorded += 1
+                # §7 5.2 점검 요약은 **세션이 끝난 응답에만** 실린다 — 즉 이 자리가 그 사실이
+                # 호스트에 도착하는 유일한 지점이다(턴 응답에는 아예 없다).
+                if res.ok:
+                    self._notify_governance(call_id, call, res)
+                    if res.compliance is None:
+                        # 요약이 아예 오지 않았다 = 점검이 배선되지 않았다("위반 0건"이 아니다).
+                        self.stats.ends_without_compliance += 1
             return res
 
     # ── 유지 루프(§9.3·§2) ───────────────────────────────────────────────
@@ -883,6 +969,7 @@ class CallbotCoreHooks:
                     self.stats.connector_waits += 1
                 call.pending_connector = pending
                 self._notify_routing(call_id, call, res)
+                self._notify_governance(call_id, call, res)
                 # 보낸 턴 중 §11.2 실측 선언이 없던 건수. 통화 구간(`ends_missing_billable_ms`)과
                 # 같은 이유로 센다 — 그 턴의 엔진 비용은 원장에 없고 청구서에만 남는다.
                 if usage_capable and not usage_declared:
@@ -968,6 +1055,91 @@ class CallbotCoreHooks:
                 disable = tuple(str(c) for c in raw) if isinstance(raw, list) else ()
                 try:
                     self._on_fallback(call_id, mode, disable)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _notify_governance(self, call_id: str, call: _Call, res: BridgeResponse) -> None:
+        """§10.1 고지·동의와 §7 5.2 준수 점검을 호스트에 넘긴다(머리말 12번).
+
+        세 칸은 **판정이 아니라 사실**이다 — 수행할 일이 아니라 남길 근거이고, 그래서 Core 는
+        어떤 노출 스위치와도 무관하게 내보낸다. 그런데 **읽을 자리가 없던 동안 세 사실은
+        음성 호스트에 한 번도 도착하지 않았다**: 응답 원문을 그대로 넘겨 두면 저장소마다
+        `result["consent"]["pendingRequired"]` 를 각자 파싱하다 각자 다르게 틀리고(§2),
+        가장 흔한 오답은 **빈 목록·없는 칸을 "다 받았다"·"위반 없음"으로 읽는 것**이다.
+
+        여기서 지키는 것:
+        - **고지는 나간 턴에만** 알린다. 같은 통화의 다음 턴에는 실리지 않으므로(이미 고지했다)
+          `None` 을 "고지하지 않았다"로 적지 않는다(§13-3).
+        - **동의는 이번 턴의 사실이 있거나 미획득 목록이 바뀐 턴에만** 알린다. 목록은 서 있는
+          값이라 턴마다 같은 것이 실려 오고, 턴마다 알리면 호스트는 같은 안내를 되풀이한다
+          (폴백 모드와 같은 규칙). **빈 목록을 "다 받았다"로 적지 않는다** — 동의가 배선되지
+          않은 테넌트도 똑같이 비어 있고, 그 구분은 와이어에 없다(`W_CONSENT_UNBOUND`).
+        - **점검은 통화당 한 번만** 알린다. 세션이 끝난 뒤의 응답에는 요약이 계속 실려 온다.
+          `reviewed == False` 를 위반 0건으로 세지 않고 **따로** 센다.
+        콜백이 던지는 예외는 통화를 끊지 않는다(어댑터의 다른 콜백과 같은 규칙).
+        """
+        disclosure = res.disclosure
+        if disclosure is not None:
+            self.stats.disclosures_seen += 1
+            if self._on_disclosure is not None:
+                channel = disclosure.get("channel")
+                placement = disclosure.get("placement")
+                version = disclosure.get("configVersion")
+                payload: Dict[str, Any] = {
+                    "channel": channel if isinstance(channel, str) and channel else None,
+                    "placement": placement if isinstance(placement, str) and placement else None,
+                    "config_version": version if isinstance(version, int) and not isinstance(version, bool) else None,
+                }
+                try:
+                    self._on_disclosure(call_id, payload)
+                except Exception:  # noqa: BLE001 - 호출자 콜백 오류가 통화를 끊으면 안 된다
+                    pass
+
+        recorded = res.consent_recorded
+        not_recorded_ko = res.consent_not_recorded_ko
+        pending = tuple(res.consent_pending_required)
+        if recorded is not None:
+            self.stats.consents_recorded += 1
+        if not_recorded_ko is not None:
+            self.stats.consents_not_recorded += 1
+        pending_changed = pending != call.consent_pending
+        if pending_changed:
+            call.consent_pending = pending
+            self.stats.consent_pending_changes += 1
+            if pending and not call.consent_pending_seen:
+                call.consent_pending_seen = True
+                self.stats.calls_pending_consent += 1
+        if (recorded is not None or not_recorded_ko is not None or pending_changed) and self._on_consent is not None:
+            try:
+                self._on_consent(call_id, {
+                    "recorded": recorded,
+                    "not_recorded_ko": not_recorded_ko,
+                    "pending_required": pending,
+                })
+            except Exception:  # noqa: BLE001
+                pass
+
+        if res.compliance is not None and not call.compliance_notified:
+            call.compliance_notified = True
+            reviewed = res.compliance_reviewed
+            violations = tuple(res.compliance_violations)
+            skipped = tuple(res.compliance_skipped)
+            if reviewed is True:
+                self.stats.compliance_reviewed_calls += 1
+            elif reviewed is False:
+                self.stats.compliance_unreviewed_calls += 1
+            if violations:
+                self.stats.compliance_violation_calls += 1
+            if skipped:
+                self.stats.compliance_skipped_calls += 1
+            if self._on_compliance is not None:
+                try:
+                    self._on_compliance(call_id, {
+                        "reviewed": reviewed,
+                        "violations": violations,
+                        "skipped": skipped,
+                        "reason_ko": res.compliance_reason_ko,
+                    })
                 except Exception:  # noqa: BLE001
                     pass
 

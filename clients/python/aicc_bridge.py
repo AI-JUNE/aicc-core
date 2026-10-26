@@ -352,6 +352,158 @@ class BridgeResponse:
         fallback = self.result.get("fallback")
         return fallback if isinstance(fallback, dict) else None
 
+    # ── §10.1 고지·동의 · §7 5.2 준수 점검 ────────────────────────────────
+    # 세 칸은 **어떤 노출 스위치와도 무관하게** 와이어로 나온다(브리지가 그렇게 적어 두었다):
+    # 개인정보가 없고(목적 코드·상태·정책 버전·규칙 id·건수·Core 가 쓴 사유뿐), 감추면 호스트가
+    # "고지했다"·"동의를 받았다"·"점검됐다"를 증명할 길이 없기 때문이다. 그런데 **읽을 자리가
+    # 이 클라이언트에 없었다** — 즉 Core 는 보냈고 권장 경로로 붙인 호스트는 세 사실을 한 번도
+    # 손에 쥐지 못했다. 증상은 셋 다 예외가 아니다:
+    #   - 고지(§10.1): 감사 근거가 `steps` 안에만 있어, 저장소마다 steps 를 뒤져 각자 다르게
+    #     찾는다(§2). 못 찾으면 "고지했다"를 증명하는 기록이 그 배치에 0건이다.
+    #   - 동의(§10.1·§6.1): 필수 동의가 미획득이면 pii 파라미터를 선언한 업무시스템 조회가
+    #     **통화 중 언제나 막힌다**. 업무시스템은 멀쩡하므로 장애로 보이지 않고 "그 메뉴만
+    #     안 된다"로만 나타난다 — 미획득 목적 목록이 그 상태의 유일한 신호다.
+    #   - 점검(§7 5.2): `reviewed: False` 는 **위반 0건이 아니라 점검을 못 했다**는 뜻이고,
+    #     그 둘을 같게 읽으면 고지 누락·마스킹 누락이 "합격"으로 집계된다.
+
+    @property
+    def disclosure(self) -> Optional[Dict[str, Any]]:
+        """이번 턴에 AI 고지를 냈다는 **감사 근거**(§10.1). 고지가 없던 턴에는 None.
+
+        문구 자체는 `steps` 맨 앞 단계로 고객에게 나갔고, 여기 있는 것은 "어느 매체에 어떤
+        설정 버전으로 고지했는가"다(`channel`·`placement`·`configVersion`). 고지가 배선되지
+        않았거나 이미 고지한 채널에는 실리지 않는다 — **None 을 "고지하지 않았다"로 적지
+        않는다**(§13-3): 같은 통화에서 이미 고지한 뒤의 턴도 None 이다.
+        """
+        if not self.ok or not isinstance(self.result, dict):
+            return None
+        disclosure = self.result.get("disclosure")
+        return disclosure if isinstance(disclosure, dict) else None
+
+    @property
+    def consent(self) -> Optional[Dict[str, Any]]:
+        """§10.1 동의 사실. 적을 것이 하나도 없으면 None(동의 미배선도 같은 모양이다)."""
+        if not self.ok or not isinstance(self.result, dict):
+            return None
+        consent = self.result.get("consent")
+        return consent if isinstance(consent, dict) else None
+
+    @property
+    def consent_recorded(self) -> Optional[Dict[str, Any]]:
+        """**이번 턴에 확정돼 추가 전용 이력에 쌓인** 동의(`purpose`·`state`·`policyVersion`).
+
+        동의 질문 자체는 시나리오의 `Confirm` 단계로 이미 나갔으므로 여기 있는 것은 감사
+        근거다. 동의 턴이 아니면 None이고 그것은 실패가 아니다 — 확정됐는데 **기록하지 못한**
+        경우는 None 이 아니라 `consent_not_recorded_ko` 에 사유가 온다(그 동의는 근거가 없고
+        개인정보 조회는 게이트에서 막힌다).
+        """
+        consent = self.consent
+        if consent is None:
+            return None
+        recorded = consent.get("recorded")
+        return recorded if isinstance(recorded, dict) else None
+
+    @property
+    def consent_not_recorded_ko(self) -> Optional[str]:
+        """확정된 답이 있었는데 기록하지 못한 사유(한국어). **Core 가 쓴 문구 그대로** 돌려준다.
+
+        정상 생략(동의 턴이 아님·되묻는 중)에는 실리지 않는다 — 즉 값이 있으면 그 자체가
+        설정·저장 결함이고, 호스트가 사유를 지어내면 운영은 저장소마다 다르게 읽는다(§2).
+        """
+        consent = self.consent
+        if consent is None:
+            return None
+        value = consent.get("notRecordedKo")
+        return value if isinstance(value, str) and value else None
+
+    @property
+    def consent_pending_required(self) -> List[str]:
+        """필수로 선언됐는데 **지금 획득 상태가 아닌** 목적 코드. 비어 있으면 빈 목록이다.
+
+        Core 는 이 값으로 통화를 막지 않는다(거부 분기는 시나리오와 테넌트가 정한다). 다만
+        **비어 있지 않은 동안 pii 파라미터를 선언한 §6.1 업무시스템 조회는 동의 게이트에서
+        막힌다** — 그때 증상은 예외가 아니라 "그 메뉴만 안 된다"이고, 이 목록이 그 상태를
+        가리키는 유일한 신호다.
+
+        빈 목록을 "동의를 다 받았다"로 읽지 않는다: 동의가 **배선되지 않은** 테넌트도 똑같이
+        비어 있다(그 테넌트에서는 동의 기록이 애초에 0건이다). 배선 여부는 와이어에서
+        구분되지 않으므로 `warnings` op 의 `W_CONSENT_UNBOUND` 로 확인한다 — 그 구분을
+        여기서 추측해 돌려주면 없는 근거를 만든 것이다(§13-3).
+        """
+        consent = self.consent
+        if consent is None:
+            return []
+        pending = consent.get("pendingRequired")
+        if not isinstance(pending, list):
+            return []
+        return [str(p) for p in pending]
+
+    @property
+    def compliance(self) -> Optional[Dict[str, Any]]:
+        """§7 5.2 준수 점검 요약. **세션이 끝난 응답에만** 실린다 — 아니면 None.
+
+        점검은 세션 전체를 한꺼번에 보므로 턴 응답에는 없다. 위반 요약만 오고 근거 이벤트
+        id·검출 표현·금칙어 문구는 애초에 담기지 않는다(§2·§10.3).
+        """
+        if not self.ok or not isinstance(self.result, dict):
+            return None
+        compliance = self.result.get("compliance")
+        return compliance if isinstance(compliance, dict) else None
+
+    @property
+    def compliance_reviewed(self) -> Optional[bool]:
+        """점검이 **실제로 수행됐는가**. 셋 중 하나다 — True·False·None(이 응답에는 요약이 없다).
+
+        **False 를 "위반 없음"으로 읽지 않는다**(§13-3). False 는 점검을 수행하지 못했다는
+        뜻이고(수집 이벤트 0건·스코프 밖 기록 혼입 등) 사유는 `compliance_reason_ko` 에 온다.
+        그 둘을 같게 읽으면 고지 누락·녹취 중 마스킹 누락이 "합격"으로 집계되는데, 드러나는
+        시점이 감독기관 점검이면 대상은 지나간 통화 전부다.
+        """
+        compliance = self.compliance
+        if compliance is None:
+            return None
+        value = compliance.get("reviewed")
+        return value if isinstance(value, bool) else None
+
+    @property
+    def compliance_violations(self) -> List[str]:
+        """위반이 잡힌 규칙 id. 빈 목록이 "위반 없음"인지는 `compliance_reviewed` 가 말한다.
+
+        `skipped`(점검하지 못한 규칙)는 여기 섞지 않는다 — 건너뛴 검사는 통과의 근거가 아니고,
+        합쳐 세면 "위반 n건"이 "점검 못 한 n건"과 같은 숫자가 된다(고칠 곳은 서로 다르다).
+        """
+        compliance = self.compliance
+        if compliance is None:
+            return []
+        violated = compliance.get("violated")
+        if not isinstance(violated, list):
+            return []
+        return [str(v) for v in violated]
+
+    @property
+    def compliance_skipped(self) -> List[str]:
+        """점검하지 **못한** 규칙 id. 이 목록에 있는 규칙은 합격이 아니라 미점검이다."""
+        compliance = self.compliance
+        if compliance is None:
+            return []
+        skipped = compliance.get("skipped")
+        if not isinstance(skipped, list):
+            return []
+        out: List[str] = []
+        for item in skipped:
+            if isinstance(item, dict) and isinstance(item.get("ruleId"), str):
+                out.append(item["ruleId"])
+        return out
+
+    @property
+    def compliance_reason_ko(self) -> Optional[str]:
+        """점검을 수행하지 못한 사유(한국어). **Core 가 쓴 문구 그대로** 돌려준다."""
+        compliance = self.compliance
+        if compliance is None:
+            return None
+        value = compliance.get("reasonKo")
+        return value if isinstance(value, str) and value else None
+
     # ── §9.3 헬스 접수 범위 ────────────────────────────────────────────────
     # `report_health` 의 응답은 "몇 건을 보냈다"가 아니라 **몇 건이 §9.3 판정에 닿았는가**다.
     # 그 차이를 읽지 않으면 샘플을 성실히 올리는 호스트와 **한 건도 전달되지 않는** 호스트가

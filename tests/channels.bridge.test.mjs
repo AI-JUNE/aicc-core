@@ -1068,3 +1068,76 @@ test('호스트가 고친 반영 사실이 Core 의 판정으로 남지 않는�
   }));
   assert.equal(again.result.connector.resultApplied, false, 'Core 의 판정이 호스트 쪽 수정에 흔들렸다');
 });
+
+// ── 투영이 계약의 칸을 빠짐없이 다루는가(§2) ────────────────────────────────
+// 투영은 칸을 **손으로 하나씩 옮겨 적는다**(객체를 그대로 흘리지 않는 것이 노출 스위치·판정
+// 복사 방지의 전제다). 그래서 계약에 칸이 늘어나는 날 투영만 모르면 그 값은 **조용히 빠진 채**
+// 나가고, 비-Node 호스트는 없는 칸을 "그 턴에는 없었다"로 읽는다 — §5.2 전환·§9.3 큐 배정·
+// §6.1 반영 사실·§11.2 과금 근거가 차례로 그 모양으로 빠져 있었다. 계약 버전은 같으므로
+// 기동 거절(BridgeConfigError)도 걸리지 않는다.
+
+/** 계약의 모든 칸이 채워진 턴 결과를 돌려주는 Core. 매체를 만지지 않는다. */
+function fullResultCore() {
+  return {
+    contractVersion: 1,
+    start: async () => fullResultCore.payload,
+    send: async () => fullResultCore.payload,
+    end: async () => fullResultCore.payload,
+    reportHealth: () => undefined,
+  };
+}
+fullResultCore.payload = {
+  interactionId: 'i_full',
+  status: 'awaiting_input',
+  steps: [{ kind: 'say', text: '안녕하세요.' }],
+  state: {
+    flowId: 'billing', flowVersion: 1, channel: 'voice', currentNodeId: 'ask',
+    status: 'awaiting_input', turnCount: 1, failCount: 0,
+    slots: { customer_name: '홍길동' }, pendingConnectorId: 'c_balance',
+  },
+  events: [],
+  fallback: { mode: 'degraded_ai', reasonKo: 'LLM 장애', causes: [{ component: 'llm', state: 'down' }], disable: ['llm'] },
+  handoff: {
+    queue: 'q_care',
+    summaryMasked: '요약',
+    placement: {
+      placement: 'queued', reasonKo: '큐에 배정했습니다.', summaryPresent: true, warnings: [],
+      requestedQueueId: 'q_care', path: ['q_care'], queueId: 'q_care', overflowed: false,
+    },
+  },
+  switchInvite: { fromChannel: 'voice', toChannel: 'visual', ticketIssued: true, expiresAt: NOW, token: 't_once' },
+  disclosure: { channel: 'voice', placement: 'session_start', configVersion: 4 },
+  billing: { usageAttached: true },
+  consent: { recorded: { purpose: 'recording', state: 'granted', policyVersion: 2 }, pendingRequired: ['marketing'] },
+  compliance: { reviewed: true, counts: { critical: 0, major: 0, minor: 0 }, violated: [], checked: [], skipped: [] },
+  connector: { resultApplied: true, pendingConnectorId: 'c_balance' },
+};
+
+test('계약의 칸은 하나도 빠지지 않고 와이어에 도착한다 — 빠지면 "그 턴에는 없었다"로 읽힌다', b, async () => {
+  const bridge = BR.createBridge({
+    core: fullResultCore(), adapter: 'callbot', scope: SCOPE,
+    // 노출 스위치로 가리는 칸도 **칸 자체는 다뤄야 한다** — 가리는 것은 값이다.
+    includeSlots: true, includeHandoffSummary: true, includeSwitchTicket: true,
+  });
+  const r = await bridge.handleLine(line({ id: '1', op: 'start', req: { flowId: 'billing', entryPoint: 'inbound_call' } }));
+  assert.equal(r.ok, true, JSON.stringify(r.error));
+  const missing = BR.PROJECTED_RESULT_KEYS.filter((k) => r.result[k] === undefined);
+  assert.deepEqual(missing, [], `투영이 다루지 않은 칸이 와이어에서 빠졌다: ${missing.join(', ')}`);
+  // 목록이 계약과 같은 모집단인지도 본다 — 목록만 늘려 두면 검사가 통과하면서 값은 안 나간다.
+  assert.deepEqual([...BR.PROJECTED_RESULT_KEYS].sort(), Object.keys(fullResultCore.payload).sort());
+});
+
+test('가려진 칸은 값만 빠지고 사실은 남는다 — 스위치를 끈 소비자도 칸을 받는다', b, async () => {
+  const bridge = BR.createBridge({ core: fullResultCore(), adapter: 'callbot', scope: SCOPE });
+  const r = await bridge.handleLine(line({ id: '1', op: 'start', req: { flowId: 'billing', entryPoint: 'inbound_call' } }));
+  const missing = BR.PROJECTED_RESULT_KEYS.filter((k) => r.result[k] === undefined);
+  assert.deepEqual(missing, [], '노출 스위치를 끄면 칸 자체가 사라졌다');
+  // 값은 가려진다(§10.3): 슬롯 원문·상담사용 요약·1회용 토큰.
+  assert.equal(r.result.state.slots, undefined);
+  assert.deepEqual(r.result.state.slotKeys, ['customer_name']);
+  assert.equal(r.result.handoff.summaryMasked, undefined);
+  assert.equal(r.result.handoff.summaryAvailable, true, '있었다는 사실까지 감추면 이관 누락을 조사할 수 없다');
+  assert.equal(r.result.switchInvite.token, undefined);
+  assert.equal(r.result.switchInvite.tokenIncluded, false);
+  assert.equal(r.result.switchInvite.ticketIssued, true, '발급 사실은 스위치와 무관하다');
+});
