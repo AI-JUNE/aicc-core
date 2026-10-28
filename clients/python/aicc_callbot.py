@@ -123,6 +123,32 @@ agent.py 에 넣을 것은 훅마다 한 줄이다(이 파일은 agent.py 를 im
    받았다"로, 없는 칸을 "위반 없음"으로 적지 않고**(§13-3), 동의는 **서 있는 값이 바뀐
    턴에만**, 점검은 **통화당 한 번만** 알린다(되풀이하면 같은 안내·기록이 턴 수만큼 쌓인다).
 
+13. **§5.2 화면 전환 지시가 도착할 자리를 둔다.** §5.1 사다리는 2회 실패에서 **화면 전환**을
+   고르고, 그 지시를 수행하는 것은 호스트다(링크 발송). Node 호스트는 `port.invite` 로 받지만
+   비-Node 호스트에 그 지시가 닿는 자리는 **턴 응답 하나뿐**이고, 읽을 자리가 없던 동안 음성
+   배치에서 전환은 **조용히 반쪽만** 일어났다: Core 는 `state.channel` 을 화면으로 바꿔 이후
+   단계를 화면용으로 렌더하는데(통화 중인 고객이 그것을 듣는다) **링크는 아무도 보내지
+   않는다**. 고객은 오지 않는 화면을 기다리고, 사다리는 이미 전환을 골랐으므로 상담사로
+   내려가지도 않으며, 어디에서도 예외가 나지 않는다.
+   `on_switch` 로 판정된 값만 넘기고 **네 가지 상태를 섞지 않는다**(§13-3) — 고칠 곳이 다르다:
+     - 토큰까지 왔다 → 링크를 **그 토큰으로** 만든다.
+     - 발급은 됐는데 토큰이 오지 않았다(`token_included=False`) → 노출 스위치가 꺼져 있다.
+       **Interaction id 로 링크를 만들지 않는다**(1회용·만료·회수가 전부 무의미해진다, §10.3) —
+       링크를 이 호스트가 직접 만든다면 `include_switch_ticket=True` 로 켠다.
+     - 전환 배선이 없어 토큰 없이 초대했다(`tokenless`) → 링크의 열쇠가 곧 id 인 **종전 상태**다.
+     - 발급에 실패했다(`not_issued_ko`) → **링크를 보내서는 안 된다**. 사유를 운영에 알린다.
+14. **Core 가 끝낸 세션에는 더 보내지 않는다(§5.3·§8.1).** 세션을 끝내는 주체가 호스트만이
+   아니다 — End 노드 도달·재시도 소진 이관·Api 순회 상한·장애 폴백은 Core 가 그 턴에서
+   세션을 닫는다. 닫힌 세션에 온 입력은 **오류가 아니라 멱등 처리**라 `ok: True`·`events`
+   0건이고 **직전 턴의 상태·단계가 그대로** 실려 온다. 그래서 그 사실(`status`)을 읽지 않으면
+   증상이 둘로 갈리는데 둘 다 조용하다: 응답 단계를 그대로 렌더하는 호스트는 마지막 안내를
+   **턴마다 다시** 재생하고, 새 단계만 렌더하는 호스트는 고객이 무슨 말을 해도 **무음**이다.
+   그래서 호스트 종료(`late_after_end`)와 **같은 규칙**으로 다룬다: 보내지 않고 건수로 남기며
+   (`turns_after_core_close`), 닫혔다는 사실은 `on_session_closed` 로 **통화당 한 번** 알린다.
+   **통화를 끊지 않는다** — 끊을지·안내를 더 할지는 호스트가 정하고(이관이 함께 실린 세션은
+   상담사로 넘길 차례다), 어댑터는 사실만 적는다. 종료(`on_call_end`)는 그대로 보낸다:
+   Core 는 멱등하게 받고 그 호출의 과금 근거 판정을 돌려준다.
+
 무엇을 하지 않는가 (build now, activate on approval)
 ---------------------------------------------------
 회선·STT/TTS·전환(transfer)을 만지지 않는다. 브리지는 기본 dry_run 이며 live 는 **[승인 필요]** 다.
@@ -159,6 +185,13 @@ ConsentHook = Callable[[str, Dict[str, Any]], None]
 #: (call_id, {"reviewed": bool|None, "violations": tuple, "skipped": tuple, "reason_ko": str|None}) —
 #: §7 5.2 준수 점검 요약. 세션이 끝난 응답에만 실리므로 통화당 한 번 불린다.
 ComplianceHook = Callable[[str, Dict[str, Any]], None]
+#: (call_id, {"to_channel", "from_channel", "ticket_issued", "token_included", "token",
+#: "expires_at", "tokenless", "not_issued_ko"}) — §5.2 전환 초대. 전환이 일어난 턴에만 불린다.
+#: 링크를 보내는 것은 **호스트**이며, 토큰이 없으면 **id 로 만들지 않는다**(머리말 13번).
+SwitchHook = Callable[[str, Dict[str, Any]], None]
+#: (call_id, status) — Core 가 이 세션을 닫았다. 통화당 한 번 불린다(머리말 14번).
+#: `status` 는 Core 가 적은 값 그대로다(`completed`·`transferred`·`failed` …) — 어댑터가 고르지 않는다.
+SessionClosedHook = Callable[[str, str], None]
 ClientFactory = Callable[[], BridgeClient]
 
 
@@ -219,6 +252,27 @@ class HookStats:
     handoffs_placement_unknown: int = 0
     #: §9.3 폴백 모드가 바뀐 횟수(정상 → 폴백 → 정상 전부 포함).
     fallback_changes: int = 0
+    #: §5.2 전환 초대가 응답에 실려 온 횟수. 아래 셋과 **반드시 같이 읽는다** — 전환이
+    #: 일어났다는 것과 링크를 보낼 수 있었다는 것은 다른 질문이다(머리말 13번).
+    switch_invites_seen: int = 0
+    #: 그중 **토큰까지 받은** 건수. 링크를 그 토큰으로 만들 수 있는 유일한 경우다.
+    switch_tokens_received: int = 0
+    #: 발급은 됐는데 **토큰이 오지 않은** 건수(노출 스위치가 꺼져 있다). 이 수만큼 호스트는
+    #: 링크를 만들 수 없다 — id 로 만들면 1회용·만료·회수가 전부 무의미해진다(§10.3).
+    switch_tokens_withheld: int = 0
+    #: 전환 배선이 없어 **토큰 없이** 초대한 건수(종전 상태 — 링크의 열쇠가 곧 id 다).
+    #: 위의 `switch_tokens_withheld` 와 합쳐 세지 않는다: 저쪽은 이 호스트의 스위치이고
+    #: 이쪽은 Core 쪽 배선이라 고칠 곳이 다른 저장소다.
+    switch_tokenless: int = 0
+    #: 발급에 **실패한** 건수. 그 전환은 링크를 보내서는 안 된다(사유는 응답에 있다).
+    switch_tickets_unissued: int = 0
+    #: Core 가 **먼저 닫은** 세션 수(통화당 한 번). End 노드 도달·재시도 소진 이관·Api 순회
+    #: 상한·장애 폴백이 전부 여기로 온다 — 호스트 종료(`calls_ended`)와 다른 숫자다.
+    calls_closed_by_core: int = 0
+    #: Core 가 닫은 세션에 보내려 한 턴 수. **보내지 않았다**(머리말 14번) — 보내면 응답은
+    #: `ok: True` 로 직전 턴의 단계를 되풀이하고, 그 턴은 안내 반복이나 무음으로 나타난다.
+    #: `late_after_end`(호스트가 닫은 뒤)와 나눠 센다: 둘의 고칠 곳이 다르다(시나리오 vs 호스트).
+    turns_after_core_close: int = 0
     #: §10.1 AI 고지 감사 근거가 응답에 실려 온 횟수. 0 인 채 통화가 쌓이면 그 배치에서는
     #: **어떤 통화에도 고지가 나가지 않았다**(고지 미배선) — 통화·이벤트·헬스는 전부 정상이고,
     #: 드러나는 시점이 감독기관 점검이면 대상은 지나간 통화 전부다.
@@ -304,6 +358,10 @@ class _Call:
     #: §7 5.2 점검 요약을 이미 알렸는가. 끝난 세션의 응답에는 요약이 계속 실려 오므로
     #: (서 있는 값이다) 이 표시가 없으면 같은 점검 결과를 두 번째 end·늦은 입력마다 다시 알린다.
     compliance_notified: bool = False
+    #: Core 가 이 세션을 닫았는가(`status != "running"`). **Core 의 마지막 말이지 추정이 아니다.**
+    #: 서면 이후 턴은 보내지 않는다 — 호스트가 닫은 `ended` 와 나눠 둔다: 이쪽은 통화가 아직
+    #: 살아 있고(호스트는 종료를 따로 불러야 한다) 저쪽은 통화가 끝난 것이다(머리말 14번).
+    core_closed: bool = False
 
 
 class CallbotCoreHooks:
@@ -315,6 +373,8 @@ class CallbotCoreHooks:
     ENV_FLOW_ID = "AICC_FLOW_ID"
     ENV_ENTRY = "AICC_ENTRY_POINT"
     ENV_MAX_LINE = "AICC_MAX_LINE_BYTES"
+    #: §5.2 전환 링크를 **이 호스트가 직접 만들어 보낼 때만** 켠다(기본 꺼짐, §10.3 — 머리말 13번).
+    ENV_SWITCH_TICKET = "AICC_INCLUDE_SWITCH_TICKET"
 
     def __init__(
         self,
@@ -329,6 +389,8 @@ class CallbotCoreHooks:
         on_disclosure: Optional[DisclosureHook] = None,
         on_consent: Optional[ConsentHook] = None,
         on_compliance: Optional[ComplianceHook] = None,
+        on_switch: Optional[SwitchHook] = None,
+        on_session_closed: Optional[SessionClosedHook] = None,
         disabled_reason_ko: str = "",
         monotonic: Optional[Callable[[], float]] = None,
     ) -> None:
@@ -348,6 +410,8 @@ class CallbotCoreHooks:
         self._on_disclosure = on_disclosure
         self._on_consent = on_consent
         self._on_compliance = on_compliance
+        self._on_switch = on_switch
+        self._on_session_closed = on_session_closed
         self._client: Optional[BridgeClient] = None
         self._calls: Dict[str, _Call] = {}
         self._lock = threading.RLock()
@@ -376,6 +440,8 @@ class CallbotCoreHooks:
         on_disclosure: Optional[DisclosureHook] = None,
         on_consent: Optional[ConsentHook] = None,
         on_compliance: Optional[ComplianceHook] = None,
+        on_switch: Optional[SwitchHook] = None,
+        on_session_closed: Optional[SessionClosedHook] = None,
         node_bin: str = "node",
     ) -> "CallbotCoreHooks":
         """환경변수로 만든다. 조건이 하나라도 빠지면 **꺼진 어댑터**를 돌려주며 예외를 던지지 않는다."""
@@ -396,15 +462,22 @@ class CallbotCoreHooks:
                 return cls(None, disabled_reason_ko=f"{cls.ENV_MAX_LINE} 는 양의 정수여야 합니다.")
             max_line = int(raw_max)
 
+        # §5.2 전환 토큰 노출(기본 꺼짐, §10.3). 켤 자리가 없던 동안 이 어댑터로 붙인 호스트는
+        # **링크를 만들 수 없었다** — 브리지·참조 클라이언트에는 스위치가 있는데 권장 경로에서만
+        # 닿지 않았고, 그 상태에서 링크를 만들려면 Interaction id 를 쓸 수밖에 없다(머리말 13번).
+        switch_ticket = (e.get(cls.ENV_SWITCH_TICKET, "") or "").strip().lower() in _TRUTHY
+
         def factory() -> BridgeClient:
             return BridgeClient(
                 core_module=module, adapter=adapter, core_root=root, cwd=root,
                 node_bin=node_bin, max_line_bytes=max_line,
+                include_switch_ticket=switch_ticket,
             )
 
         return cls(factory, flow_id=flow_id, entry_point=entry, on_error=on_error, on_turn=on_turn,
                    on_handoff=on_handoff, on_fallback=on_fallback, on_disclosure=on_disclosure,
-                   on_consent=on_consent, on_compliance=on_compliance)
+                   on_consent=on_consent, on_compliance=on_compliance, on_switch=on_switch,
+                   on_session_closed=on_session_closed)
 
     # ── 상태 ─────────────────────────────────────────────────────────────
     @property
@@ -467,6 +540,9 @@ class CallbotCoreHooks:
             # 읽으면 그 통화의 고지 감사 근거가 호스트에 영영 도착하지 않는다. 미획득 필수
             # 동의도 여기서 처음 선다(인증 전·동의 전이 통화의 시작 상태다).
             self._notify_governance(call_id, call, res)
+            # 첫 응답에서 이미 끝나는 시나리오가 있다(즉시 안내 후 End·첫 노드가 Transfer·
+            # Api 순회 상한). 턴에서만 읽으면 그 통화는 **시작부터** 닫힌 세션에 말을 보낸다.
+            self._notify_core_close(call_id, call, res)
             return res.interaction_id
 
     def on_transcript(
@@ -951,6 +1027,12 @@ class CallbotCoreHooks:
             if call.ended:
                 self.stats.late_after_end += 1  # 끝난 통화의 지연 전사. 보내지 않는다
                 return None
+            if call.core_closed:
+                # Core 가 이미 닫은 세션이다. 보내면 응답은 `ok: True` 로 **직전 턴의 단계를
+                # 되풀이**하고(멱등, §8.1) 호스트는 그것을 새 안내로 읽는다 — 안내 반복이나
+                # 무음으로 나타난다(머리말 14번). 호스트 종료와 나눠 센다: 고칠 곳이 다르다.
+                self.stats.turns_after_core_close += 1
+                return None
             now = self._now()
             if defer_on_limit and call.blocked_until > now:
                 # 한도가 풀릴 때까지는 보내지 않는다. 통화는 계속되고, 건수로만 남는다.
@@ -970,6 +1052,10 @@ class CallbotCoreHooks:
                 call.pending_connector = pending
                 self._notify_routing(call_id, call, res)
                 self._notify_governance(call_id, call, res)
+                self._notify_switch(call_id, res)
+                # **마지막에 알린다**: 닫혔다는 사실보다 그 턴에 일어난 일(이관·폴백·고지·동의·
+                # 전환)이 먼저 손에 쥐어져야 호스트가 무엇 때문에 끝났는지 알고 마무리한다.
+                self._notify_core_close(call_id, call, res)
                 # 보낸 턴 중 §11.2 실측 선언이 없던 건수. 통화 구간(`ends_missing_billable_ms`)과
                 # 같은 이유로 센다 — 그 턴의 엔진 비용은 원장에 없고 청구서에만 남는다.
                 if usage_capable and not usage_declared:
@@ -1142,6 +1228,87 @@ class CallbotCoreHooks:
                     })
                 except Exception:  # noqa: BLE001
                     pass
+
+    def _notify_switch(self, call_id: str, res: BridgeResponse) -> None:
+        """§5.2 전환 초대를 호스트에 넘긴다(머리말 13번). **링크를 보내는 것은 호스트다.**
+
+        여기서 지키는 것:
+        - **네 상태를 섞지 않는다**: 토큰 수신 · 발급됐으나 토큰 미실림(이 호스트의 스위치) ·
+          토큰 없는 초대(Core 쪽 배선 없음) · 발급 실패(링크를 보내면 안 된다). 합쳐 세면
+          "링크를 못 보낸다"는 한 숫자가 되고, 고칠 곳이 셋으로 갈린다.
+        - **id 를 토큰 자리에 넣지 않는다**(§10.3): 어댑터는 `interaction_id` 를 이 payload 에
+          담지 않는다 — 담으면 "토큰이 없으면 id 로 만든다"는 경로를 여기서 열어 주는 셈이다.
+        - **턴 사실이라 되풀이되지 않는다**: Core 는 끝난 세션의 늦은 입력에 전환 초대를 싣지
+          않으므로(그 토큰은 이미 상환됐을 수 있다) 통화당 래치를 두지 않는다.
+        콜백이 던지는 예외는 통화를 끊지 않는다(어댑터의 다른 콜백과 같은 규칙).
+        """
+        invite = res.switch_invite
+        if invite is None:
+            return
+        self.stats.switch_invites_seen += 1
+        ticket_issued = invite.get("ticketIssued") is True
+        token = invite.get("token")
+        token = token if isinstance(token, str) and token else None
+        token_included = invite.get("tokenIncluded") is True and token is not None
+        tokenless = invite.get("tokenless") is True
+        not_issued_ko = invite.get("notIssuedKo")
+        not_issued_ko = not_issued_ko if isinstance(not_issued_ko, str) and not_issued_ko else None
+        if token_included:
+            self.stats.switch_tokens_received += 1
+        elif ticket_issued:
+            # 토큰 노출이 꺼져 있다. **알림을 내지 않는다**: 링크를 Core 쪽 transport 가 보내는
+            # 구성이 정상일 수 있고(그 호스트는 토큰이 필요 없다), 그 구성에 턴마다 오류를
+            # 올리면 진짜 신호가 묻힌다. 필요한 호스트에는 이 건수가 곧 "스위치를 켜라"다.
+            self.stats.switch_tokens_withheld += 1
+        elif tokenless:
+            # Core 쪽 배선 없음 — 등록 시점 경고(`W_CHANNEL_SWITCH_UNBOUND`)가 이미 적어 둔
+            # 상태라 여기서 되풀이하지 않는다(같은 사실을 두 경로로 알리면 둘 다 안 읽힌다).
+            self.stats.switch_tokenless += 1
+        else:
+            # 발급 실패만 **알린다**: 이 상태에서 링크를 보내면 안 되고, 그 사실을 말해 주는
+            # 다른 경로가 없다(등록 시점에는 멀쩡했고 통화는 계속 돌아간다).
+            self.stats.switch_tickets_unissued += 1
+            self._report("E_SWITCH_NOT_ISSUED",
+                         "전환 초대가 발급되지 않아 링크를 보내지 않아야 합니다. 사유는 응답에 있습니다.")
+        if self._on_switch is None:
+            return
+        from_channel = invite.get("fromChannel")
+        to_channel = invite.get("toChannel")
+        expires_at = invite.get("expiresAt")
+        payload: Dict[str, Any] = {
+            "from_channel": from_channel if isinstance(from_channel, str) and from_channel else None,
+            "to_channel": to_channel if isinstance(to_channel, str) and to_channel else None,
+            "ticket_issued": ticket_issued,
+            "token_included": token_included,
+            "token": token if token_included else None,
+            "expires_at": expires_at if isinstance(expires_at, str) and expires_at else None,
+            "tokenless": tokenless,
+            "not_issued_ko": not_issued_ko,
+        }
+        try:
+            self._on_switch(call_id, payload)
+        except Exception:  # noqa: BLE001 - 호출자 콜백 오류가 통화를 끊으면 안 된다
+            pass
+
+    def _notify_core_close(self, call_id: str, call: _Call, res: BridgeResponse) -> None:
+        """Core 가 이 세션을 닫았다는 사실을 호스트에 넘긴다(머리말 14번).
+
+        **모름을 닫혔다로 적지 않는다**(§13-3): 상태 칸이 없는 응답(`session_closed is None`)은
+        판정이 아니다. **통화당 한 번만** 알린다 — 닫힌 세션의 응답에는 그 상태가 계속 실려
+        오므로(서 있는 값이다) 턴마다 알리면 같은 마무리가 턴 수만큼 되풀이된다.
+        통화를 끊지 않는다: 끊을지·안내를 더 할지는 호스트가 정한다.
+        """
+        if call.core_closed or res.session_closed is not True:
+            return
+        call.core_closed = True
+        self.stats.calls_closed_by_core += 1
+        status = res.run_status or ""
+        if self._on_session_closed is None:
+            return
+        try:
+            self._on_session_closed(call_id, status)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _report(self, code: str, message_ko: str) -> None:
         if self._on_error is None:

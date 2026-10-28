@@ -54,7 +54,7 @@ function fakePort(id = 'callbot', capsOver = {}, over = {}) {
   };
 }
 
-function build({ flows = [flowBilling], registry, port = fakePort(), ports, samples = [], policy = {}, components, newId, reprompt, timing, routing, connectors, channelSwitch, disclosure, intent, knowledge, consent, qa, observability, recovery, engines, retention } = {}) {
+function build({ flows = [flowBilling], registry, port = fakePort(), ports, samples = [], policy = {}, components, newId, reprompt, timing, routing, connectors, channelSwitch, disclosure, intent, knowledge, consent, qa, observability, recovery, engines, retention, sessions } = {}) {
   const collector = B.createCollectorSink('t');
   const bus = B.createEventBus({
     scope: SCOPE, sinks: [collector],
@@ -87,8 +87,27 @@ function build({ flows = [flowBilling], registry, port = fakePort(), ports, samp
     ...(recovery !== undefined ? { recovery } : {}),
     ...(engines !== undefined ? { engines } : {}),
     ...(retention !== undefined ? { retention } : {}),
+    ...(sessions !== undefined ? { sessions } : {}),
   });
   return { core, port, collector, health };
+}
+
+/**
+ * 영속 저장소를 흉내 내는 세션 저장소 — `put` 시점에 **직렬화**하고 `get` 에서 되살린다.
+ *
+ * 인메모리 기본 구현은 레코드 객체를 그대로 담으므로, 저장 **뒤에** 레코드를 고치는 코드도
+ * 조용히 반영된다. 운영 구현(DB·Redis)은 그렇지 않다 — `put` 이 곧 그 시점의 사본이다.
+ * 그 차이가 숨기는 결함을 이 저장소가 드러낸다(§6.2: 저장소는 인터페이스 뒤로 교체된다).
+ * 함수·시계는 세션 레코드에 담기지 않으므로 JSON 왕복으로 충분하다.
+ */
+function serializingSessionStore() {
+  const map = new Map();
+  return {
+    get: (id) => { const raw = map.get(id); return raw === undefined ? undefined : JSON.parse(raw); },
+    put: (r) => { map.set(r.interactionId, JSON.stringify(r)); },
+    remove: (id) => { map.delete(id); },
+    ids: () => [...map.keys()],
+  };
 }
 
 const req = (over = {}) => ({ scope: SCOPE, adapter: 'callbot', entryPoint: 'inbound_call', flowId: 'billing', ...over });
@@ -386,6 +405,36 @@ test('라우팅을 주면 배정 결과가 결과에 실리고 확정된 큐로 
   assert.equal(r.handoff.placement.queueId, 'q_care');
   const transfer = port.log.find((l) => l[0] === 'transfer');
   assert.equal(transfer[2], 'q_care');
+});
+
+test('큐 배정 판정은 보관 복사본에도 남는다 — 늦은 입력이 "판정 없는 이관"을 돌려받지 않는다', b, async () => {
+  // 큐에 들어간 건은 **요약 저장이 뒤따라서** 종전에도 우연히 남아 있었다(그 put 은 소진 수렴을
+  // 위한 것이다) — 그래서 이 검사는 정상 경로의 회귀 고정이고, 결함이 드러나는 쪽은 다음 검사다.
+  const { core } = build({ flows: [flowHandoff], routing: ROUTING(), sessions: serializingSessionStore() });
+  await core.start(req({ flowId: 'care' }));
+  const turn = await core.send('i_test1', { input: { kind: 'utterance', text: '901010-1234567 입니다' } });
+  assert.equal(turn.handoff.placement.placement, 'queued');
+  const late = await core.send('i_test1', { input: { kind: 'utterance', text: '여보세요?' } });
+  assert.equal(late.events.length, 0, '늦은 입력은 새 이벤트를 만들지 않는다');
+  assert.ok(late.handoff, '이관은 서 있는 사실이라 되풀이된다');
+  assert.equal(late.handoff.placement?.placement, 'queued',
+    '판정이 보관 복사본에 남지 않으면 호스트는 큐 배정을 "모름"으로 읽는다');
+  assert.equal(late.handoff.placement.queueId, 'q_care');
+});
+
+test('대안으로 간 판정도 보관 복사본에 남는다 — 늦은 입력에도 상담사 연결을 안내하지 않는다', b, async () => {
+  // 큐에 들어가지 못한 건은 요약을 남기는 그 put 보다 **먼저** 돌아간다(transfer 를 부르지
+  // 않으므로) — 즉 판정이 보관 복사본에 적히는 경로가 없었다. 영속 저장소에서 그 세션의 늦은
+  // 입력은 `placement` 없는 이관을 받고, 호스트는 판정 없음을 "라우팅 미배선(모름)"으로
+  // 읽어야 한다(§13-3) — 큐 id 를 들고 있지 않아 `queue` 도 비어 있으므로, 그 응답은
+  // "큐를 선언하지 않은 이관"과 같은 모양이 되어 **상담사 연결 안내**로 되돌아간다.
+  const routing = ROUTING({ snapshots: () => [] });   // 상태 미확인 → 보수적으로 닫힘
+  const { core } = build({ flows: [flowHandoff], routing, sessions: serializingSessionStore() });
+  await core.start(req({ flowId: 'care' }));
+  await core.send('i_test1', { input: { kind: 'utterance', text: '901010-1234567 입니다' } });
+  const late = await core.send('i_test1', { input: { kind: 'utterance', text: '여보세요?' } });
+  assert.equal(late.handoff.placement?.placement, 'alternative');
+  assert.equal(late.handoff.placement.action, 'callback');
 });
 
 test('오버플로면 요청 큐가 아니라 수용 큐로 전달한다', b, async () => {

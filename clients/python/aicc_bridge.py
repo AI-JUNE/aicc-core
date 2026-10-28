@@ -50,6 +50,12 @@ Callbot 의 음성 에이전트는 파이썬 프로세스다. Node 로 된 채�
    `health_accepted`·`health_ignored`·`health_registered`·`health_intake_known` 이 있고,
    **모름을 0 으로도 `offered` 로도 읽지 않는다** — 0 으로 읽으면 멀쩡한 보고가 전부 유실로
    집계되고, `offered` 로 읽으면 **한 건도 닿지 않는 상태가 정상으로** 집계된다(§13-3).
+12. **세션을 끝내는 주체가 호스트만이 아니다(§5.3·§9.3).** End 노드 도달·재시도 소진 이관·
+   Api 순회 상한·장애 폴백은 Core 가 그 턴에서 세션을 닫는다. 닫힌 세션에 온 입력은 **오류가
+   아니라 멱등 처리**다 — `ok: True` · `events` 0건이고 **직전 턴의 상태·단계가 그대로** 실려
+   온다. 그래서 `status`(`run_status`·`session_closed`)를 읽지 않으면 증상이 둘로 갈리는데
+   둘 다 조용하다: `steps` 를 그대로 렌더하는 호스트는 마지막 안내를 **턴마다 다시** 재생하고,
+   새 단계만 렌더하는 호스트는 고객이 무슨 말을 해도 **무음**이다.
 
 무엇을 하지 않는가 (build now, activate on approval)
 ---------------------------------------------------
@@ -351,6 +357,39 @@ class BridgeResponse:
             return None
         fallback = self.result.get("fallback")
         return fallback if isinstance(fallback, dict) else None
+
+    # ── Core 가 끝낸 세션(§5.3·§8.1) ──────────────────────────────────────
+    # 세션을 끝내는 주체는 **호스트만이 아니다**: End 노드 도달·재시도 소진 이관·Api 노드 순회
+    # 상한·장애 폴백(§9.3)은 전부 Core 가 그 턴에서 세션을 닫는다. 그런데 그 사실이 실려 오는
+    # 칸(`status`)을 읽지 않으면 호스트는 닫힌 세션에 계속 말을 보내고, 그 응답은 **오류가
+    # 아니다**: Core 는 늦게 도착한 입력을 멱등으로 다루어 새 이벤트를 만들지 않고
+    # (`events` 0건) **직전 턴의 상태와 단계를 그대로** 돌려준다(`ok: True`).
+    # 그래서 증상은 둘인데 둘 다 조용하다 — 응답의 `steps` 를 그대로 렌더하는 호스트는
+    # 마지막 안내를 **턴마다 다시** 재생하고(통화가 끝나지 않는다), 새 단계만 렌더하는 호스트는
+    # 고객이 무슨 말을 해도 **무음**이다. 어느 쪽도 예외가 나지 않고 통화는 끊기지도 않는다.
+
+    @property
+    def run_status(self) -> Optional[str]:
+        """Core 가 적은 이 세션의 실행 상태. 턴 응답이 아니면 None.
+        `running`·`completed`·`transferred`·`failed` 이며 **값을 지어내지 않는다**(§13-3) —
+        목록은 Core(`flow/runner.ts` 의 `RunStatus`)에 있고 여기서 다시 적지 않는다(§2).
+        """
+        if not self.ok or not isinstance(self.result, dict):
+            return None
+        value = self.result.get("status")
+        return value if isinstance(value, str) and value else None
+
+    @property
+    def session_closed(self) -> Optional[bool]:
+        """Core 세션이 **이미 닫혔는가**. 셋 중 하나다 — True·False·None(모름).
+
+        `None` 은 상태 칸이 없는 응답(유지 루프·헬스·hello·오류)이고 **닫혔다로도 열렸다로도
+        읽지 않는다**(§13-3). `True` 면 그 세션에 보낼 턴은 더 없다 — 이관(§9.3)이 함께
+        실렸으면 상담사로 넘길 차례이고, 아니면 Core 의 시나리오가 끝난 것이다. 어느 쪽이든
+        **호스트가 정할 일**이며(통화를 끊을지·안내를 더 할지) 이 클라이언트는 사실만 적는다.
+        """
+        status = self.run_status
+        return None if status is None else status != "running"
 
     # ── §10.1 고지·동의 · §7 5.2 준수 점검 ────────────────────────────────
     # 세 칸은 **어떤 노출 스위치와도 무관하게** 와이어로 나온다(브리지가 그렇게 적어 두었다):

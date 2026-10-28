@@ -50,9 +50,12 @@ errors = []
 def factory():
     return BridgeClient(core_module=CORE, adapter="callbot", core_root=ROOT, cwd=ROOT,
                         max_line_bytes=65536, keep_transcript=True)
-def hooks(**kw):
-    return CallbotCoreHooks(factory, flow_id="f_reference_voice", entry_point="inbound_call",
+def hooks(flow_id="f_reference_voice", **kw):
+    return CallbotCoreHooks(factory, flow_id=flow_id, entry_point="inbound_call",
                             on_error=lambda c, m: errors.append(c), **kw)
+# 참조 흐름은 첫 발화가 곧 이관이라 그 턴에서 Core 세션이 끝난다 — 다중 턴 경로를 검사하려면
+# 수집 노드가 이어지는 흐름이 필요하다(fixtures/reference-core.mjs 의 두 번째 흐름 주석).
+MULTI = "f_reference_voice_multi"
 def dump(h, **extra):
     c = h._client
     t = {"requests": c.transcript.requests, "responses": c.transcript.responses} if c else None
@@ -69,7 +72,7 @@ function parse(run) {
 
 test('겹친 통화 두 건이 call_id 로 격리되고 고객 발화만 Core 로 간다', b, () => {
   const out = parse(runDriver(`${PRELUDE}
-h = hooks()
+h = hooks(MULTI)
 a = h.on_call_start("call-A"); bb = h.on_call_start("call-B")
 assert a and bb and a != bb, (a, bb)
 h.on_transcript("call-A", "assistant", "이음 고객센터입니다")   # 봇 발화 → 보내지 않는다
@@ -153,7 +156,7 @@ h.close()
 
 test('브리지가 통화 중 죽어도 훅은 던지지 않고 degraded 로 드러낸다(§9.3)', b, () => {
   const out = parse(runDriver(`${PRELUDE}
-h = hooks()
+h = hooks(MULTI)
 h.on_call_start("c1")
 h.on_transcript("c1", "user", "첫 턴")
 h._client._proc.kill(); h._client._proc.wait()
@@ -190,7 +193,7 @@ json.dump({"transcript": {"requests": c.transcript.requests, "responses": c.tran
 test('비동기 래퍼는 같은 통화의 훅을 순서대로 처리하고 이벤트 루프를 막지 않는다', b, () => {
   const out = parse(runDriver(`${PRELUDE}
 async def main():
-    h = AsyncCallbotCoreHooks(hooks())
+    h = AsyncCallbotCoreHooks(hooks(MULTI))
     assert h.enabled
     # 순서를 기다리지 않고 한꺼번에 던진다 — 같은 통화는 도착 순서대로 처리돼야 한다.
     await asyncio.gather(
@@ -353,7 +356,7 @@ def rl_factory():
 
 test('한도 초과는 degraded 가 아니며 그 통화의 턴만 대기시킨다 — end 는 미루지 않는다', b, () => {
   const out = parse(runDriver(`${RL_PRELUDE}
-h = CallbotCoreHooks(rl_factory, flow_id="f_reference_voice", entry_point="inbound_call",
+h = CallbotCoreHooks(rl_factory, flow_id=MULTI, entry_point="inbound_call",
                      on_error=lambda c, m: errors.append(c))
 h.on_call_start("c1")
 h.on_transcript("c1", "user", "하나")        # send 버킷 burst 2
@@ -514,7 +517,7 @@ h.close()
 
 test('§11.2 턴 단위 실측은 받은 그대로 나가고, 선언 없이 보낸 턴을 센다', b, () => {
   const out = parse(runDriver(`${PRELUDE}
-h = hooks()
+h = hooks(MULTI)
 h.on_call_start("call-A")
 h.on_transcript("call-A", "user", "잔액 조회요", confidence=0.91,
                 latency={"stt_ms": 310, "total_ms": 820},
@@ -545,7 +548,7 @@ h.close()
 test('비동기 래퍼도 같은 실측을 넘긴다 — 동기 쪽만 열면 권장 경로에서만 사라진다', b, () => {
   const out = parse(runDriver(`${PRELUDE}
 async def main():
-    h = AsyncCallbotCoreHooks(hooks())
+    h = AsyncCallbotCoreHooks(hooks(MULTI))
     await h.on_call_start("call-A")
     await h.on_transcript("call-A", "user", "잔액", usage={"stt_audio_ms": 900})
     await h.on_dtmf("call-A", "2", usage={"tts_audio_ms": 300}, latency={"total_ms": 55})
@@ -666,25 +669,32 @@ asyncio.run(main())
 // 선언된 턴으로 세기 때문이다. Core 는 그 판정을 응답에 돌려주므로 그대로 읽어 나눠 센다.
 
 test('§11.2 선언했는데 실리지 않은 실측·통화 구간을 선언 누락과 나눠 센다', b, () => {
-  // 참조 시나리오는 첫 발화에 상담사로 이관되며 그 턴에서 Core 세션이 끝난다 — 그 뒤에 온
-  // 턴·종료는 실제 운영의 "늦게 도착한 입력"과 같은 경로이고(전송 재시도 루프가 거기 몰린다),
-  // 훅 어댑터는 자기 쪽 `call.ended` 가 아직 False 라 그대로 보낸다.
+  // 실을 자리가 없는 턴의 **실제 운영 경로**는 §9.3 장애 폴백이다: 인지 계층이 죽으면 그 턴은
+  // 고객 발화 이벤트를 만들기 전에 상담사로 내려가고(`applyOutage`), 그런데 회선은 이미 STT 를
+  // 돌렸으므로 그 수량은 공급사 청구서에만 남는다. 그 폴백이 세션을 끝내므로 뒤따르는 종료의
+  // 통화 구간도 실리지 않는다 — 추가 전용 이벤트는 뒤늦게 고치지 않는다(§8.1).
   const out = parse(runDriver(`${PRELUDE}
-h = hooks()
+from datetime import datetime, timezone
+now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+h = hooks(MULTI)
 h.on_call_start("call-A")
-first = h.on_transcript("call-A", "user", "상담사 연결해 주세요", usage={"stt_audio_ms": 2400})
-late = h.on_transcript("call-A", "user", "여보세요", usage={"stt_audio_ms": 300})
+first = h.on_transcript("call-A", "user", "요금 문의입니다", usage={"stt_audio_ms": 2400})
+# 인지 계층(STT) 장애를 회선이 올린다 — 이 샘플이 없으면 Core 는 엔진 상태를 모른다(§6.2).
+h.report_health([{"component": "stt", "state": "down"}], now_iso)
+outage = h.on_transcript("call-A", "user", "그럼 상담사", usage={"stt_audio_ms": 300})
 ended = h.on_call_end("call-A", billable_ms=48000)
 dump(h,
      first_attached=first.usage_attached if first else None,
-     late_attached=late.usage_attached if late else None,
-     late_reasons=late.billing_reasons_ko if late else None,
+     outage_attached=outage.usage_attached if outage else None,
+     outage_mode=(outage.fallback or {}).get("mode") if outage else None,
+     outage_reasons=outage.billing_reasons_ko if outage else None,
      end_recorded=ended.billable_ms_recorded if ended else None)
 h.close()
 `));
   assert.equal(out.first_attached, true, '실린 턴을 실리지 않았다고 읽으면 누락 건수가 부풀어 멀쩡한 집계를 의심하게 된다');
-  assert.equal(out.late_attached, false);
-  assert.ok(out.late_reasons.length > 0, 'Core 가 쓴 사유가 호스트에 닿지 않았다');
+  assert.equal(out.outage_mode, 'agent_only', '§9.3 판정이 호스트에 닿지 않으면 회선을 내릴 근거가 없다');
+  assert.equal(out.outage_attached, false);
+  assert.ok(out.outage_reasons.length > 0, 'Core 가 쓴 사유가 호스트에 닿지 않았다');
   assert.equal(out.end_recorded, false, '이미 끝난 세션에 구간이 실렸다고 읽었다');
   // 선언은 전부 했으므로 종전 카운터는 0 이다 — 그것만 보면 "근거 있는 턴 2건"으로 읽힌다.
   assert.equal(out.stats.turns_missing_usage, 0);
@@ -694,6 +704,9 @@ h.close()
   assert.equal(out.stats.ends_billable_ms_unrecorded, 1, '버려진 통화 구간을 세지 않았다');
   assert.equal(out.stats.turns_usage_dropped, 0);
   assert.equal(out.stats.turns_sent, 2);
+  // 폴백이 세션을 끝냈다는 사실도 함께 선다 — 그 뒤 턴을 보내면 직전 단계를 되풀이한다.
+  assert.equal(out.stats.calls_closed_by_core, 1);
+  assert.equal(out.stats.turns_after_core_close, 0);
 });
 
 test('§11.2 집계에서 빠진 항목·판정 없음을 누락으로 세지 않는다(실패·경계 경로)', b, () => {
@@ -1170,7 +1183,7 @@ h.close()
 
 test('recover() 가 래치를 풀고 다음 통화는 새 브리지에서 돈다 — 멀쩡한 브리지는 건드리지 않는다', b, () => {
   const out = parse(runDriver(`${PRELUDE}
-h = hooks()
+h = hooks(MULTI)
 # 멀쩡한 상태에서는 풀 것이 없다. 여기서 내리면 진행 중인 세션이 통째로 사라진다.
 healthy = h.recover()
 h.on_call_start("c1")
@@ -1368,5 +1381,155 @@ h.close()
   assert.equal(out.stats.compliance_reviewed_calls, 0);
   assert.equal(out.stats.compliance_unreviewed_calls, 0, '요약 없음을 "점검 못 했다"로 셌다 — 둘은 다른 상태다');
   assert.equal(out.stats.ends_without_compliance, 1, '§7 미배선의 유일한 와이어 신호를 세지 않았다');
+  assert.deepEqual(out.errors, []);
+});
+
+// ── §5.2 화면 전환 지시(2026-10-28) ──────────────────────────────────────────
+// 전환은 §5.1 사다리가 고르고 **링크 발송은 호스트가** 한다. Node 호스트는 `port.invite` 로
+// 그 지시를 받지만 비-Node 호스트에 닿는 자리는 턴 응답 하나뿐이고, 읽을 자리가 없던 동안
+// 전환은 **조용히 반쪽만** 일어났다: 이후 단계는 화면용으로 렌더되는데(통화 중인 고객이
+// 그것을 듣는다) 링크는 아무도 보내지 않고, 사다리는 이미 전환을 골랐으므로 상담사로도
+// 내려가지 않는다. 어디에서도 예외가 나지 않는다.
+
+const SWITCH_PRELUDE = `${PRELUDE}
+SW = os.path.join(ROOT, "fixtures", "reference-core-switch.mjs")
+def sw_factory(ticket):
+    return lambda: BridgeClient(core_module=SW, adapter="callbot", core_root=ROOT, cwd=ROOT,
+                                max_line_bytes=65536, keep_transcript=True,
+                                include_switch_ticket=ticket)
+switches = []
+def sw_hooks(ticket, **kw):
+    return CallbotCoreHooks(sw_factory(ticket), flow_id="f_reference_voice",
+                            entry_point="inbound_call", on_error=lambda c, m: errors.append(c),
+                            on_switch=lambda cid, p: switches.append([cid, dict(p)]), **kw)
+`;
+
+test('§5.2 전환 초대가 훅으로 도착한다 — 토큰 노출을 켠 호스트는 링크를 만들 수 있다', b, () => {
+  const out = parse(runDriver(`${SWITCH_PRELUDE}
+h = sw_hooks(True)
+h.on_call_start("c1")
+h.on_timeout("c1")      # 1회 실패 → 재프롬프트
+h.on_timeout("c1")      # 2회 실패 → 화면 전환(§5.1)
+h.on_timeout("c1")      # 3회 실패 → 상담사 이관. 전환은 다시 실리지 않는다
+dump(h, switches=switches)
+h.close()
+`));
+  assert.equal(out.switches.length, 1, '전환을 턴마다 알리면 호스트가 링크를 여러 번 보낸다');
+  const [callId, p] = out.switches[0];
+  assert.equal(callId, 'c1');
+  assert.equal(p.from_channel, 'voice');
+  assert.equal(p.to_channel, 'visual');
+  assert.equal(p.ticket_issued, true);
+  assert.equal(p.token_included, true);
+  assert.equal(p.token, 'tk_reference_1', '토큰이 오지 않으면 호스트는 id 로 링크를 만들 수밖에 없다(§10.3)');
+  assert.ok(typeof p.expires_at === 'string' && p.expires_at.length > 0, '만료를 모르면 안내할 수 없다');
+  assert.equal(p.tokenless, false);
+  assert.equal(p.not_issued_ko, null);
+  assert.equal(out.stats.switch_invites_seen, 1);
+  assert.equal(out.stats.switch_tokens_received, 1);
+  assert.equal(out.stats.switch_tokens_withheld, 0);
+  assert.equal(out.stats.switch_tokenless, 0);
+  assert.equal(out.stats.switch_tickets_unissued, 0);
+  assert.deepEqual(out.errors, []);
+});
+
+test('토큰 노출이 꺼져 있으면 사실만 오고 토큰은 어떤 경로로도 오지 않는다(§10.3)', b, () => {
+  // 끈 쪽이 기본이다. 그 상태에서도 **전환 사실은 와야 한다** — 감추면 호스트는 "링크를 보낼
+  // 차례"도 "보낼 수 없는 상태"도 알 수 없다. 건수를 나눠 두는 이유가 여기다: 이 수는
+  // "스위치를 켜라"이고 아래 검사의 수는 "Core 쪽 배선이 없다"다(고칠 곳이 다른 저장소다).
+  const out = parse(runDriver(`${SWITCH_PRELUDE}
+h = sw_hooks(False)
+h.on_call_start("c1")
+h.on_timeout("c1")
+h.on_timeout("c1")
+dump(h, switches=switches)
+h.close()
+`));
+  assert.equal(out.switches.length, 1);
+  const p = out.switches[0][1];
+  assert.equal(p.ticket_issued, true, '발급은 됐다 — 그 사실을 감추면 전환 품질을 집계할 수 없다');
+  assert.equal(p.token_included, false);
+  assert.equal(p.token, null);
+  assert.equal(p.to_channel, 'visual');
+  assert.equal(out.stats.switch_tokens_withheld, 1);
+  assert.equal(out.stats.switch_tokens_received, 0);
+  assert.equal(out.stats.switch_tokenless, 0, '노출 스위치 문제를 Core 미배선으로 적으면 고칠 곳이 바뀐다');
+  assert.equal(JSON.stringify(out).includes('tk_reference'), false, '1회용 열쇠가 응답·전사에 실렸다');
+});
+
+test('전환 배선이 없는 Core 에서는 "토큰 없는 초대"로 온다 — 토큰을 지어내지 않는다(실패 경로)', b, () => {
+  // `reference-core.mjs` 에는 전환 배선이 없다. 그 상태의 링크는 **id 가 곧 열쇠**이며,
+  // 그것을 "토큰을 못 받았다"와 같게 적으면 호스트 스위치를 뒤지다 Core 설정을 놓친다.
+  const out = parse(runDriver(`${PRELUDE}
+switches = []
+h = hooks(on_switch=lambda cid, p: switches.append([cid, dict(p)]))
+h.on_call_start("c1")
+h.on_timeout("c1")
+h.on_timeout("c1")
+dump(h, switches=switches)
+h.close()
+`));
+  assert.equal(out.switches.length, 1);
+  const p = out.switches[0][1];
+  assert.equal(p.tokenless, true);
+  assert.equal(p.ticket_issued, false);
+  assert.equal(p.token, null, '없는 토큰을 만들어 넣었다(§13-3)');
+  assert.equal(p.expires_at, null, '만료 없는 링크를 "만료 있음"으로 적었다');
+  assert.equal(out.stats.switch_tokenless, 1);
+  assert.equal(out.stats.switch_invites_seen, 1);
+  assert.equal(out.stats.switch_tokens_withheld, 0);
+  assert.deepEqual(out.errors, [], '종전 상태는 등록 시점 경고(W_CHANNEL_SWITCH_UNBOUND)가 이미 적는다');
+});
+
+// ── Core 가 먼저 닫은 세션(2026-10-28) ───────────────────────────────────────
+// 세션을 끝내는 주체가 호스트만이 아니다 — End 노드 도달·재시도 소진 이관·Api 순회 상한·
+// 장애 폴백은 Core 가 그 턴에서 닫는다. 닫힌 세션에 온 입력은 **오류가 아니라 멱등 처리**라
+// `ok: True`·events 0건이고 직전 턴의 단계가 그대로 실려 온다 — 그래서 읽지 않으면 증상이
+// 둘로 갈리고 둘 다 조용하다(안내 반복 · 무음).
+
+test('Core 가 닫은 세션에는 더 보내지 않고 통화당 한 번 알린다(§5.3·§8.1)', b, () => {
+  const out = parse(runDriver(`${PRELUDE}
+closed = []
+h = hooks(on_session_closed=lambda cid, st: closed.append([cid, st]))
+h.on_call_start("c1")
+h.on_transcript("c1", "user", "잔액 조회요")   # 수집 완료 → Transfer → Core 가 세션을 닫는다
+assert h.on_dtmf("c1", "1") is None            # 보내지 않는다
+assert h.on_transcript("c1", "user", "여보세요") is None
+r = h.on_call_end("c1", billable_ms=12000.0)   # 종료는 그대로 보낸다
+assert r is not None and r.ok
+dump(h, closed=closed)
+h.close()
+`));
+  const report = verifyBridgeTranscript(out.transcript, { adapter: 'callbot', maxLineBytes: 65536 });
+  assert.equal(report.verdict, 'passed', JSON.stringify(report.issues));
+  assert.equal(report.opCounts.send, 1, '닫힌 세션에 보낸 턴은 직전 단계를 되풀이해 돌려받는다');
+  assert.equal(report.opCounts.end, 1, '종료는 미루지 않는다 — 닫혔어도 과금 근거 판정을 받아야 한다');
+  assert.deepEqual(out.closed, [['c1', 'transferred']], 'Core 가 적은 상태를 그대로 넘긴다');
+  assert.equal(out.stats.calls_closed_by_core, 1);
+  assert.equal(out.stats.turns_after_core_close, 2);
+  assert.equal(out.stats.turns_sent, 1);
+  assert.equal(out.stats.late_after_end, 0, '호스트가 닫은 것이 아니다 — 합쳐 세면 고칠 곳이 바뀐다');
+  assert.equal(out.stats.calls_ended, 1);
+  assert.deepEqual(out.errors, []);
+});
+
+test('열려 있는 세션을 닫혔다고 적지 않는다 — 모름도 닫힘이 아니다(§13-3)', b, () => {
+  const out = parse(runDriver(`${PRELUDE}
+closed = []
+h = hooks(MULTI, on_session_closed=lambda cid, st: closed.append([cid, st]))
+h.on_call_start("c1")
+h.on_timeout("c1")                              # 무입력 1회 — 재프롬프트이고 세션은 열려 있다
+r = h.on_dtmf("c1", "1")                        # 수집 노드가 이어져 있어 아직 끝나지 않는다
+assert r is not None and r.ok
+# 유지 루프·헬스 응답에는 상태 칸이 없다 — 그것을 닫힘으로 읽으면 통화가 Core 를 잃는다.
+hr = h.report_health([{"component": "telephony", "state": "up"}], "2026-10-28T00:00:00.000Z")
+assert hr is not None and hr.session_closed is None
+dump(h, closed=closed)
+h.close()
+`));
+  assert.deepEqual(out.closed, []);
+  assert.equal(out.stats.calls_closed_by_core, 0);
+  assert.equal(out.stats.turns_after_core_close, 0, '열린 세션의 턴을 보내지 않으면 통화가 멈춘다');
+  assert.equal(out.stats.turns_sent, 2);
   assert.deepEqual(out.errors, []);
 });

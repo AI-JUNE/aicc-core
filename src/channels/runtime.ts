@@ -2807,7 +2807,28 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       await reg.port.transfer(rec.interactionId, rec.state.handoff.queue, summaryMasked);
       return;
     }
-    if (result.handoff) result.handoff.placement = placement;
+    if (result.handoff) {
+      result.handoff.placement = placement;
+      /**
+       * **보관 복사본에도 남겨야 한다.** 이 대입은 턴 결과를 저장한 **뒤**에 일어난다
+       * (배정은 이벤트 발행·단계 렌더 다음이다) — 인메모리 저장소에서는 `lastResult.handoff` 가
+       * 같은 객체라 대입만으로 남지만, **영속 구현에서는 `put` 시점의 직렬화가 전부다**
+       * (아래 요약이 같은 이유로 다시 저장하는 자리다, §6.2).
+       *
+       * 남지 않으면 끝난 세션에 **늦게 도착한 입력**은 `placement` 없는 이관을 돌려받는다
+       * (`withoutTurnFacts` 는 이관을 서 있는 사실로 남긴다) — 그리고 하필 전송 계층의 재시도
+       * 루프가 그 경로로 몰린다. 호스트는 판정 없음을 "라우팅 미배선(모름)"으로 읽어야 하므로
+       * (§13-3 — 모름을 못 들어갔다로 적지 않는다) 증상은 예외가 아니라 **대안으로 간 고객에게
+       * 상담사 연결을 안내하는 것**이다: 큐 id 를 들고 있지 않은 건은 `queue` 도 비어 있어
+       * "큐를 선언하지 않은 이관"과 같은 모양이 된다(`BridgePlacementPayload` 주석의 그 오답).
+       *
+       * **큐에 들어간 건만 우연히 남아 있었다** — 아래 요약 저장이 뒤따르기 때문이다(그 put 은
+       * 소진 수렴을 위한 것이고 이 사실을 보장하려고 둔 것이 아니다). 그래서 종전에 복사본을
+       * 잃는 쪽은 정확히 **대안·목적지 불가**, 즉 잘못 안내하면 고객이 아무도 없는 곳에서
+       * 기다리게 되는 쪽이었다. 여기서 한 번 저장하면 세 판정이 같은 규칙을 받는다.
+       */
+      sessions.put(rec);
+    }
     if (placement.placement !== 'queued') return;
     await reg.port.transfer(rec.interactionId, placement.queueId, summaryMasked);
     // **전달 다음이다.** 먼저 열면 `transfer` 가 실패한 통화에 상담사가 배정되고, 그 상담사는
