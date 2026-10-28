@@ -276,3 +276,39 @@ test('빈 사용량 객체도 선언이다 — 실을 수 없다는 사실을 �
   const r = await core.send('i_fb1', { input: { kind: 'utterance', text: '여보세요' }, usage: {} });
   assert.equal(r.billing.usageAttached, false);
 });
+
+test('턴 사실·서 있는 사실 분할이 계약의 칸을 빠짐없이 덮는다 — 다음에 칸이 늘면 빌드가 깨진다(§2)', b, async () => {
+  // 위 검사들이 고정하는 것은 **지금 있는 네 칸**이다. 걷어낼 칸을 손으로 적는 한, 계약에 칸이
+  // 하나 늘어나는 날 그 칸은 '서 있는 사실'로 분류된 채 늦은 입력마다 다시 보고된다 —
+  // 기본값이 '남긴다'인 쪽이라 더 조용하고, 실제로 그 모양으로 네 번 새고 있었다. 그래서 분할을
+  // 컴파일 검사로 묶었고(`Exclude<keyof ChannelTurnResult, …>`), 여기서는 그 분할이 와이어
+  // 투영 목록(`PROJECTED_RESULT_KEYS` — 그쪽도 계약의 칸을 전부 덮도록 묶여 있다)과 **같은
+  // 집합**인지 본다. 둘이 어긋나면 어느 한쪽이 모르는 칸이 있다는 뜻이다.
+  const BR = await import('../src/channels/bridge.ts');
+  const split = [...R.TURN_FACT_KEYS, ...R.STANDING_RESULT_KEYS].sort();
+  assert.deepEqual(split, [...BR.PROJECTED_RESULT_KEYS].sort());
+  // 두 목록이 겹치면 걷히는지가 목록 순서로 정해진다 — 겹치지 않는다.
+  const overlap = R.TURN_FACT_KEYS.filter((k) => R.STANDING_RESULT_KEYS.includes(k));
+  assert.deepEqual(overlap, []);
+});
+
+test('목록에 적힌 턴 사실은 **하나도 빠짐없이** 걷힌다 — 손으로 적던 자리와 같은 결과다', b, async () => {
+  const { core, last } = await endedSession();
+  const rec = core.sessions.get('i_fb1');
+  // 네 칸을 모두 세워 둔다(형태는 계약 그대로, 값은 판정이 아니라 자리 표시다).
+  rec.lastResult = {
+    ...last,
+    disclosure: { channel: 'voice', placement: 'first_turn', configVersion: 3 },
+    switchInvite: { fromChannel: 'voice', toChannel: 'visual', ticketIssued: true },
+    connector: { resultApplied: true },
+  };
+  core.sessions.put(rec);
+  const late = await core.send('i_fb1', { input: { kind: 'utterance', text: '여보세요' } });
+  for (const key of R.TURN_FACT_KEYS) {
+    assert.equal(late[key], undefined, `${key} 가 늦은 입력의 답으로 되풀이됐다`);
+  }
+  // 서 있는 사실은 그대로 남는다 — 지우면 채널이 마지막 안내를 렌더할 수 없다.
+  assert.equal(late.status, last.status);
+  assert.deepEqual(late.state, last.state);
+  assert.deepEqual(late.steps, last.steps);
+});

@@ -416,6 +416,40 @@ function withoutSwitchToken(result: ChannelTurnResult): ChannelTurnResult {
 }
 
 /**
+ * 늦은 입력에 되풀이하면 **거짓이 되는** 칸 — "이번 호출에 일어난 사실"이다(아래 함수 주석).
+ * 이 목록에 적힌 칸은 보관 복사본에서 걷힌다.
+ */
+export const TURN_FACT_KEYS = ['billing', 'disclosure', 'switchInvite', 'connector'] as const;
+
+/**
+ * 되풀이해도 거짓이 아닌 칸 — 세션에 **서 있는** 사실이다.
+ * `consent` 는 둘이 섞여 있어(확정 사실 + 서 있는 미획득 목록) 아래 함수가 한 겹 더 쪼갠다.
+ */
+export const STANDING_RESULT_KEYS = [
+  'interactionId', 'state', 'steps', 'status', 'events', 'fallback', 'handoff', 'consent', 'compliance',
+] as const;
+
+/**
+ * 빠뜨린 칸이 있으면 이 대입이 **컴파일 오류**가 된다(`PROJECTED_RESULT_KEYS` 와 같은 규칙).
+ *
+ * 왜 묶는가: 두 목록이 없던 동안 아래 함수는 걷어낼 칸을 **손으로 하나씩 적었다** — 즉 계약에
+ * 칸이 늘어나는 날 이 자리만 모르면 그 칸은 **서 있는 사실로 분류된 채** 늦은 입력마다 다시
+ * 보고된다. 기본값이 '남긴다'인 쪽이라 더 조용하다. 실제로 그 모양으로 네 칸이 차례로 새고
+ * 있었고(§5.2 전환 초대·§10.1 고지·확정 동의·§11.2 과금 근거) 하필 그 경로에 전송 계층의
+ * 재시도 루프가 몰린다 — 한 번 일어난 사실이 임의의 횟수만큼 되풀이된다. 같은 결함이 다섯
+ * 번째가 되지 않게 **사람의 기억이 아니라 빌드가 깨지게** 한다(`WIRE_INPUT_KINDS` 와 같은 자리).
+ */
+const _turnFactKeysCover: Exclude<
+  keyof ChannelTurnResult, typeof TURN_FACT_KEYS[number] | typeof STANDING_RESULT_KEYS[number]
+> extends never ? true : never = true;
+void _turnFactKeysCover;
+/** 한 칸을 양쪽에 적으면 걷히는지가 **목록 순서**로 정해진다 — 그 모호함을 컴파일에서 끊는다. */
+const _turnFactKeysDisjoint: Extract<
+  typeof TURN_FACT_KEYS[number], typeof STANDING_RESULT_KEYS[number]
+> extends never ? true : never = true;
+void _turnFactKeysDisjoint;
+
+/**
  * 끝난 세션에 **늦게 도착한 입력**에 되돌려줄 복사본에서, 직전 턴의 "이번 턴 사실"을 걷어낸다.
  *
  * 그 경로들(`send` 의 조기 반환·이미 닫힌 `end`)은 `lastResult` 를 그대로 돌려준다 — 상태와
@@ -447,11 +481,13 @@ function withoutSwitchToken(result: ChannelTurnResult): ChannelTurnResult {
  * `compliance` 는 세션 전체의 점검 요약이므로 남긴다 — 이번 턴의 사실이 아니다.
  */
 function withoutTurnFacts(result: ChannelTurnResult): ChannelTurnResult {
-  const {
-    billing: _billing, disclosure: _disclosure, switchInvite: _invite,
-    connector: _connector, consent, ...standing
-  } = result;
+  // **목록에서** 걷어낸다 — 분해 대입으로 적으면 목록과 코드가 두 벌이 되고(§2), 한쪽만
+  // 늘어나는 날 그 칸은 조용히 남는다. 목록은 위에서 컴파일 검사로 묶여 있다.
+  const standing: ChannelTurnResult = { ...result };
+  for (const key of TURN_FACT_KEYS) delete standing[key];
+  const { consent } = result;
   if (consent === undefined) return standing;
+  delete standing.consent;
   // 확정 사실(`recorded`)과 그 사실을 적지 못한 사유만 뺀다 — 남는 것이 없으면 칸 자체를
   // 만들지 않는다(빈 객체는 "확인했는데 아무것도 없음"으로 읽힌다).
   const { recorded: _recorded, notRecordedKo: _notRecorded, ...standingConsent } = consent;
@@ -3272,6 +3308,32 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     const reg = registration(req.adapter);
     const channel = ADAPTER_CHANNEL[req.adapter];
 
+    /**
+     * **이 시나리오를 합류 매체가 렌더할 수 있는지는 아무도 묻지 않았다**(§5.3).
+     *
+     * `start` 는 같은 검사를 하고 거절한다 — 그 자리 주석이 이유를 적어 두었다("렌더 불가 노드를
+     * 가진 시나리오는 시작하지 않는다 — 통화 중간에 막히는 것이 더 나쁘다"). 그런데 **같은
+     * 시나리오가 다른 채널로 옮겨 가는 자리는 합류 하나뿐**이고(§5.2 는 Interaction 을 유지한
+     * 채 렌더러만 바꾼다), 거기에는 그 검사가 없었다: 시작에서 통과한 것은 **음성 능력** 기준
+     * 이므로 화면·채팅 능력으로는 한 번도 검사되지 않은 셈이다.
+     *
+     * 빠뜨린 쪽의 증상이 조용하다. 합류 턴은 현재 노드만 그리므로 대개 지나가고, 막히는 것은
+     * **그 뒤 어느 턴**이다 — 입력 수단이 없는 Choice 노드에 닿은 고객은 고를 것이 없는 화면을
+     * 보고(버튼도 DTMF 도 없다) 무엇을 말해도 §5.1 사다리만 돌다 끝난다. 예외는 나지 않는다.
+     *
+     * **토큰을 상환하기 전에** 본다(순서가 곧 안전장치다): 상환 뒤에 거절하면 1회용 초대가
+     * 타 버려 고객은 같은 링크를 다시 눌러도 들어올 수 없고, 고칠 것은 시나리오인데 남는
+     * 흔적은 "링크가 안 된다"뿐이다(§5.2·§10.3).
+     */
+    const unrenderable = checkFlowSupported(rec.flow, reg.port.capabilities).filter((i) => i.severity === 'error');
+    if (unrenderable.length > 0) {
+      throw new Error(
+        `합류 거부: ${req.adapter} 채널에서 렌더할 수 없는 시나리오입니다 — `
+        + `${unrenderable.map((i) => i.messageKo).join(' / ')} `
+        + '(통화 중간에 막히는 것이 더 나쁩니다, 설계서 §5.2·§5.3)',
+      );
+    }
+
     // 합류 자격 — 배선이 있으면 **토큰이 있어야만** 합류한다. 없으면 종전과 같다(§13-3),
     // 다만 그 상태는 등록 시점에 경고로 남는다(id 가 곧 열쇠다).
     const cs = opts.channelSwitch;
@@ -3299,6 +3361,23 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       }
     }
     rec.state.channel = channel;
+    /**
+     * **세션이 어느 매체에 사는지를 함께 옮긴다.** 종전에는 `state.channel` 만 바꾸고
+     * `rec.adapter` 를 그대로 두었다 — 그래서 합류 **다음** 호출부터 Core 가 고르는 포트가
+     * 합류 전 매체로 되돌아갔다(`send`·`end` 는 `registration(rec.adapter)` 로 포트를 고른다).
+     *
+     * 증상은 예외가 아니다. 한 세션의 연속된 두 턴이 **서로 다른 매체로** 나간다:
+     *  - 합류 턴은 화면 포트로 `present` 되고(그 자리는 합류 어댑터의 등록을 쓴다),
+     *  - 그 다음 턴부터는 **화면용으로 렌더된 단계가 음성 포트로** 나간다. 화면을 보고 있는
+     *    고객에게는 아무것도 도착하지 않고(§5.2 가 전환을 고른 이유가 인식 실패인데, 그
+     *    고객은 이제 어떤 말도 들려줄 수 없는 화면을 본다), 통화 쪽에서는 버튼 목록이
+     *    합성되어 나간다. 어느 쪽도 오류 응답이 아니다.
+     *  - 같은 이유로 §9.3 이관 지시(`port.transfer`)와 종료(`port.end`)도 고객이 떠난 매체로
+     *    간다 — 화면은 닫히지 않고, 상담사 연결은 통화 쪽에 접수된다.
+     * 어느 포트가 맞는지는 하나뿐이다: 단계는 `state.channel` 기준으로 렌더되므로, 그 단계를
+     * 받을 수 있는 포트는 **같은 채널을 선언한 포트**다(합류 턴이 이미 그렇게 골랐다).
+     */
+    rec.adapter = req.adapter;
     if (!rec.channels.includes(channel)) rec.channels.push(channel);
 
     // §9.3 판정은 **네 진입점에서 같아야 한다**. 아래 `stampOutage` 는 축소 지시(저하된 TTS 등)를
