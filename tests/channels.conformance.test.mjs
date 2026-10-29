@@ -501,3 +501,95 @@ test('OUTAGE_HINTS: 검사용 단계의 목록은 MEDIA_DISABLE 하나에서 온
   const probe = seen.find((s) => s.outage !== undefined);
   assert.deepEqual(probe.outage.disabled, [...F.MEDIA_DISABLE]);
 });
+
+// ── §9.3 기존 IVR 회귀 (LEGACY_IVR_ROUTE) ───────────────────────────────────
+// 이 스위트가 **한 번도 불러 본 적이 없던 유일한 포트 메서드**다. 종전에 본 것은 정적 선언
+// 뿐이라, 던지거나 매달리는 회귀 구현은 전 검사를 통과하고 **엔진이 죽은 순간에만** 깨졌다.
+
+/** 회귀 능력을 켠 음성 포트. 기본 프로파일은 routeToLegacyIvr=false 다(고객사 사정). */
+const ivrPort = () => m.createDryRunPort({
+  id: 'callbot',
+  capabilities: {
+    adapter: 'callbot', channel: 'voice', dtmf: true, richUi: false, speech: true,
+    transferToAgent: true, routeToLegacyIvr: true, crossChannelInvite: true,
+  },
+});
+
+test('LEGACY_IVR_ROUTE: 회귀를 선언·구현한 포트는 실제 호출까지 통과한다', b, async () => {
+  const port = ivrPort();
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  const c = r.checks.find((x) => x.id === 'LEGACY_IVR_ROUTE');
+  assert.equal(c.passed, true, c.messageKo);
+  assert.notEqual(c.skipped, true);
+  // **선언만 본 것이 아니라 불렀다** — 기록에 그 호출이 남아야 이 검사가 의미가 있다.
+  assert.ok(port.calls.some((x) => x.method === 'routeToLegacyIvr'), '회귀를 부르지 않았다');
+  assert.equal(r.passed, true);
+});
+
+test('LEGACY_IVR_ROUTE: 회귀를 선언하지 않은 채널은 "해당 없음" 이며 건너뜀이 아니다', b, async () => {
+  for (const id of ['callbot', 'chatbot', 'dars']) {
+    const port = m.createDryRunPort({ id });   // 기본 프로파일: routeToLegacyIvr=false
+    const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+    const c = r.checks.find((x) => x.id === 'LEGACY_IVR_ROUTE');
+    assert.equal(c.passed, true, `${id}: ${c.messageKo}`);
+    // 판정보류로 적으면 "검사를 못 돌렸다"와 "해당 사항이 없다"가 섞인다(§13-3).
+    assert.notEqual(c.skipped, true);
+    assert.match(c.messageKo, /해당 없음/);
+    assert.equal(port.calls.some((x) => x.method === 'routeToLegacyIvr'), false);
+  }
+});
+
+test('LEGACY_IVR_ROUTE: 회귀를 거부하는 구현을 잡는다 — 다른 검사는 전부 통과하는 포트다', b, async () => {
+  const port = ivrPort();
+  port.routeToLegacyIvr = async () => { throw new Error('IVR 게이트웨이 응답 없음'); };
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  assert.equal(r.checks.find((x) => x.id === 'REGISTRATION').passed, true);
+  assert.equal(r.checks.find((x) => x.id === 'ASYNC_CONTRACT').passed, true);
+  const c = r.checks.find((x) => x.id === 'LEGACY_IVR_ROUTE');
+  assert.equal(c.passed, false);
+  assert.equal(c.severity, 'error');
+  assert.match(c.messageKo, /엔진이 죽은 순간에만 돌고/);
+  assert.equal(r.passed, false);
+});
+
+test('LEGACY_IVR_ROUTE: 동기 예외·미정착·Promise 아님을 모두 잡는다(경계)', b, async () => {
+  const sync = ivrPort();
+  sync.routeToLegacyIvr = () => { throw new Error('동기 폭발'); };
+  const rSync = await m.runChannelConformance({ port: sync, timeoutMs: 500 });
+  assert.equal(rSync.checks.find((x) => x.id === 'LEGACY_IVR_ROUTE').passed, false);
+
+  const hang = ivrPort();
+  hang.routeToLegacyIvr = () => new Promise(() => {});   // 영원히 정착하지 않는다
+  const rHang = await m.runChannelConformance({ port: hang, timeoutMs: 30 });
+  const cHang = rHang.checks.find((x) => x.id === 'LEGACY_IVR_ROUTE');
+  assert.equal(cHang.passed, false);
+  assert.match(cHang.messageKo, /예산 초과/);
+
+  // Promise 를 돌려주지 않는 구현: Core 의 await 가 지시가 나가기 전에 통과한다.
+  const sloppy = ivrPort();
+  sloppy.routeToLegacyIvr = () => undefined;
+  const rSloppy = await m.runChannelConformance({ port: sloppy, timeoutMs: 500 });
+  const cSloppy = rSloppy.checks.find((x) => x.id === 'LEGACY_IVR_ROUTE');
+  assert.equal(cSloppy.passed, false);
+  assert.match(cSloppy.messageKo, /Promise 를 돌려주지 않습니다/);
+});
+
+test('LEGACY_IVR_ROUTE: 구현만 있고 선언이 없으면 경고다 — Core 는 그 경로를 쓰지 않는다', b, async () => {
+  const port = m.createDryRunPort({ id: 'callbot' });   // 선언은 false
+  port.routeToLegacyIvr = async () => {};
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  const c = r.checks.find((x) => x.id === 'LEGACY_IVR_ROUTE');
+  assert.equal(c.passed, false);
+  assert.equal(c.severity, 'warning');
+  assert.equal(r.passed, true, '경고가 통과를 막았다');
+});
+
+test('LEGACY_IVR_ROUTE: 선언만 하고 구현이 없는 상태도 오류로 적는다', b, async () => {
+  const port = ivrPort();
+  delete port.routeToLegacyIvr;
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  const c = r.checks.find((x) => x.id === 'LEGACY_IVR_ROUTE');
+  assert.equal(c.passed, false);
+  // 같은 사실을 REGISTRATION 도 적지만(등록 거부) 여기서는 **그 뒤에 무엇이 일어나는가**를 적는다.
+  assert.match(c.messageKo, /상담사 이관으로 대신하고/);
+});

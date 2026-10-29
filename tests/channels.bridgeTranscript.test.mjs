@@ -120,6 +120,53 @@ test('허용되지 않은 상담사용 요약이 실리면 실패한다 — hand
   assert.equal(allowed.verdict, 'passed');
 });
 
+test('허용되지 않은 §5.2 전환 토큰이 실리면 실패한다 — 그 토큰이 상담 화면의 열쇠다(§10.3)', () => {
+  // 브리지는 **세 값**을 노출 스위치 뒤에 둔다(슬롯 값·상담사용 요약·전환 토큰). 이 게이트는
+  // 그중 둘만 보고 있었고, 보지 않던 하나가 하필 진행 중인 상담의 열쇠였다 — 기록 파일은
+  // CI 산출물로 남으므로 토큰이 섞인 기록은 그 자체가 유출 경로다.
+  const pair = startPair('2', 'ix_1', {
+    switchInvite: {
+      fromChannel: 'voice', toChannel: 'visual', ticketIssued: true,
+      tokenIncluded: true, expiresAt: '2026-10-29T09:10:00.000Z', token: 'tk_secret',
+    },
+  });
+  const r = verifyBridgeTranscript(build([helloPair(), pair, endPair()]), EXPECT);
+  assert.ok(r.issues.some((i) => i.code === 'E_TICKET_LEAK'), '토큰 유출을 잡지 못했다');
+  assert.equal(r.verdict, 'failed');
+  // 유출을 지적하는 줄이 유출을 한 번 더 하지 않는다.
+  assert.equal(JSON.stringify(r.issues).includes('tk_secret'), false);
+  // 링크를 직접 보내는 호스트에게는 결함이 아니다 — 선언하면 통과한다.
+  const allowed = verifyBridgeTranscript(build([helloPair(), pair, endPair()]), { ...EXPECT, includeSwitchTicket: true });
+  assert.equal(allowed.verdict, 'passed');
+});
+
+test('전환 사실만 실린 기록은 통과한다 — 사실은 스위치와 무관하게 나간다(§5.2)', () => {
+  // `ticketIssued`·`tokenIncluded`·만료·사유에는 열쇠가 없다. 이것까지 유출로 적으면 끈
+  // 소비자는 **정상 응답만으로** 영구히 실패하고, 그러면 이 게이트를 아무도 켜지 않는다.
+  const pair = startPair('2', 'ix_1', {
+    switchInvite: {
+      fromChannel: 'voice', toChannel: 'visual', ticketIssued: true,
+      tokenIncluded: false, expiresAt: '2026-10-29T09:10:00.000Z',
+    },
+  });
+  assert.equal(verifyBridgeTranscript(build([helloPair(), pair, endPair()]), EXPECT).verdict, 'passed');
+});
+
+test('토큰 유출 판정은 플래그가 아니라 실린 값을 본다(경계)', () => {
+  // `tokenIncluded: false` 인데 토큰이 실려 있는 응답: 판정만 보면 열쇠가 그냥 지나간다.
+  const pair = startPair('2', 'ix_1', {
+    switchInvite: { fromChannel: 'voice', toChannel: 'visual', ticketIssued: true, tokenIncluded: false, token: 'tk_x' },
+  });
+  const r = verifyBridgeTranscript(build([helloPair(), pair, endPair()]), EXPECT);
+  assert.ok(r.issues.some((i) => i.code === 'E_TICKET_LEAK'));
+  // 빈 문자열도 실린 값이다 — 없는 칸(undefined)과 구분한다.
+  const empty = startPair('2', 'ix_1', {
+    switchInvite: { fromChannel: 'voice', toChannel: 'visual', ticketIssued: false, token: '' },
+  });
+  assert.ok(verifyBridgeTranscript(build([helloPair(), empty, endPair()]), EXPECT)
+    .issues.some((i) => i.code === 'E_TICKET_LEAK'));
+});
+
 test('허용되지 않은 슬롯 값이 실리면 실패한다', () => {
   const pair = startPair('2', 'ix_1', { state: { slotKeys: ['name'], slots: { name: '홍길동' } } });
   const r = verifyBridgeTranscript(build([helloPair(), pair, endPair()]), EXPECT);

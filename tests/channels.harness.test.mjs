@@ -243,7 +243,10 @@ test('JSON 출력: 판정·검사목록을 담고 임의 점수를 만들지 않
   assert.equal(j.adapter, 'callbot');
   assert.equal(j.channel, 'voice');
   assert.equal(j.timeoutMs, 500);
-  assert.equal(j.checks.length, 17);
+  // 적합성 항목 수. 항목이 늘면 이 숫자도 함께 올린다 — **줄어드는 쪽**을 잡으려고 둔 검사다
+  // (검사 하나가 조용히 빠지면 그 포트는 통과로 남는다). 2026-10-29: §9.3 기존 IVR 회귀를
+  // 실제로 불러 보는 LEGACY_IVR_ROUTE 가 추가돼 18 이 됐다.
+  assert.equal(j.checks.length, 18);
   assert.ok(!('score' in j) && !('grade' in j));
 });
 

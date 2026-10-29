@@ -47,6 +47,7 @@ export type TranscriptIssueCode =
   | 'E_SESSION_LEAK'       // 시작만 하고 끝내지 않은 세션이 있다
   | 'E_SUMMARY_LEAK'       // 허용하지 않은 상담사용 요약이 응답에 실렸다(§2·§10.3)
   | 'E_SLOT_LEAK'          // 허용하지 않은 슬롯 값이 응답에 실렸다(§10.3)
+  | 'E_TICKET_LEAK'        // 허용하지 않은 §5.2 전환 토큰이 응답에 실렸다(§5.2·§10.3)
   | 'W_ALL_ERRORS'         // 모든 응답이 오류다 — 클라이언트가 무엇도 성공시키지 못했다
   | 'W_NO_HEALTH';         // 헬스 보고가 한 번도 없다(§9.3 폴백 판단 근거가 안 쌓인다)
 
@@ -65,6 +66,14 @@ export interface TranscriptExpectations {
   includeHandoffSummary?: boolean;
   /** 슬롯 값 수신이 허용된 소비자인가. 기본 false. */
   includeSlots?: boolean;
+  /**
+   * §5.2 전환 **1회용 토큰** 수신이 허용된 소비자인가(브리지의 `includeSwitchTicket`). 기본 false.
+   *
+   * 켜는 경우는 하나다 — 전환 링크(SMS·알림톡·푸시)를 **이 호스트가 직접 만들어 보낸다**.
+   * 그 외에는 끈 상태가 맞고, 끈 상태에서 토큰이 응답에 보이면 그것은 브리지 설정이 잘못
+   * 열렸거나 이 기록이 열쇠째로 보관되고 있다는 뜻이다(기록 파일은 CI 산출물로 남는다).
+   */
+  includeSwitchTicket?: boolean;
   /** 한 줄 바이트 상한. 주지 않으면 상한 검사를 건너뛴다(§13-3, 기본값 금지). */
   maxLineBytes?: number;
   /** 헬스 보고 누락을 경고로 볼지. 주지 않으면 그 검사를 하지 않는다. */
@@ -128,6 +137,24 @@ function findSlots(result: unknown): boolean {
   if (!isPlainObject(result)) return false;
   const state = result.state;
   return isPlainObject(state) && state.slots !== undefined;
+}
+
+/**
+ * §5.2 전환 토큰이 응답에 실렸는지.
+ *
+ * 왜 이 검사가 따로 필요한가: 브리지는 **세 값**을 노출 스위치 뒤에 둔다 — 슬롯 값·상담사용
+ * 요약·전환 토큰(`includeSlots`·`includeHandoffSummary`·`includeSwitchTicket`). 이 게이트는
+ * 그중 **둘만** 보고 있었고, 보지 않던 하나가 하필 **진행 중인 상담의 열쇠**다: 그 토큰으로
+ * 합류하면 이미 수집된 슬롯이 그려진 화면이 열린다(`core/executeSwitch.ts` 가 막겠다고 적어
+ * 둔 사고). 기록 파일은 CI 산출물·첨부로 남으므로, 토큰이 섞인 기록은 그 자체가 유출 경로다.
+ *
+ * `tokenIncluded` 가 아니라 **`token` 필드의 존재**를 본다 — 앞의 것은 브리지가 적은 판정이고
+ * 뒤의 것이 실제로 실린 값이다(판정만 보면 플래그가 어긋난 날 열쇠가 그냥 지나간다).
+ */
+function findSwitchToken(result: unknown): boolean {
+  if (!isPlainObject(result)) return false;
+  const invite = result.switchInvite;
+  return isPlainObject(invite) && invite.token !== undefined;
 }
 
 /**
@@ -292,6 +319,17 @@ export function verifyBridgeTranscript(
           severity: 'error',
           index: i,
           messageKo: '슬롯 값이 응답에 실렸습니다. 이 소비자는 값 수신이 허용되지 않았습니다 — 키 목록만 받아야 합니다(§10.3).',
+        });
+      }
+      if (!expectations.includeSwitchTicket && findSwitchToken(res.result)) {
+        issues.push({
+          code: 'E_TICKET_LEAK',
+          severity: 'error',
+          index: i,
+          // 토큰 값은 **당연히 싣지 않는다** — 유출을 지적하는 줄이 유출을 한 번 더 하면 안 된다.
+          messageKo: '§5.2 전환 1회용 토큰이 응답에 실렸습니다. 이 소비자는 토큰 수신이 허용되지 않았습니다 — '
+            + '그 토큰으로 합류하면 이미 수집된 슬롯이 그려진 화면이 열립니다(§5.2·§10.3). '
+            + '링크를 이 호스트가 직접 만들어 보내는 구성이면 그 사실을 선언하세요(includeSwitchTicket).',
         });
       }
       const result = isPlainObject(res.result) ? res.result : undefined;

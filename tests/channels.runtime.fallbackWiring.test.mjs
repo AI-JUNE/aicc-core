@@ -159,6 +159,49 @@ test('실제로 대신한 턴: transfer 로 가고 판정은 legacy_ivr 그대�
   assert.ok(w.some((x) => /상담사 이관으로 대신했습니다/.test(x.messageKo)));
 });
 
+test('회귀 지시가 거절되면 상담사 이관으로 대신한다 — 고객을 아무 데도 보내지 않고 끝내지 않는다', b, async () => {
+  // 종전에는 이 예외가 호출자까지 그대로 올라갔고 그 뒤에 아무것도 남지 않았다: 세션은 이미
+  // `transferred` 로 적히고 §8.1 이벤트는 발행됐는데 **매체에는 어떤 지시도 도착하지 않는다**
+  // (회귀도 못 했고 transfer 는 그 분기에 없었다). 하필 이 경로는 인지 계층이 죽은 시각에만
+  // 돌고, 회귀가 거부되는 이유도 같은 시각에 몰려 있다 — 장애 위에 장애다.
+  const port = fakePort('callbot', {
+    async routeToLegacyIvr() { throw new Error('IVR 게이트웨이 응답 없음'); },
+  });
+  const { core } = build({ port, samples: [sample('llm', 'down')], policy: { legacyIvrAvailable: true, fallbackQueue: 'q_care' } });
+  const r = await core.start(reqOf());
+  assert.equal(r.status, 'transferred');
+  // 판정을 고쳐 적지 않는다 — 무엇을 할지는 `decideFallbackMode` 하나다(§2).
+  assert.equal(r.fallback.mode, 'legacy_ivr');
+  const transfer = port.log.find((l) => l[0] === 'transfer');
+  assert.ok(transfer, '회귀도 이관도 없이 끝났다 — 고객은 안내도 대안도 없이 남는다');
+  assert.equal(transfer[2], 'q_care');
+  // 사유까지 남긴다: 고칠 곳이 다르다(구현 없음=포트 구현, 거절=그 시각의 회선).
+  const w = core.warnings().filter((x) => x.code === 'W_FALLBACK_LEGACY_IVR');
+  assert.ok(w.some((x) => /거절돼 상담사 이관으로 대신했습니다/.test(x.messageKo)), '대신한 사실이 없다');
+  assert.ok(w.some((x) => /IVR 게이트웨이 응답 없음/.test(x.messageKo)), '사유가 없다');
+});
+
+test('거절 사유는 마스킹을 지난다 — 회선 오류 문구에 발신번호가 섞인다(§10.3)', b, async () => {
+  const port = fakePort('callbot', {
+    async routeToLegacyIvr() { throw new Error('회선 010-1234-5678 회귀 거부'); },
+  });
+  const { core } = build({ port, samples: [sample('llm', 'down')], policy: { legacyIvrAvailable: true } });
+  await core.start(reqOf());
+  const w = core.warnings().find((x) => x.code === 'W_FALLBACK_LEGACY_IVR' && /거절/.test(x.messageKo));
+  assert.ok(w);
+  assert.equal(/010-1234-5678/.test(w.messageKo), false, '경고 문구에 개인정보 원문이 남았다');
+});
+
+test('거절 뒤 이관까지 실패하면 그 예외는 올린다 — 더 시도할 경로가 없다(경계)', b, async () => {
+  const port = fakePort('callbot', {
+    async routeToLegacyIvr() { throw new Error('IVR 거부'); },
+    async transfer() { throw new Error('큐 접수 거부'); },
+  });
+  const { core } = build({ port, samples: [sample('llm', 'down')], policy: { legacyIvrAvailable: true } });
+  await assert.rejects(() => core.start(reqOf()), /큐 접수 거부/);
+  // 삼키면 호스트는 아무 지시도 닿지 않은 통화를 "폴백 처리됨"으로 읽는다(품질기준 §3).
+});
+
 test('회귀 구현이 있는 채널은 종전대로 IVR 로 내린다 — 대신했다는 기록을 만들지 않는다', b, async () => {
   const { core, port } = build({ samples: [sample('llm', 'down')], policy: { legacyIvrAvailable: true } });
   const r = await core.start(reqOf());

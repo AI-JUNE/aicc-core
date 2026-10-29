@@ -2524,11 +2524,39 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     rec.lastResult = result;
     sessions.put(rec);
 
+    /**
+     * **회귀 지시가 거절되면 상담사 이관으로 대신한다**(§9.3).
+     *
+     * 종전에는 `routeToLegacyIvr` 가 거부하면 그 예외가 그대로 호출자까지 올라갔고, 그 뒤에는
+     * 아무것도 남아 있지 않았다 — 세션은 이미 `transferred` 로 적히고 `handoff.requested`·
+     * `session.ended` 는 발행됐는데 **매체에는 어떤 지시도 도착하지 않는다**(회귀도 못 했고
+     * `transfer` 는 이 분기에 없다). 즉 고객은 안내도 대안도 없이 죽은 AI 와 남고, 원장에는
+     * "IVR 로 내렸다"가 남는다. 하필 이 경로는 **인지 계층이 죽은 시각에만** 돌므로, 회귀가
+     * 거부되는 이유(회선·IVR 게이트웨이 장애)도 같은 시각에 몰려 있다 — 장애 위에 장애다.
+     *
+     * 거절을 "접수했다"로 읽지 않는 근거는 계약이다: 포트 메서드의 반환은 "지시를 접수했다"
+     * 까지만 뜻하므로(`ChannelPort` 주석) 거부는 **접수되지 않았다**는 뜻이고, 그때 남은
+     * §9.3 경로는 상담사 이관 하나다. 구현이 **없을 때** 이미 같은 대체를 하고 있었으므로
+     * (바로 아래 분기) 여기서 규칙이 하나로 모인다 — 있는데 실패한 쪽만 예외였다.
+     *
+     * 판정은 고쳐 적지 않고(§2) **대신한 사실과 사유**를 남긴다. 사유는 호스트가 만든 문구라
+     * 마스킹을 지난다(§10.3 — 회선 오류 문구에 발신번호가 섞이는 현장이 있다).
+     */
+    let routedToIvr = false;
     if (decision.mode === 'legacy_ivr' && typeof reg.port.routeToLegacyIvr === 'function') {
-      await reg.port.routeToLegacyIvr(id, decision.reasonKo);
-    } else {
-      if (decision.mode === 'legacy_ivr') {
-        // **판정과 실제 행동이 갈라지는 유일한 자리다.** 정책은 "기존 IVR 로 내린다"인데 그 채널에
+      try {
+        await reg.port.routeToLegacyIvr(id, decision.reasonKo);
+        routedToIvr = true;
+      } catch (e) {
+        warnOnce('W_FALLBACK_LEGACY_IVR',
+          `§9.3 기존 IVR 회귀 지시가 ${reg.port.capabilities.adapter} 채널에서 거절돼 상담사 이관으로 `
+          + `대신했습니다: ${maskPii(e instanceof Error ? e.message : String(e)).text}`
+          + ' — 통화는 이어지지만 판정과 실제 행동이 다릅니다.');
+      }
+    }
+    if (!routedToIvr) {
+      if (decision.mode === 'legacy_ivr' && typeof reg.port.routeToLegacyIvr !== 'function') {
+        // **판정과 실제 행동이 갈라지는 자리다.** 정책은 "기존 IVR 로 내린다"인데 그 채널에
         // 회귀 구현이 없어 상담사 이관으로 대신한다. 판정을 고쳐 적지는 않는다(무엇을 할지는
         // `decideFallbackMode` 하나다, §2) — 대신 **대신했다는 사실**을 남긴다. 남기지 않으면
         // 결과·원장에 남는 것은 `fallback.mode: 'legacy_ivr'` 뿐이고 사후 분석은 "IVR 로 내렸다"로

@@ -43,6 +43,7 @@ export type ConformanceCheckId =
   | 'TURN_HINTS'          // 재시도·타이밍 힌트가 붙은 단계를 흡수하는가(§5.1)
   | 'CONNECTOR_WAIT'      // 한 턴에 present 가 두 번 와도(대기 안내 → 결과) 되는가(§6.1)
   | 'CHANNEL_INVITE'      // 전환 초대에 티켓이 실려도 흡수하는가 — 링크는 토큰으로 만든다(§5.2·§10.3)
+  | 'LEGACY_IVR_ROUTE'    // §9.3 기존 IVR 회귀를 **실제로** 수행하는가(선언만 보지 않는다)
   | 'AI_DISCLOSURE'       // 시나리오 노드가 아닌 AI 고지 단계를 그대로 내보내는가(§10.1·§7 7.4)
   | 'INTENT_CLARIFY'      // 시나리오에 없는 **선택지 단계**(명확화)를 렌더할 수 있는가(§5.1)
   | 'KNOWLEDGE_ANSWER'    // 각주(`citations`)가 붙은 지식 응대 답변 단계를 흡수하는가(§5.2)
@@ -434,6 +435,56 @@ export async function runChannelConformance(opts: ConformanceOptions): Promise<C
         : !unchanged
           ? '전환 티켓을 invite 가 변형했습니다. 같은 객체가 만료 안내·감사 기록에 쓰입니다(§5.2).'
           : `전환 초대에서 실패했습니다: ${'timeout' in failing ? '예산 초과' : errText((failing as { error: unknown }).error)}. 모르는 인자는 무시하세요 — 전환 배선을 켜는 순간 전 전환이 깨집니다(§5.2).`,
+    });
+  }
+
+  // 12-1) §9.3 기존 IVR 회귀 — **이 스위트에서 한 번도 불러 본 적이 없는 유일한 포트 메서드였다.**
+  //     종전에 본 것은 정적 선언뿐이다(`validateRegistration` 의 "선언했는데 구현이 없다").
+  //     그래서 동기 예외를 던지거나 정착하지 않는 회귀 구현은 **전 검사를 통과**하고, 깨지는
+  //     시점은 하필 **인지 계층이 죽어 Core 가 `legacy_ivr` 을 낸 순간**이다 — 장애 위에 장애이고,
+  //     그때 Core 가 할 수 있는 일은 상담사 이관으로 대신하는 것뿐이다(그 사실은 경고로 남지만
+  //     고객은 이미 기대한 IVR 이 아닌 곳에 있다). OUTAGE_HINTS 와 같은 이유로 **시점이 다른**
+  //     실패이므로 따로 둔다: 평시에는 이 경로가 아예 돌지 않는다.
+  //     **무엇을 하는지는 검사하지 않는다** — 회선을 어느 IVR 분기로 되돌릴지는 고객사 설정이고
+  //     포트 안의 일이다(§13-3). 여기서 보는 것은 "지시를 접수하는가" 하나다.
+  if (typeof port.routeToLegacyIvr !== 'function') {
+    // **건너뜀으로 적지 않는다**(CHANNEL_INVITE 와 같은 규칙): 기존 IVR 이 없는 고객사에서
+    // 구현이 없는 것은 정상이며, 판정보류로 적으면 "검사를 못 돌렸다"와 섞인다.
+    add({
+      id: 'LEGACY_IVR_ROUTE',
+      passed: !port.capabilities.routeToLegacyIvr,
+      severity: 'error',
+      messageKo: port.capabilities.routeToLegacyIvr
+        ? 'routeToLegacyIvr 능력을 선언했으나 구현이 없습니다 — §9.3 판정이 legacy_ivr 이면 Core 는 상담사 이관으로 대신하고, 사후 분석에는 "IVR 로 내렸다"만 남습니다.'
+        : '해당 없음 — 기존 IVR 회귀를 선언하지 않은 채널입니다(§9.3).',
+    });
+  } else if (!port.capabilities.routeToLegacyIvr) {
+    add({
+      id: 'LEGACY_IVR_ROUTE',
+      passed: false,
+      severity: 'warning',
+      messageKo: 'routeToLegacyIvr 를 구현했지만 능력을 선언하지 않았습니다 — Core 는 이 경로를 쓰지 않고 상담사 이관으로 대신합니다(§9.3).',
+    });
+  } else {
+    const route = port.routeToLegacyIvr as NonNullable<ChannelPort['routeToLegacyIvr']>;
+    let returned: unknown;
+    const r = await withBudget(() => {
+      returned = route('i_probe_ivr', '엔진 장애로 기존 IVR 로 돌립니다(§9.3).');
+      return returned as Promise<void>;
+    }, budget);
+    // Promise 를 돌려주지 않는 구현은 Core 의 `await` 가 **지시가 나가기 전에** 통과한다 —
+    // 그 뒤 매체에서 실패해도 Core 는 회귀했다고 적는다(ASYNC_CONTRACT 와 같은 이유).
+    const thenable = isThenable(returned);
+    add({
+      id: 'LEGACY_IVR_ROUTE',
+      passed: r.ok === true && thenable,
+      severity: 'error',
+      messageKo: r.ok === true && thenable
+        ? '기존 IVR 회귀 지시를 접수합니다(§9.3). 이 경로는 인지 계층이 죽은 시각에만 돌므로, 여기서 거부하면 Core 는 상담사 이관으로 대신합니다.'
+        : !thenable
+          ? 'routeToLegacyIvr 가 Promise 를 돌려주지 않습니다 — Core 의 await 가 지시가 나가기 전에 통과하고, 그 뒤의 실패는 아무 데도 남지 않습니다(§9.3).'
+          : `기존 IVR 회귀에서 실패했습니다: ${'timeout' in r ? '예산 초과' : errText((r as { error: unknown }).error)}. `
+            + '이 경로는 엔진이 죽은 순간에만 돌고, 거부하면 고객은 기대한 IVR 이 아니라 상담사 큐로 갑니다(§9.3).',
     });
   }
 

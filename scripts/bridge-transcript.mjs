@@ -16,7 +16,8 @@ import { verifyBridgeTranscript, formatTranscriptReport } from '../src/channels/
 
 const USAGE = `사용: node scripts/bridge-transcript.mjs (--transcript <기록.json> | --requests <a.jsonl> --responses <b.jsonl>)
        [--adapter <callbot|chatbot|dars>] [--max-line-bytes N]
-       [--include-handoff-summary] [--include-slots] [--expect-health] [--json]
+       [--include-handoff-summary] [--include-slots] [--include-switch-ticket]
+       [--expect-health] [--json]
 종료코드: 0=통과, 1=실패, 2=판정보류(판정보류를 통과로 넘기지 마세요).`;
 
 const argv = process.argv.slice(2);
@@ -80,6 +81,10 @@ const report = verifyBridgeTranscript({ requests, responses }, {
   maxLineBytes,
   includeHandoffSummary: flag('--include-handoff-summary'),
   includeSlots: flag('--include-slots'),
+  // 브리지 실행기의 같은 이름 플래그와 짝이다 — 끈 쪽이 기본이고, 끈 상태에서 기록에 토큰이
+  // 보이면 그 기록 자체가 열쇠를 들고 있다는 뜻이다(§5.2·§10.3). 자리를 두지 않으면 링크를
+  // 직접 보내는 호스트는 이 게이트를 **영구히 실패로** 통과시킬 수 없다.
+  includeSwitchTicket: flag('--include-switch-ticket'),
   expectHealthReport: flag('--expect-health') ? true : undefined,
 });
 

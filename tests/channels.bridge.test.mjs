@@ -662,6 +662,52 @@ test('잘못된 스코프·상한·능력 선언은 생성 시점에 막는다',
   );
 });
 
+test('모르는 어댑터 id 로는 브리지가 기동하지 않는다 — CLI 한 글자가 Core 예외로 쌓였다(§2)', b, () => {
+  const { core } = build();
+  // 종전: `profileFor` 가 모르는 id 에 `{ adapter: '오타', channel: undefined }` 라는 반쪽
+  // 능력 선언을 만들어 돌려주고, 어댑터끼리만 비교하는 검사를 그대로 통과했다. 그러면
+  // `hello` 는 channel 없는 능력(전부 거짓)을 광고하고 — 참조 클라이언트의 어댑터 확인은
+  // **같은 오타끼리 비교**하므로 통과한다 — 모든 start 가 E_INTERNAL 로 끝난다.
+  assert.throws(
+    () => BR.createBridge({ core, adapter: 'calbot', scope: SCOPE }),
+    (e) => e.name === 'BridgeConfigError' && /알 수 없는 채널 어댑터/.test(e.message),
+  );
+  // 가능한 값을 문구에 적는다 — 오타를 고치려면 목록이 있어야 한다.
+  assert.throws(() => BR.createBridge({ core, adapter: 'calbot', scope: SCOPE }), /callbot·chatbot·dars/);
+  for (const id of ['callbot', 'chatbot', 'dars']) {
+    // 아는 값 셋은 종전과 완전히 같이 기동한다(어댑터별 Core 등록 여부는 기동 조건이 아니다).
+    assert.ok(BR.createBridge({ core, adapter: id, scope: SCOPE }));
+  }
+});
+
+test('모르는 어댑터는 빈 문자열·객체·프로토타입 키에서도 막힌다(경계)', b, () => {
+  const { core } = build();
+  for (const bad of ['', ' ', 'CALLBOT', 'constructor', 'toString', 42, null, undefined]) {
+    assert.throws(
+      () => BR.createBridge({ core, adapter: bad, scope: SCOPE }),
+      /알 수 없는 채널 어댑터/,
+      `막히지 않았다: ${String(bad)}`,
+    );
+  }
+});
+
+test('능력 선언의 채널이 어댑터와 어긋나면 막는다 — Node 경로와 같은 판정이다(§2·§5.3)', b, () => {
+  const { core } = build();
+  // `adapter` 는 맞고 `channel` 만 틀린 선언: 종전에는 통과했다. 그 브리지의 `hello` 는
+  // 이 프로세스가 **다른 매체**라고 광고하므로(호스트는 그 값으로 입력 수단을 고른다)
+  // 한 세션의 단계가 양쪽에서 서로 다른 매체용으로 다뤄진다 — 오류 응답은 한 건도 없다.
+  assert.throws(
+    () => BR.createBridge({
+      core, adapter: 'callbot', scope: SCOPE,
+      capabilities: { ...P.profileFor('callbot'), channel: 'chat' },
+    }),
+    /능력 선언의 채널/,
+  );
+  // 같은 불일치를 Node 경로는 등록 거부(E_CHANNEL_MISMATCH)로 적는다.
+  const C = P.profileFor('callbot');
+  assert.ok(BR.createBridge({ core, adapter: 'callbot', scope: SCOPE, capabilities: C }));
+});
+
 test('기록은 op·판정만 남기고 시계 미주입 시 소요를 만들지 않는다(§13-3)', b, async () => {
   const { bridge } = build();
   await bridge.handleLine(line({ id: '1', op: 'hello' }));

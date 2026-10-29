@@ -51,7 +51,7 @@ import type {
   BridgeOp, ChannelAdapterId, ChannelCapabilities, ChannelSessionRequest, ChannelTurnInput,
   ChannelTurnResult, ContractIssue, ConversationCorePort,
 } from './contract.ts';
-import { BRIDGE_MAINTENANCE_OPS, BRIDGE_OPS, CHANNEL_CONTRACT_VERSION } from './contract.ts';
+import { ADAPTER_CHANNEL, BRIDGE_MAINTENANCE_OPS, BRIDGE_OPS, CHANNEL_CONTRACT_VERSION } from './contract.ts';
 import type { AgentOfferStep, InviteExpiryReport, OfferExpiryReport, ReadinessRequest } from './runtime.ts';
 import type { OfferEvent } from '../routing/agentQueue.ts';
 import { OFFER_EVENTS } from '../routing/agentQueue.ts';
@@ -958,9 +958,42 @@ export function createBridge(opts: BridgeOptions): Bridge {
       + '브리지는 모르는 필드를 조용히 빼고 응답하므로 호스트가 그것을 "그 턴에는 없었다"로 읽습니다(§2).',
     );
   }
+  /**
+   * **어댑터 id 를 아는 값으로 거른다**(§2·§13-3). 목록은 `ADAPTER_CHANNEL` 하나다.
+   *
+   * 이 검사가 없던 동안 브리지는 **오타 난 어댑터로도 기동했다**: 실행기는 `--adapter` 의
+   * 존재만 보고(값은 argv 문자열이다) 넘기고, `profileFor` 는 모르는 id 에 `CHANNEL_PROFILES`
+   * 가 없으므로 `{ adapter: '오타', channel: undefined }` 라는 **반쪽 능력 선언**을 만들어
+   * 돌려준다 — 그리고 바로 아래 검사는 `adapter` 끼리만 비교하므로 그대로 통과한다.
+   *
+   * 그 상태의 증상은 설정 오류처럼 보이지 않는다: `hello` 는 `channel` 없는 능력(전부 거짓)을
+   * 광고하고 — 참조 클라이언트의 어댑터 확인은 **같은 오타끼리 비교**하므로 통과한다 —
+   * `start` 는 전부 `E_INTERNAL`("등록되지 않은 채널입니다")로 끝난다. 즉 **CLI 한 글자가
+   * 수집기에 Core 예외로 쌓이고**, 헬스 보고는 `registered: false` 로 조용히 버려진다.
+   * 되돌릴 수 있는 쪽은 기동 거절이므로 여기서 막는다(`E_FOREIGN_COMPONENT`·계약 버전
+   * 불일치와 같은 저울이다).
+   */
+  if (!Object.prototype.hasOwnProperty.call(ADAPTER_CHANNEL, opts.adapter)) {
+    throw new BridgeConfigError(
+      `알 수 없는 채널 어댑터입니다: ${String(opts.adapter)} — 브리지 하나가 채널 하나이고 `
+      + `가능한 값은 ${Object.keys(ADAPTER_CHANNEL).join('·')} 입니다. 모르는 id 로 열린 브리지는 `
+      + '능력 선언이 반쪽이고 모든 start 가 "등록되지 않은 채널" 로 끝납니다(§2).',
+    );
+  }
   const capabilities = opts.capabilities ?? profileFor(opts.adapter);
   if (capabilities.adapter !== opts.adapter) {
     throw new BridgeConfigError(`능력 선언이 어댑터(${opts.adapter})와 어긋납니다.`);
+  }
+  // **채널까지 본다.** 종전에는 `adapter` 끼리만 비교했으므로 호스트가 넘긴 능력 선언의
+  // `channel` 이 어긋나도 통과했다 — Node 경로는 같은 불일치를 `E_CHANNEL_MISMATCH` 로
+  // 거부한다(§2). 통과시키면 `hello` 는 이 브리지가 **다른 매체**라고 광고하고(호스트는 그
+  // 값으로 렌더·입력 수단을 고른다) Core 는 어댑터 기준으로 렌더하므로, 한 세션의 단계가
+  // 양쪽에서 서로 다른 매체용으로 다뤄진다. 오류 응답은 한 건도 나지 않는다.
+  if (capabilities.channel !== ADAPTER_CHANNEL[opts.adapter]) {
+    throw new BridgeConfigError(
+      `능력 선언의 채널(${String(capabilities.channel)})이 ${opts.adapter} 어댑터의 채널`
+      + `(${ADAPTER_CHANNEL[opts.adapter]})과 다릅니다 — Node 경로는 같은 불일치로 등록을 거부합니다(§5.3).`,
+    );
   }
   // 제한기 **장애**는 통과로 두지만(§9.3), 제한기 **형태**가 틀린 것은 설정 오류다.
   // 둘을 같게 다루면 오타 하나로 제한이 조용히 꺼진 채 "적용했다"로 남는다.
