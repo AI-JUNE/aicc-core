@@ -75,8 +75,8 @@ agent.py 에 넣을 것은 훅마다 한 줄이다(이 파일은 agent.py 를 im
    으로 넘긴다: **모름(None)을 False 로 적지 않고**(§13-3), 상담사용 요약은 담지 않으며
    (§2·§10.3), 같은 폴백 모드를 턴마다 다시 알리지 않는다(알리면 같은 안내가 반복된다).
 10. **유지 루프를 부를 자리를 둔다(§9.3·§2).** Core 는 **타이머를 돌리지 않는다**(몰래 켠
-   인터벌은 끌 수도 없고 프로세스 종료를 막는다) — 그래서 만료 수렴·복구 확인·readiness·
-   상담사 응답·헬스 보고는 **호스트가 부른다**. `aicc_bridge.py` 에는 그 여섯 자리가 다
+   인터벌은 끌 수도 없고 프로세스 종료를 막는다) — 그래서 만료 수렴·초대 정리·복구 확인·
+   readiness·상담사 응답·헬스 보고는 **호스트가 부른다**. `aicc_bridge.py` 에는 그 자리가 다
    있었는데 `agent.py` 가 손에 쥐는 것은 이 어댑터이고 브리지 클라이언트는 어댑터 안에서
    **지연 생성되는 비공개 필드**였다 — 즉 권장 경로로 붙인 음성 배치에서는 유지 루프를
    부를 방법이 아예 없었고, **한 번도 돌지 않았다**. 증상은 하나도 예외가 아니다:
@@ -90,6 +90,10 @@ agent.py 에 넣을 것은 훅마다 한 줄이다(이 파일은 agent.py 를 im
      - readiness 미호출 → 모든 통화가 상담사 직결로 떨어진 순간에도 호스트 `/health` 는 초록이다.
      - 상담사 응답 미반영 → 재배정도 소진 수렴도 없다("상담사가 안 받는다"와 구분되지 않는다).
      - 관측 미조회 → 로거·수집기가 전부 던지는 상태(`failed`)가 "로그를 붙였다"와 구분되지 않는다.
+     - 초대 정리 미호출 → §5.2 전환 초대가 레지스트리에서 **나가지 않는다**(상환·만료는 상태만
+       바꾼다). Node 호스트는 자기가 만든 레지스트리를 직접 정리할 수 있지만 권장 경로에서는
+       그것을 만드는 쪽이 브리지가 읽는 Core 모듈이다 — 음성 에이전트는 며칠을 살고, 초대
+       안에는 §10.3 승계 슬롯 스냅샷이 들어 있다.
    **주기는 이 어댑터가 정하지 않는다**(§13-3 — 회선 수·상담사 수에 따라 다르다). 자리만 열고,
    유지 루프의 실패는 **통화 경로를 건드리지 않는다**: 배선되지 않은 op(`E_NOT_WIRED`)는
    브리지 사망이 아니므로 `degraded` 로 올리지 않는다(올리면 유지 루프 설정 하나가 그
@@ -804,6 +808,16 @@ class CallbotCoreHooks:
         """배정 오퍼 만료 수렴 1회. `issues` 가 비어 있지 않으면 `expired` 는 판정 결과가 아니다."""
         return self._maintenance(lambda c: c.run_offer_expiry())
 
+    def run_invite_expiry(self) -> Optional[BridgeResponse]:
+        """§5.2 전환 초대 정리 1회(머리말 10번). `issues` 가 비어 있지 않으면 `purged` 는 판정이 아니다.
+
+        부르지 않으면 발급된 초대가 레지스트리에서 **나가지 않는다** — 상환·만료는 상태만
+        바꾼다. 음성 에이전트는 며칠을 살고 초대 안에는 §10.3 승계 슬롯 스냅샷이 들어 있으므로,
+        증상은 장애가 아니라 **지나간 전환 전부가 프로세스 안에 남아 있는 것**이다.
+        아직 유효한 초대는 걷히지 않는다(고객의 손에 있는 링크를 태우지 않는다).
+        """
+        return self._maintenance(lambda c: c.run_invite_expiry())
+
     def settle_offer(self, offer_id: str, event: str) -> Optional[BridgeResponse]:
         """상담사 수락·거절·취소 반영. `event` 는 accept·decline·cancel 이다.
 
@@ -1451,6 +1465,9 @@ class AsyncCallbotCoreHooks:
 
     async def run_offer_expiry(self) -> Optional[BridgeResponse]:
         return await self._detached(self.inner.run_offer_expiry)
+
+    async def run_invite_expiry(self) -> Optional[BridgeResponse]:
+        return await self._detached(self.inner.run_invite_expiry)
 
     async def settle_offer(self, offer_id: str, event: str) -> Optional[BridgeResponse]:
         return await self._detached(lambda: self.inner.settle_offer(offer_id, event))

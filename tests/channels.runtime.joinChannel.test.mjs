@@ -211,3 +211,95 @@ test('렌더할 수 있는 시나리오의 합류는 종전과 완전히 같다(
   assert.equal(r.status, 'running');
   assert.ok(presents(visual).length >= 1);
 });
+
+// ── 거절은 **고르기 전에** 해야 한다(§5.2·§5.3) ──────────────────────────────
+//
+// 위 거절은 고객이 **이미 링크를 누른 뒤**다. 그 시점에는 되돌릴 것이 남아 있지 않다:
+// §5.1 사다리는 전환 칸을 이미 써 버렸고(`state.channel` 이 화면으로 바뀌어 통화 중인 고객이
+// 화면용 단계를 듣는다) 호스트는 링크까지 발송했다. 고객이 받는 것은 "이 화면에서 열 수 없다"
+// 이고 상담사로 내려갈 경로는 그 통화에 남아 있지 않다 — 어디에서도 예외가 나지 않는다.
+// 그래서 사다리가 **고르기 전에** 목적지 포트의 능력으로 같은 검사를 한다.
+
+/** 두 번 실패하면 §5.1 사다리가 전환을 고르는 시나리오 + 화면 능력이 필요한 노드. */
+const flowRetryChoice = {
+  id: 'retrychoice', version: 1, startNodeId: 'greet',
+  nodes: {
+    greet: { id: 'greet', kind: 'Say', text: '안녕하세요.', next: 'ask' },
+    ask: { id: 'ask', kind: 'Collect', slot: 'customer_name', prompt: '성함을 말씀해 주세요.', next: 'pick' },
+    pick: {
+      id: 'pick', kind: 'Choice', prompt: '무엇을 도와드릴까요?',
+      options: [{ label: '요금', next: 'bill' }, { label: '해지', next: 'bill' }],
+    },
+    bill: { id: 'bill', kind: 'Say', text: '요금 안내입니다.' },
+  },
+};
+const ladderReq = (over = {}) => startReq({ flowId: 'retrychoice', ...over });
+const twice = async (core) => {
+  await core.send('i_jc1', { input: { kind: 'timeout' } });
+  return core.send('i_jc1', { input: { kind: 'timeout' } });
+};
+
+test('목적지가 이 시나리오를 렌더할 수 없으면 사다리는 전환을 고르지 않는다(§5.1·§5.3)', b, async () => {
+  const sw = switchWiring();
+  const voice = fakePort('callbot');
+  const { core } = build({
+    flows: [flowRetryChoice],
+    ports: [voice, fakePort('dars', { richUi: false })],
+    channelSwitch: sw.binding,
+  });
+  await core.start(ladderReq());
+  const r = await twice(core);
+  // 통화 중인 고객에게 화면용 단계를 들려주지 않고, 링크도 만들지 않는다.
+  assert.equal(r.state.channel, 'voice');
+  assert.equal(r.switchInvite, undefined);
+  assert.equal(voice.log.some((l) => l[0] === 'invite'), false);
+  // 사다리는 다음 칸으로 간다 — 고객은 상담사에게 닿는다.
+  assert.equal(r.status, 'transferred');
+  assert.ok(voice.log.some((l) => l[0] === 'transfer'));
+  // 1회용 초대가 발급되지도 않았다(태울 링크 자체가 없다).
+  assert.equal(sw.invites.get('tk_jc_1', SCOPE), undefined);
+});
+
+test('배선이 없어도 같은 검사를 한다 — 토큰 없는 초대였을 뿐 막히는 자리는 같다', b, async () => {
+  const voice = fakePort('callbot');
+  const { core } = build({
+    flows: [flowRetryChoice],
+    ports: [voice, fakePort('dars', { richUi: false })],
+  });
+  await core.start(ladderReq());
+  const r = await twice(core);
+  assert.equal(r.state.channel, 'voice');
+  assert.equal(r.status, 'transferred');
+  assert.equal(voice.log.some((l) => l[0] === 'invite'), false);
+});
+
+test('렌더할 수 있는 목적지면 전환은 종전과 완전히 같다(§13-3)', b, async () => {
+  const sw = switchWiring();
+  const voice = fakePort('callbot');
+  const { core } = build({
+    flows: [flowRetryChoice],
+    ports: [voice, fakePort('dars')],
+    channelSwitch: sw.binding,
+  });
+  await core.start(ladderReq());
+  const r = await twice(core);
+  assert.equal(r.state.channel, 'visual');
+  assert.equal(r.switchInvite.ticketIssued, true);
+  assert.ok(voice.log.some((l) => l[0] === 'invite'));
+  // 그리고 그 초대로 실제로 합류할 수 있다 — 고르기 전 검사와 상환 전 검사가 같은 답을 낸다(§2).
+  const joined = await core.start(joinReq({ flowId: 'retrychoice', joinToken: 'tk_jc_1' }));
+  assert.equal(joined.state.channel, 'visual');
+  assert.equal(joined.status, 'running');
+});
+
+test('목적지가 이 프로세스에 없으면 묻지 않는다 — 능력을 추정해 전환을 막지 않는다(§13-3)', b, async () => {
+  // 합류가 다른 프로세스에서 일어나는 배치. 그 포트의 능력은 여기서 알 수 없으므로 종전대로
+  // 채널 능력(crossChannelInvite)만 보고 전환을 고른다 — 검사는 합류 쪽에서 돈다.
+  const voice = fakePort('callbot');
+  const { core } = build({ flows: [flowRetryChoice], ports: [voice] });
+  await core.start(ladderReq());
+  const r = await twice(core);
+  assert.equal(r.state.channel, 'visual');
+  assert.equal(r.switchInvite.tokenless, true);
+  assert.ok(voice.log.some((l) => l[0] === 'invite'));
+});

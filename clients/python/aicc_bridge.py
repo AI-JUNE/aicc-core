@@ -979,10 +979,14 @@ class BridgeClient:
 
     # ── 유지 루프(§9.3·§2) ────────────────────────────────────────────────
     # Core 는 **타이머를 돌리지 않는다**(몰래 켠 인터벌은 끌 수도 없고 프로세스 종료를 막는다).
-    # 그래서 아래 여섯은 호스트가 주기적으로 불러야 한다. 부를 자리가 없던 동안 비-Node 호스트의
+    # 그래서 아래 일곱은 호스트가 주기적으로 불러야 한다. 부를 자리가 없던 동안 비-Node 호스트의
     # 배치에서는 전부 **한 번도 돌지 않았고**, 증상은 하나도 예외가 아니었다:
     #   - `run_offer_expiry` 미호출 → 만료된 오퍼가 열린 채 쌓여 같은 콜이 두 번 제안되고,
     #     그 통화는 큐에 묶인 채 §9.3 대안(콜백·음성사서함)으로도 가지 않는다.
+    #   - `run_invite_expiry` 미호출 → §5.2 전환 초대가 레지스트리에서 **나가지 않는다**
+    #     (상환·만료는 상태만 바꾼다). Node 호스트는 자기가 만든 레지스트리를 직접 정리할 수
+    #     있지만 여기서 그 레지스트리를 만드는 것은 브리지가 읽는 Core 모듈이다 — 음성
+    #     에이전트는 며칠을 살고, 초대 안에는 §10.3 승계 슬롯 스냅샷이 들어 있다.
     #   - `run_recovery_probe` 미호출 → 한 번 `degraded_ai`·`agent_only` 로 내려간 테넌트는
     #     엔진이 돌아와도 **영구히** 폴백에 남는다(아무도 찌르지 않으니 샘플이 갱신되지 않는다).
     #   - `readiness` 미호출 → 호스트 `/health` 에 §9.3 상태가 닿지 않아, 모든 통화가 상담사
@@ -1025,6 +1029,15 @@ class BridgeClient:
     def run_offer_expiry(self) -> BridgeResponse:
         """배정 오퍼 만료 수렴 1회. `issues` 가 비어 있지 않으면 `expired` 는 판정 결과가 아니다."""
         return self.request("offerExpiry")
+
+    def run_invite_expiry(self) -> BridgeResponse:
+        """§5.2 전환 초대 정리 1회. `issues` 가 비어 있지 않으면 `purged` 는 판정 결과가 아니다.
+
+        **시각을 넘기지 않는다**(다른 유지 op 와 같은 규칙, §2): 호스트가 주면 틀린 시계 하나가
+        아직 유효한 링크를 전부 만료로 적고, 그 뒤 고객이 누른 링크는 전부 "만료된 초대"로
+        거절된다. 아직 유효한 초대는 걷히지 않으므로 이 호출이 고객의 손에 있는 링크를 태우지 않는다.
+        """
+        return self.request("inviteExpiry")
 
     def settle_offer(self, offer_id: str, event: str) -> BridgeResponse:
         """상담사 응답 반영. `event` 는 accept·decline·cancel 이다.

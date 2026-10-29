@@ -1034,6 +1034,33 @@ export interface ConversationCore extends ConversationCorePort {
    * (`executeOffer` (바)). 배선이 없으면 `undefined` — 빈 보고서는 "만료 0건"으로 읽힌다.
    */
   runOfferExpiry(nowIso?: string): Promise<OfferExpiryReport | undefined>;
+  /**
+   * §5.2 전환 초대 정리 1회(§10.3). **타이머를 Core 가 돌리지 않는다** — 호스트가 부른다
+   * (`runOfferExpiry`·`runRecoveryProbes` 와 같은 이유).
+   *
+   * 왜 자리가 필요한가: 레지스트리는 **호스트가 만들어 넣는 값**이므로(§6.2) Node 호스트는
+   * 자기 손에 든 참조로 `purge` 를 부를 수 있다. 그런데 권장 경로로 붙인 비-Node 배치에서는
+   * 그 레지스트리를 만드는 것이 브리지가 읽는 Core 모듈이고 호스트가 쥐는 것은 JSONL 파이프
+   * 하나다 — 즉 **부를 방법이 아예 없었고, 한 번도 돌지 않았다**(유지 루프 다른 자리와 같은
+   * 결말이다). 발급된 초대는 상환·만료되어도 상태만 바뀌므로 레지스트리에서 나가지 않고,
+   * 그 안에는 §10.3 승계 슬롯 스냅샷이 들어 있다. 음성 에이전트는 며칠을 사니 증상은 장애가
+   * 아니라 **지나간 전환 전부가 프로세스 안에 남아 있는 것**이다.
+   *
+   * 배선이 없으면 `undefined` — 빈 보고서는 "정리할 것이 0건"으로 읽힌다(§13-3).
+   * 어떤 경우에도 던지지 않는다(정리 루프가 예외로 죽으면 정리도 같이 죽는다).
+   */
+  runInviteExpiry(nowIso?: string): Promise<InviteExpiryReport | undefined>;
+}
+
+/** `runInviteExpiry` 1회의 실측. 판단 점수가 아니라 건수다(§13-3). */
+export interface InviteExpiryReport {
+  /** 레지스트리에서 제거된 초대 건수(만료·상환 완료·회수). */
+  purged: number;
+  /**
+   * 판정이 **돌지 않은** 사유. 비어 있어야 정상이다 — `purged: 0` 과 섞어 적으면
+   * "정리할 것이 없었다"와 "정리하지 못했다"가 같은 숫자가 된다(§13-3).
+   */
+  issues: string[];
 }
 
 function stubState(flowId: string, flowVersion: number, channel: ChannelKind, status: RunStatus): FlowState {
@@ -1416,6 +1443,13 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     }
     if (!cs.invites || typeof cs.invites.issue !== 'function' || typeof cs.invites.redeem !== 'function') {
       throw new Error('채널 전환 배선 거부: 초대 레지스트리가 없다 (설계서 §5.2)');
+    }
+    // **정리할 길도 배선 시점에 본다.** 없으면 발급된 초대는 레지스트리에서 영원히 나가지
+    // 않고(상환·만료는 상태만 바꾼다) 그 안에는 §10.3 승계 슬롯 스냅샷이 들어 있다 — 음성
+    // 에이전트는 며칠을 살므로 증상은 장애가 아니라 **지나간 전환 전부가 남아 있는 것**이다.
+    // 통화 중에는 어디에서도 드러나지 않으므로(발급·상환은 그대로 된다) 여기서 거른다.
+    if (typeof cs.invites.purge !== 'function') {
+      throw new Error('채널 전환 배선 거부: 초대 레지스트리에 정리(purge)가 없다 — 발급된 초대가 영구히 남는다 (설계서 §10.3·§5.2)');
     }
     if (!Array.isArray(cs.carry?.allow)) {
       throw new Error('채널 전환 배선 거부: 승계 슬롯 allowlist 가 배열이 아니다 (설계서 §10.3)');
@@ -3032,12 +3066,31 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     warnings.push({ code, severity: 'warning', messageKo });
   }
 
-  /** 목적지 채널이 지금 등록되어 있는가. 추정하지 않는다 — 등록 사실만 본다(§13-3). */
-  function targetRegistered(target: SwitchTargetChannel): boolean {
+  /** 목적지 채널의 등록. 추정하지 않는다 — 등록 사실만 본다(§13-3). */
+  function targetRegistration(target: SwitchTargetChannel): ChannelRegistration | undefined {
     for (const reg of regs.values()) {
-      if (reg.port.capabilities.channel === target) return true;
+      if (reg.port.capabilities.channel === target) return reg;
     }
-    return false;
+    return undefined;
+  }
+
+  /** 목적지 채널이 지금 등록되어 있는가. */
+  function targetRegistered(target: SwitchTargetChannel): boolean {
+    return targetRegistration(target) !== undefined;
+  }
+
+  /**
+   * 이 시나리오를 저 포트가 렌더할 수 있는가. 판정은 `checkFlowSupported` 하나이고(§2) 여기서
+   * 다시 쓰지 않는다 — **턴마다 부르는 자리**라 같은 (시나리오, 어댑터) 쌍은 한 번만 센다.
+   */
+  const renderableCache = new Map<string, boolean>();
+  function flowRenderableOn(flow: Flow, caps: ChannelCapabilities): boolean {
+    const key = `${flow.id}@${flow.version}|${caps.adapter}`;
+    const hit = renderableCache.get(key);
+    if (hit !== undefined) return hit;
+    const ok = checkFlowSupported(flow, caps).every((i) => i.severity !== 'error');
+    renderableCache.set(key, ok);
+    return ok;
   }
 
   /**
@@ -3046,12 +3099,27 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
    * 배선이 있으면 전환 성립 조건을 **사다리 판정 전에** 본다. 순서가 중요하다 — 전환을 고른 뒤에
    * 링크 발급이 막히면 `state.channel` 은 이미 화면으로 바뀌어 있고, 고객은 여전히 통화 중인데
    * 화면용으로 렌더된 단계를 듣게 된다. 미리 보면 사다리는 그냥 다음 칸(상담사)으로 간다.
+   *
+   * **목적지가 이 시나리오를 렌더할 수 있는지도 그 '미리'에 들어간다**(§5.2·§5.3). 합류는 같은
+   * 검사를 하고 거절한다(`join` 의 렌더 가능 검사) — 그런데 거절은 **고객이 이미 링크를 누른
+   * 뒤**이고, 그 시점에는 되돌릴 것이 하나도 남아 있지 않다: 사다리는 전환 칸을 이미 써 버렸고
+   * (`state.channel` 이 화면으로 바뀌어 통화 중인 고객이 화면용 단계를 듣는다) 호스트는 링크까지
+   * 발송했다. 고객이 받는 것은 "이 상담은 이 화면에서 열 수 없습니다"이고, 상담사로 내려갈
+   * 경로는 그 통화에 남아 있지 않다 — 어디에서도 예외가 나지 않는다.
+   *
+   * 그래서 **고르기 전에** 묻는다. 물을 수 있는 조건은 목적지 포트가 이 프로세스에 등록되어
+   * 있는 것뿐이고(능력은 포트가 선언한다, §13-3) 그러면 사다리는 전환을 건너뛰고 다음 칸
+   * (상담사)으로 간다. 등록되어 있지 않으면 **묻지 않는다** — 능력을 추정해 전환을 막으면
+   * 종전까지 되던 전환이 사라진다(§13-3). 그 상태의 합류는 다른 프로세스에서 일어나고,
+   * 거기서는 그 포트의 능력으로 같은 검사가 돈다.
    */
   function switchFeasible(rec: SessionRecord, caps: ChannelCapabilities): boolean {
     if (!caps.crossChannelInvite) return false;
+    const target = targetRegistration('visual');
+    if (target !== undefined && !flowRenderableOn(rec.flow, target.port.capabilities)) return false;
     const cs = opts.channelSwitch;
     if (cs === undefined) return true;
-    if (!targetRegistered('visual')) return false;
+    if (target === undefined) return false;
     try {
       return cs.reachable(rec.interactionId) === true;
     } catch {
@@ -3417,6 +3485,21 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     recordTurns(rec, events);
     const result: ChannelTurnResult = {
       interactionId: rec.interactionId, state: rec.state, steps, status: rec.state.status, events,
+      /**
+       * **축소 운영 판정도 함께 싣는다.** 위 `applyOutage` 는 `degraded_ai` 를 통과시키므로
+       * (AI 응대를 계속할 수 있는 모드다) 그 사실이 호스트에 닿는 자리는 이 칸 하나뿐인데,
+       * 합류만 그것을 비워 두었다 — `start`·`send` 는 둘 다 같은 조건으로 싣는다. 바로 위
+       * `stampOutage` 주석이 "경로마다 따로 판단하지 않는다"고 적어 둔 그 비대칭이 **한 층 위
+       * 판정에서** 성립해 있던 셈이다(§9.3·§2).
+       *
+       * 증상은 예외가 아니다. 합류는 고객이 **다른 매체로 건너온 첫 턴**이고, 그 매체의 호스트
+       * 입장에서는 세션에서 처음 받는 응답이다 — 거기서 판정이 비면 그 호스트는 축소 운영을
+       * `normal` 로 읽고(§13-3 — 없는 칸을 정상으로 적지 않는다) 저하된 구성요소를 쓰는 안내를
+       * 그대로 수행한다. 하필 전환을 고른 이유가 인식 실패이므로 그 세션은 **대개 이미 축소
+       * 운영 중**이고, 호스트가 그 사실을 아는 다음 기회는 고객의 첫 입력이 올 때다(화면을
+       * 보기만 하고 아무것도 누르지 않으면 영영 오지 않는다).
+       */
+      ...(decision.mode === 'degraded_ai' ? { fallback: decision } : {}),
       ...(disclosure !== undefined ? { disclosure } : {}),
       ...(consent !== undefined ? { consent } : {}),
       ...complianceSlot(rec, events),
@@ -3860,6 +3943,24 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
         if (step !== undefined) steps.push(step);
       }
       return { expired: due.length, steps, issues: [] };
+    },
+
+    /**
+     * §5.2 초대 정리 1회. 판정은 레지스트리 하나다(§2) — 여기서 만료 규칙을 다시 쓰지 않는다.
+     * 어떤 경우에도 던지지 않는다: 호스트가 넘긴 시각 형태가 틀리면 `purge` 가 던지는데,
+     * 그것을 0 건으로 바꿔 적으면 "정리할 것이 없었다"로 읽힌다(§13-3).
+     */
+    async runInviteExpiry(nowIso) {
+      const cs = opts.channelSwitch;
+      if (cs === undefined) return undefined;
+      const at = nowIso ?? now();
+      try {
+        return { purged: cs.invites.purge(at), issues: [] };
+      } catch (e) {
+        const whyKo = e instanceof Error ? e.message : String(e);
+        warnOnce('W_CHANNEL_SWITCH_UNBOUND', `전환 초대 정리를 돌리지 못했습니다: ${whyKo}`);
+        return { purged: 0, issues: [whyKo] };
+      }
     },
 
     readiness: (req) => runReadiness({

@@ -1457,6 +1457,68 @@ h.close()
   assert.equal(JSON.stringify(out).includes('tk_reference'), false, '1회용 열쇠가 응답·전사에 실렸다');
 });
 
+test('§5.2 초대 정리를 음성 호스트가 부를 수 있다 — 발급된 초대가 영구히 쌓이지 않는다(§10.3)', b, () => {
+  // 부를 자리가 없던 동안 초대는 레지스트리에서 **나가지 않았다**(상환·만료는 상태만 바꾼다).
+  // Node 호스트는 자기가 만든 레지스트리를 직접 정리할 수 있지만, 권장 경로에서 그것을 만드는
+  // 쪽은 브리지가 읽는 Core 모듈이고 호스트가 쥐는 것은 이 어댑터다.
+  const out = parse(runDriver(`${SWITCH_PRELUDE}
+h = sw_hooks(True)
+h.on_call_start("c1")
+h.on_timeout("c1")
+h.on_timeout("c1")      # 2회 실패 → 전환 초대 발급
+ops = h.maintenance_ops()
+r = h.run_invite_expiry()
+# 같은 통화를 한 턴 더 돌린다 — 정리가 **아직 유효한** 초대를 태웠다면 여기서 드러난다.
+again = h.on_timeout("c1")
+dump(h, switches=switches, ops=list(ops),
+     purged=(r.result or {}).get("purged"), issues=(r.result or {}).get("issues"),
+     ok=r.ok, code=(r.error.code if r.error else None), again_ok=(again.ok if again else None))
+h.close()
+`));
+  assert.ok(out.ops.includes('inviteExpiry'), '열린 op 로 알려주지 않으면 호스트는 부르지 않는다(§2)');
+  assert.equal(out.ok, true, `초대 정리가 거절됐다: ${out.code}`);
+  assert.equal(out.purged, 0, '아직 유효한 초대를 걷으면 고객의 링크가 타 버린다');
+  assert.deepEqual(out.issues, [], 'issues 가 있으면 purged 는 판정 결과가 아니다');
+  assert.equal(out.again_ok, true, '정리가 통화 경로를 건드렸다');
+  assert.equal(out.stats.maintenance_runs >= 1, true);
+  assert.deepEqual(out.errors, []);
+});
+
+test('비동기 호스트에도 초대 정리 자리가 있다 — 한쪽만 열면 권장 경로에서만 사라진다', b, () => {
+  // asyncio 가 권장 경로다. 동기 쪽에만 열면 증상은 "음성 채널 전체에서 초대가 쌓인다"가 된다.
+  const out = parse(runDriver(`${SWITCH_PRELUDE}
+async def main():
+    h = AsyncCallbotCoreHooks(sw_hooks(True))
+    ops = await h.maintenance_ops()
+    await h.on_call_start("c1")
+    # 통화와 정리를 같은 체인에 묶지 않는다 — 묶으면 턴이 정리를 기다린다.
+    await asyncio.gather(h.on_timeout("c1"), h.run_invite_expiry())
+    r = await h.run_invite_expiry()
+    await h.drain()
+    dump(h.inner, ops=list(ops), ok=bool(r and r.ok), purged=((r.result or {}).get("purged") if r else None))
+    await h.close()
+asyncio.run(main())
+`));
+  assert.ok(out.ops.includes('inviteExpiry'));
+  assert.equal(out.ok, true);
+  assert.equal(out.purged, 0);
+  assert.deepEqual(out.errors, []);
+});
+
+test('전환이 배선되지 않은 Core 에서는 초대 정리가 조용한 0건이 아니라 E_NOT_WIRED 다(실패 경로)', b, () => {
+  const out = parse(runDriver(`${PRELUDE}
+h = hooks()
+r = h.run_invite_expiry()
+dump(h, ok=r.ok, code=(r.error.code if r.error else None), result=r.result)
+h.close()
+`));
+  assert.equal(out.ok, false, '"정리할 것이 0건"과 "한 번도 돌지 않았다"는 다른 상태다(§13-3)');
+  assert.equal(out.code, 'E_NOT_WIRED');
+  assert.equal(out.result, null);
+  // 배선 누락은 브리지 사망이 아니다 — 올리면 설정 하나가 모든 통화에서 Core 를 떼어 간다.
+  assert.equal(out.degraded, false);
+});
+
 test('전환 배선이 없는 Core 에서는 "토큰 없는 초대"로 온다 — 토큰을 지어내지 않는다(실패 경로)', b, () => {
   // `reference-core.mjs` 에는 전환 배선이 없다. 그 상태의 링크는 **id 가 곧 열쇠**이며,
   // 그것을 "토큰을 못 받았다"와 같게 적으면 호스트 스위치를 뒤지다 Core 설정을 놓친다.

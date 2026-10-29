@@ -52,7 +52,7 @@ import type {
   ChannelTurnResult, ContractIssue, ConversationCorePort,
 } from './contract.ts';
 import { BRIDGE_MAINTENANCE_OPS, BRIDGE_OPS, CHANNEL_CONTRACT_VERSION } from './contract.ts';
-import type { AgentOfferStep, OfferExpiryReport, ReadinessRequest } from './runtime.ts';
+import type { AgentOfferStep, InviteExpiryReport, OfferExpiryReport, ReadinessRequest } from './runtime.ts';
 import type { OfferEvent } from '../routing/agentQueue.ts';
 import { OFFER_EVENTS } from '../routing/agentQueue.ts';
 import type { RecoveryRunReport } from '../ops/recoveryProbe.ts';
@@ -354,6 +354,12 @@ export interface BridgeMaintenanceBinding {
    */
   recoveryProbe?: boolean;
   offerExpiry?: boolean;
+  /**
+   * §5.2 전환 초대 정리. **전환이 Core 에 배선되지 않았으면 켜도 거절된다** —
+   * `runInviteExpiry()` 가 `undefined` 를 돌려주고, 그것을 0 으로 적으면 "정리할 것이
+   * 0건"이 되어 **한 번도 돌지 않았다는 사실**이 "깨끗하다"로 읽힌다(§13-3).
+   */
+  inviteExpiry?: boolean;
   settleOffer?: boolean;
   warnings?: boolean;
   /**
@@ -373,6 +379,7 @@ type MaintenanceCapableCore = ConversationCorePort & {
   readiness?(req: ReadinessRequest): Promise<CoreReadinessReport>;
   runRecoveryProbes?(nowIso?: string): Promise<RecoveryRunReport | undefined>;
   runOfferExpiry?(nowIso?: string): Promise<OfferExpiryReport | undefined>;
+  runInviteExpiry?(nowIso?: string): Promise<InviteExpiryReport | undefined>;
   settleAgentOffer?(p: { offerId: string; event: OfferEvent; nowIso?: string }): Promise<AgentOfferStep | undefined>;
   observability?(): ObserverStats | undefined;
 };
@@ -1034,6 +1041,7 @@ export function createBridge(opts: BridgeOptions): Bridge {
       case 'readiness': return m.readiness !== undefined;
       case 'recoveryProbe': return m.recoveryProbe === true;
       case 'offerExpiry': return m.offerExpiry === true;
+      case 'inviteExpiry': return m.inviteExpiry === true;
       case 'settleOffer': return m.settleOffer === true;
       case 'observability': return m.observability === true;
       default: return false;
@@ -1048,6 +1056,7 @@ export function createBridge(opts: BridgeOptions): Bridge {
       case 'readiness': return typeof maintCore.readiness === 'function';
       case 'recoveryProbe': return typeof maintCore.runRecoveryProbes === 'function';
       case 'offerExpiry': return typeof maintCore.runOfferExpiry === 'function';
+      case 'inviteExpiry': return typeof maintCore.runInviteExpiry === 'function';
       case 'settleOffer': return typeof maintCore.settleAgentOffer === 'function';
       case 'observability': return typeof maintCore.observability === 'function';
       default: return false;
@@ -1194,6 +1203,21 @@ export function createBridge(opts: BridgeOptions): Bridge {
         const report = await core.runOfferExpiry!();
         span.returned = true;
         if (report === undefined) notWired('offerExpiry', 'Core 에 배정 오퍼 배선이 없습니다(§2).');
+        return wireCopy(report);
+      }
+      /**
+       * §5.2 초대 정리. **시각을 본문에서 받지 않는다**(다른 유지 op 와 같은 규칙) — 호스트가
+       * 주면 틀린 시계 하나가 아직 유효한 링크를 전부 만료로 적고, 그 뒤 고객이 누른 링크는
+       * 전부 "만료된 초대"로 거절된다(§5.2·§2).
+       */
+      case 'inviteExpiry': {
+        const core = requireMaintenance('inviteExpiry', (c) => c.runInviteExpiry);
+        span.entered = true;
+        const report = await core.runInviteExpiry!();
+        span.returned = true;
+        // 배선이 없으면 `undefined` 다. 0 건으로 적으면 **한 번도 돌지 않았다는 사실**이
+        // "정리할 것이 없었다"로 읽힌다(§13-3).
+        if (report === undefined) notWired('inviteExpiry', 'Core 에 채널 전환 배선이 없습니다(§5.2).');
         return wireCopy(report);
       }
       case 'settleOffer': {

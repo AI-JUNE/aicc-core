@@ -59,6 +59,11 @@ export type BridgeOp =
   | 'recoveryProbe'
   /** 배정 오퍼 만료 수렴 1회. 부르지 않으면 만료분이 열린 채 쌓인다. */
   | 'offerExpiry'
+  /**
+   * §5.2 전환 초대 정리 1회(§10.3). 부르지 않으면 발급된 초대가 레지스트리에서 **나가지
+   * 않는다** — 상환·만료는 상태만 바꾸고, 그 안에는 승계 슬롯 스냅샷이 들어 있다.
+   */
+  | 'inviteExpiry'
   /** 상담사 수락·거절·취소 반영. 올리지 않으면 재배정도 소진 수렴도 일어나지 않는다. */
   | 'settleOffer'
   /**
@@ -77,7 +82,7 @@ const CALL_PATH_OP_TUPLE = ['hello', 'start', 'send', 'end', 'health'] as const;
 
 /** 유지 루프. 호스트가 주기적으로 부르는 쪽이다(Core 는 타이머를 돌리지 않는다). */
 const MAINTENANCE_OP_TUPLE = [
-  'warnings', 'readiness', 'recoveryProbe', 'offerExpiry', 'settleOffer', 'observability',
+  'warnings', 'readiness', 'recoveryProbe', 'offerExpiry', 'inviteExpiry', 'settleOffer', 'observability',
 ] as const;
 
 // 전체 목록은 **두 분류의 합**이다 — 따로 적으면 op 를 늘릴 때 분류를 빼먹을 수 있고, 그러면

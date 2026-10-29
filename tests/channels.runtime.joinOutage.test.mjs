@@ -120,7 +120,31 @@ test('축소 운영(degraded)에서도 합류는 그대로 진행된다 — 끄�
   await core.start(startReq);
   const r = await core.start(joinReq());
   assert.equal(r.status, 'running');
-  assert.equal(r.fallback, undefined);           // 합류 응답은 종전대로 판정을 싣지 않는다
+  // 진행은 그대로이고 **판정은 실린다** — `start`·`send` 와 같은 조건이다(§9.3·§2).
+  // 종전에는 이 칸이 비어 있었고, 합류는 고객이 다른 매체로 건너온 첫 턴이라
+  // 그 호스트에게는 첫 응답이다: 비어 있으면 축소 운영을 정상으로 읽는다(§13-3).
+  assert.equal(r.fallback.mode, 'degraded_ai');
+  assert.deepEqual(r.fallback.disable, ['knowledge_grounding']);
+  // 축소 지시는 종전처럼 단계에도 찍힌다 — 둘은 같은 판정 하나를 본다(§2).
+  assert.equal(r.steps.every((s) => s.outage === undefined), true, 'rag 저하는 매체 지시가 아니다');
+});
+
+test('정상 판정이면 합류 응답에 fallback 칸이 없다 — 없는 칸을 만들지 않는다(§13-3)', b, async () => {
+  const { core } = build();
+  await core.start(startReq);
+  const r = await core.start(joinReq());
+  assert.equal('fallback' in r, false);
+});
+
+test('합류 뒤 첫 입력도 같은 판정을 돌려준다 — 합류만 비껴가던 자리였다', b, async () => {
+  const { core } = build({ samples: [sample('rag', 'degraded')] });
+  await core.start(startReq);
+  const joined = await core.start(joinReq());
+  const next = await core.send('i_jo1', { input: { kind: 'utterance', text: '김고운' } });
+  assert.equal(next.fallback.mode, 'degraded_ai');
+  // 같은 세션의 연속된 두 응답이 **같은 모양**이어야 한다 — 한쪽만 비면 호스트는 "판정이
+  // 풀렸다"로 읽고(§13-3) 축소 운영 중에 저하된 구성요소를 다시 켠다.
+  assert.deepEqual(joined.fallback, next.fallback);
 });
 
 test('매체 계층이 죽은 상태의 합류는 세션을 끝낸다 — 빈 화면에 running 으로 남기지 않는다', b, async () => {

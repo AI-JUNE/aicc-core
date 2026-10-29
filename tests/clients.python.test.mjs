@@ -634,6 +634,7 @@ c.hello()
 out = {"ops": list(c.maintenance_ops())}
 for name, res in (("warnings", c.warnings()), ("readiness", c.readiness()),
                   ("recovery", c.run_recovery_probe()), ("expiry", c.run_offer_expiry()),
+                  ("invites", c.run_invite_expiry()),
                   ("settle", c.settle_offer("o_1", "accept"))):
     out[name] = {"ok": res.ok, "code": res.error.code if res.error else None, "result": res.result}
 json.dump(out, sys.stdout, ensure_ascii=False)
@@ -643,7 +644,7 @@ c.close()
   assert.equal(run.status, 0, run.stderr);
   const out = JSON.parse(run.stdout);
   assert.deepEqual(out.ops, [], '열지 않은 op 를 열렸다고 알려주면 호스트가 돌고 있다고 믿는다');
-  for (const name of ['warnings', 'readiness', 'recovery', 'expiry', 'settle']) {
+  for (const name of ['warnings', 'readiness', 'recovery', 'expiry', 'invites', 'settle']) {
     assert.equal(out[name].ok, false, `${name} 가 배선 없이 통과했다`);
     assert.equal(out[name].code, 'E_NOT_WIRED', `${name}: ${JSON.stringify(out[name])}`);
     // 파이썬 쪽에서 `None` 이 되어 null 로 직렬화된다 — 어느 쪽이든 **본문이 없다**는 뜻이다.

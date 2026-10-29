@@ -1396,6 +1396,9 @@ test('전환 배선 형태 오류는 통화 중이 아니라 생성 시점에 �
     [{ reachable: undefined }, /수신 가능 여부/],
     [{ ttlMs: 0 }, /유효기간/],
     [{ invites: undefined }, /초대 레지스트리/],
+    // 정리할 길이 없으면 발급된 초대가 레지스트리에서 영원히 나가지 않는다 — 상환·만료는
+    // 상태만 바꾼다. 통화 중에는 드러나지 않으므로(발급·상환은 그대로 된다) 여기서 거른다(§10.3).
+    [{ invites: { issue: () => {}, redeem: () => {} } }, /정리\(purge\)/],
     [{ carry: { allow: 'customer_name' } }, /allowlist/],
   ];
   for (const [over, re] of bad) {

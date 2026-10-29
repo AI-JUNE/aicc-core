@@ -22,7 +22,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
-let BR = null, R = null, F = null, P = null, BP = null, C = null, OBS = null;
+let BR = null, R = null, F = null, P = null, BP = null, C = null, OBS = null, CS = null;
 try {
   BR = await import('../src/channels/bridge.ts');
   R = await import('../src/channels/runtime.ts');
@@ -31,6 +31,7 @@ try {
   BP = await import('../src/channels/basePort.ts');
   C = await import('../src/channels/contract.ts');
   OBS = await import('../src/obs/executeObservability.ts');
+  CS = await import('../src/core/channelSwitch.ts');
 } catch { /* 타입 스트리핑 미지원 런타임 */ }
 const b = { skip: BR ? false : '타입 스트리핑 미지원 런타임' };
 
@@ -160,7 +161,7 @@ test('모르는 op 는 종전대로 거부된다(실패 경로)', b, async () =>
 
 // ── 2) 배선이 없으면 0건으로 적지 않는다 ────────────────────────────────────
 
-test('유지 배선이 없으면 다섯 op 모두 E_NOT_WIRED 다 — 빈 보고서를 돌려주지 않는다(§13-3)', b, async () => {
+test('유지 배선이 없으면 유지 op 전부가 E_NOT_WIRED 다 — 빈 보고서를 돌려주지 않는다(§13-3)', b, async () => {
   const { bridge } = build({ core: { routing: ROUTING({ offers: OFFERS() }), recovery: RECOVERY() } });
   for (const op of C.BRIDGE_MAINTENANCE_OPS) {
     const r = await call(bridge, op, op === 'settleOffer' ? { offerId: 'o_1', event: 'accept' } : {});
@@ -202,14 +203,27 @@ test('readiness 는 요청(프로브·제한 시간)이 배선되지 않으면 �
 // ── 3) 열면 실제로 돈다 ─────────────────────────────────────────────────────
 
 const OPEN = {
-  warnings: true, recoveryProbe: true, offerExpiry: true, settleOffer: true,
+  warnings: true, recoveryProbe: true, offerExpiry: true, inviteExpiry: true, settleOffer: true,
   observability: true, readiness: { timeoutMs: 500 },
+};
+
+/** §5.2 전환 배선. 초대 정리(`inviteExpiry`)가 열리는 조건이다. */
+const SWITCH = (over = {}) => {
+  const invites = CS.createInviteRegistry();
+  let n = 0;
+  return {
+    invites,
+    binding: {
+      invites, newToken: () => { n += 1; return `tk_m_${n}`; }, ttlMs: 300000,
+      carry: { allow: [] }, reachable: () => true, delivery: 'sms', ...over,
+    },
+  };
 };
 
 test('hello 가 열린 유지 op 를 알려준다 — 호스트가 하나씩 찔러 보지 않는다(§2)', b, async () => {
   const { bridge } = build({
     bridge: { maintenance: OPEN },
-    core: { routing: ROUTING({ offers: OFFERS() }), recovery: RECOVERY() },
+    core: { routing: ROUTING({ offers: OFFERS() }), recovery: RECOVERY(), channelSwitch: SWITCH().binding },
   });
   const r = await call(bridge, 'hello');
   assert.equal(r.ok, true);
@@ -276,6 +290,90 @@ test('offerExpiry 1회가 돌고 보고서가 판정 여부를 밝힌다', b, as
   assert.equal(r.result.expired, 0);
   assert.deepEqual(r.result.issues, [], 'issues 가 있으면 expired 는 판정 결과가 아니다');
   assert.ok(Array.isArray(r.result.steps));
+});
+
+// ── 3-1) §5.2 초대 정리 ─────────────────────────────────────────────────────
+//
+// 발급된 초대는 상환·만료되어도 레지스트리에서 **나가지 않는다**(상태만 바뀐다). Node 호스트는
+// 자기가 만든 레지스트리의 `purge` 를 직접 부를 수 있지만, 권장 경로로 붙인 비-Node 배치에서
+// 그 레지스트리를 만드는 것은 브리지가 읽는 Core 모듈이고 호스트가 쥐는 것은 JSONL 파이프
+// 하나다 — 즉 부를 방법이 아예 없었고 한 번도 돌지 않았다. 음성 에이전트는 며칠을 살고,
+// 초대 안에는 §10.3 승계 슬롯 스냅샷이 들어 있다.
+
+const issueInvite = (invites, token, over = {}) => invites.issue({
+  scope: SCOPE, interactionId: 'i_m1', fromChannel: 'voice', toChannel: 'visual',
+  reason: 'customer_request', delivery: 'sms', token, issuedAt: NOW,
+  ttlMs: 300000, carry: { allow: [] }, crossChannelInviteSupported: true, ...over,
+});
+
+test('inviteExpiry 1회가 만료·상환된 초대를 레지스트리에서 걷어낸다(§5.2·§10.3)', b, async () => {
+  const sw = SWITCH();
+  const { bridge } = build({ bridge: { maintenance: OPEN }, core: { channelSwitch: sw.binding } });
+  // 만료된 것 1건 + 상환된 것 1건 + 아직 유효한 것 1건.
+  issueInvite(sw.invites, 'tk_old', { issuedAt: '2026-10-21T08:00:00.000Z', ttlMs: 60000 });
+  issueInvite(sw.invites, 'tk_used');
+  sw.invites.redeem({ token: 'tk_used', scope: SCOPE, channel: 'visual', at: NOW });
+  issueInvite(sw.invites, 'tk_live');
+
+  const r = await call(bridge, 'inviteExpiry');
+  assert.equal(r.ok, true, JSON.stringify(r.error));
+  assert.equal(r.result.purged, 2);
+  assert.deepEqual(r.result.issues, [], 'issues 가 있으면 purged 는 판정 결과가 아니다');
+  // 아직 유효한 링크는 살아 있다 — 정리가 고객의 손에 있는 링크를 태우지 않는다.
+  assert.ok(sw.invites.get('tk_live', SCOPE));
+  assert.equal(sw.invites.get('tk_old', SCOPE), undefined);
+  assert.equal(sw.invites.get('tk_used', SCOPE), undefined);
+  // 두 번 돌려도 같은 건을 다시 세지 않는다(수렴이다).
+  const again = await call(bridge, 'inviteExpiry');
+  assert.equal(again.result.purged, 0);
+});
+
+test('전환 배선이 없으면 inviteExpiry 는 E_NOT_WIRED 다 — 0건으로 적지 않는다(§13-3)', b, async () => {
+  const { bridge } = build({ bridge: { maintenance: { inviteExpiry: true } } });
+  const r = await call(bridge, 'inviteExpiry');
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, 'E_NOT_WIRED');
+  assert.match(r.error.messageKo, /채널 전환 배선/);
+  assert.equal(r.result, undefined, '"정리할 것이 0건"으로 읽힐 본문이 함께 나가면 안 된다');
+});
+
+test('스위치를 켜지 않으면 배선이 있어도 열리지 않는다 — 기본은 닫힘이다', b, async () => {
+  const sw = SWITCH();
+  const { bridge } = build({ bridge: { maintenance: { warnings: true } }, core: { channelSwitch: sw.binding } });
+  const r = await call(bridge, 'inviteExpiry');
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, 'E_NOT_WIRED');
+});
+
+test('레지스트리가 던져도 통화 경로를 건드리지 않고 사유만 보고서에 남는다', b, async () => {
+  const sw = SWITCH();
+  sw.binding.invites = {
+    ...sw.invites,
+    issue: (p) => sw.invites.issue(p),
+    redeem: (a) => sw.invites.redeem(a),
+    get: (t, s) => sw.invites.get(t, s),
+    purge: () => { throw new Error('저장소 연결이 끊겼습니다'); },
+  };
+  const { bridge, core } = build({ bridge: { maintenance: OPEN }, core: { channelSwitch: sw.binding } });
+  const r = await call(bridge, 'inviteExpiry');
+  // 던지지 않는다 — 정리 루프가 예외로 죽으면 정리도 같이 죽는다.
+  assert.equal(r.ok, true, JSON.stringify(r.error));
+  assert.equal(r.result.purged, 0);
+  assert.deepEqual(r.result.issues, ['저장소 연결이 끊겼습니다']);
+  assert.ok(core.warnings().some((i) => i.messageKo.includes('전환 초대 정리를 돌리지 못했습니다')));
+  // 통화는 그대로 돈다.
+  const s = await call(bridge, 'start', { req: { flowId: 'care', entryPoint: 'inbound_call' } });
+  assert.equal(s.ok, true, JSON.stringify(s.error));
+});
+
+test('초대 정리에 쓸 시각을 본문에서 받지 않는다 — 틀린 시계가 유효한 링크를 태우지 않는다(§2)', b, async () => {
+  const sw = SWITCH();
+  const { bridge } = build({ bridge: { maintenance: OPEN }, core: { channelSwitch: sw.binding } });
+  issueInvite(sw.invites, 'tk_live');
+  const r = await call(bridge, 'inviteExpiry', { nowIso: '2027-01-01T00:00:00.000Z' });
+  assert.equal(r.ok, true, JSON.stringify(r.error));
+  assert.equal(r.result.purged, 0, '호스트가 준 시각이 판정에 쓰였다');
+  assert.ok(sw.invites.get('tk_live', SCOPE));
 });
 
 test('settleOffer 가 상담사 수락을 원장에 반영한다 — 올리지 않으면 재배정도 없다', b, async () => {
