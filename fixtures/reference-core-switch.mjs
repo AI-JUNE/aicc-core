@@ -34,8 +34,34 @@ export const flows = [{
   },
 }];
 
+/**
+ * 발송 경로 장애 드릴(§5.2). **환경변수로만 켜지고, 실발신은 하지 않는다**.
+ *
+ * 왜 여기 있는가: 초대 지시가 매체에서 거부되는 경우에 Core 가 하는 일은 "사실을 남기고 턴의
+ * 나머지를 그대로 내보내는 것"이고(`switchInvite.notDeliveredKo`), 비-Node 호스트가 그 사실을
+ * 받는 자리는 턴 응답 하나뿐이다. 그런데 드라이런 포트의 초대는 **언제나 접수되므로** 그
+ * 호스트는 자기 처리 경로를 한 번도 지나 볼 수 없다 — 그 상태에서 호스트가 보는 것은
+ * `ticketIssued: true` 뿐이고, 그러면 "링크를 보냈다"로 읽는다(고객은 오지 않는 화면을
+ * 기다리고 세션은 이미 화면 채널로 옮겨 가 있다). 그래서 거부를 **한 줄로 재현**할 수 있게 둔다.
+ *
+ * 베이스 포트를 감싸기만 한다 — 다른 지시는 전부 종전대로 베이스가 처리한다(§2).
+ */
+function withInviteRejectionDrill(base) {
+  if (process.env.AICC_REF_SWITCH_INVITE !== 'reject') return base;
+  return {
+    id: base.id,
+    capabilities: base.capabilities,
+    present: (id, steps) => base.present(id, steps),
+    transfer: (id, queue, summaryMasked) => base.transfer(id, queue, summaryMasked),
+    end: (id, reasonKo) => base.end(id, reasonKo),
+    // 거부는 Core 에 닿아야 한다(베이스의 `surfaced` 와 같은 규칙) — 삼키면 Core 는
+    // "링크를 보냈다"로 적는다. 사유 문구에 수신번호·링크를 싣지 않는다(§10.3).
+    invite: async () => { throw new Error('발송 게이트웨이가 초대를 거부했습니다(드릴)'); },
+  };
+}
+
 export default function createCore() {
-  const port = createChannelPort({ id: 'callbot' });
+  const port = withInviteRejectionDrill(createChannelPort({ id: 'callbot' }));
   // 목적지 채널. 등록되지 않았으면 전환은 **성립하지 않는다**(링크를 열 화면이 없다).
   const visualPort = createChannelPort({ id: 'dars' });
   let issued = 0;

@@ -1543,6 +1543,56 @@ h.close()
   assert.deepEqual(out.errors, [], '종전 상태는 등록 시점 경고(W_CHANNEL_SWITCH_UNBOUND)가 이미 적는다');
 });
 
+test('§5.2 초대 지시가 매체에서 거부되면 호스트가 그 사실을 받는다 — 발급 여부와 다른 질문이다', b, () => {
+  // 발급은 됐고 토큰까지 왔는데 **링크는 나가지 않은** 상태다(발송 게이트웨이 장애). 그 사실이
+  // 비-Node 호스트에 닿는 자리는 턴 응답의 `notDeliveredKo` 하나뿐이고, 읽지 않으면 호스트가
+  // 보는 것은 `ticket_issued=True` 뿐이다 — 그러면 "링크를 보냈다"로 읽는다. 세션은 이미 화면
+  // 채널로 옮겨 가 있고 §5.1 사다리는 전환 칸을 썼으므로, 그 통화는 아무도 손쓰지 않는 채 끝난다.
+  const out = parse(runDriver(`${SWITCH_PRELUDE}
+h = sw_hooks(True)
+h.on_call_start("c1")
+h.on_timeout("c1")
+r = h.on_timeout("c1")      # 2회 실패 → 전환 초대 발급 → 발송 거부
+dump(h, switches=switches, not_delivered=r.switch_not_delivered_ko, ok=r.ok,
+     steps=len((r.result or {}).get("steps") or []), status=r.run_status)
+h.close()
+`, { AICC_REF_SWITCH_INVITE: 'reject' }));
+  // **그 턴은 오류로 끝나지 않는다**: 거부 때문에 턴의 나머지(단계·안내)가 사라지면 고객은
+  // 링크도 못 받고 그 턴의 안내도 못 듣는다.
+  assert.equal(out.ok, true);
+  assert.equal(out.status, 'running');
+  assert.ok(out.steps > 0, '거부가 그 턴의 단계를 삼켰다');
+  assert.ok(typeof out.not_delivered === 'string' && out.not_delivered.length > 0,
+    '브리지 응답에 거부 사유가 실리지 않으면 호스트는 링크가 나갔는지 알 수 없다');
+  assert.equal(out.switches.length, 1);
+  const p = out.switches[0][1];
+  assert.equal(p.ticket_issued, true, '발급은 됐다 — 발급 실패로 적으면 운영이 발급 설정을 뒤진다');
+  assert.equal(p.token_included, true);
+  assert.ok(typeof p.not_delivered_ko === 'string' && p.not_delivered_ko.length > 0);
+  assert.equal(p.not_issued_ko, null, '전달 거부를 발급 실패로 적으면 고칠 곳이 바뀐다');
+  assert.equal(out.stats.switch_not_delivered, 1);
+  assert.equal(out.stats.switch_tickets_unissued, 0, '합쳐 세면 고칠 곳이 둘로 갈린다');
+  assert.equal(out.stats.switch_tokens_received, 1);
+  assert.deepEqual(out.errors, ['E_SWITCH_NOT_DELIVERED'],
+    '링크가 나가지 않은 것을 말해 주는 경로가 이 알림뿐이다 — 통화는 오류 없이 계속 돈다');
+});
+
+test('초대가 접수되면 전달 거부 칸은 비어 있고 알림도 나지 않는다(경계)', b, () => {
+  // 드릴을 끈 상태가 평시다. 없는 사유를 만들어 넣으면 호스트는 매 전환을 발송 실패로 센다.
+  const out = parse(runDriver(`${SWITCH_PRELUDE}
+h = sw_hooks(True)
+h.on_call_start("c1")
+h.on_timeout("c1")
+r = h.on_timeout("c1")
+dump(h, switches=switches, not_delivered=r.switch_not_delivered_ko)
+h.close()
+`));
+  assert.equal(out.not_delivered, null);
+  assert.equal(out.switches[0][1].not_delivered_ko, null);
+  assert.equal(out.stats.switch_not_delivered, 0);
+  assert.deepEqual(out.errors, []);
+});
+
 // ── Core 가 먼저 닫은 세션(2026-10-28) ───────────────────────────────────────
 // 세션을 끝내는 주체가 호스트만이 아니다 — End 노드 도달·재시도 소진 이관·Api 순회 상한·
 // 장애 폴백은 Core 가 그 턴에서 닫는다. 닫힌 세션에 온 입력은 **오류가 아니라 멱등 처리**라

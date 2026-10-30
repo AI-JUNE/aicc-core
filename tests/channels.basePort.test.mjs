@@ -55,6 +55,67 @@ test('종료 중복 호출은 매체를 두 번 내리지 않고 흡수한다', 
   assert.equal(t.seen.filter((e) => e.kind === 'end').length, 1);
   assert.equal(port.records[1].suppressed, true);
   assert.equal(port.records[1].ok, true);
+  assert.equal(port.failures.length, 0, '접수된 종료의 중복은 실패가 아니다');
+});
+
+test('접수되지 않은 종료는 "중복 흡수"로 삼키지 않는다 — 다음 종료가 매체에 닿는다', b, async () => {
+  // 이 파일의 전제가 곧 이 경로다: "고객 끊음과 Core 종료가 겹치면 반드시 생긴다"는 것은
+  // **같은 통화에 종료가 두 번 온다**는 뜻이고, 첫 번째가 회선 장애로 거부된 상태에서 두 번째가
+  // 오는 것이 바로 그 시각의 모양이다. 멱등 표식이 시도 앞에 있던 동안 두 번째는 성공
+  // (`suppressed`)으로 기록되고 회선·세션은 **내려가지 않은 채** 남았다 — 그 시간은 장애가
+  // 아니라 §11.2 요금으로 나타나고, 기록은 "한 번 실패했고 그 다음은 중복"으로 읽힌다.
+  let attempts = 0;
+  const seen = [];
+  const t = {
+    name: 'flaky',
+    async deliver(env) {
+      attempts += 1;
+      if (attempts === 1) throw new Error('회선 거부');
+      seen.push(env.kind);
+    },
+  };
+  const port = m.createChannelPort({ id: 'callbot', activation: 'live', approvalRef: 'T', transport: t });
+  await port.end('i1', '고객 종료');
+  assert.equal(port.failures.length, 1, '첫 시도는 실패로 남는다');
+  await port.end('i1', '고객 종료');
+  assert.deepEqual(seen, ['end'], '두 번째 종료가 매체에 닿아야 한다');
+  assert.equal(port.records.length, 2);
+  assert.equal(port.records[1].ok, true);
+  assert.equal(port.records[1].suppressed, undefined, '접수되지 않은 종료를 중복으로 적으면 안 된다');
+  // 접수된 뒤에는 종전대로 흡수한다 — 매체를 세 번 내리지 않는다.
+  await port.end('i1', '고객 종료');
+  assert.deepEqual(seen, ['end']);
+  assert.equal(port.records[2].suppressed, true);
+});
+
+test('예산 초과 종료도 접수되지 않은 것으로 보고 재시도를 허용한다(경계: 타임아웃)', b, async () => {
+  // `surfaced` 가 타임아웃을 "접수되지 않았다"로 읽는 것과 같은 저울이다. 여기서 흡수하면
+  // 정착하지 않은 회선 하나가 **영구히 열린 세션**이 된다(사람이 손대기 전까지).
+  let attempts = 0;
+  const t = {
+    name: 'hang-once',
+    deliver: () => {
+      attempts += 1;
+      return attempts === 1 ? new Promise(() => {}) : Promise.resolve();
+    },
+  };
+  const port = m.createChannelPort({
+    id: 'chatbot', activation: 'live', approvalRef: 'T', transport: t, timeoutMs: 20,
+  });
+  await port.end('i1', '종료');
+  assert.equal(port.failures[0].errorCode, 'E_TIMEOUT');
+  await port.end('i1', '종료');
+  assert.equal(attempts, 2, '예산 초과를 중복으로 흡수하면 다시 내릴 기회가 사라진다');
+  assert.equal(port.records[1].ok, true);
+});
+
+test('dry_run 의 종료는 접수로 적히므로 중복은 종전대로 흡수된다', b, async () => {
+  const t = recording();
+  const port = m.createChannelPort({ id: 'dars', transport: t });
+  await port.end('i1', '종료');
+  await port.end('i1', '종료');
+  assert.equal(t.seen.length, 0);
+  assert.equal(port.records[1].suppressed, true);
 });
 
 test('전송된 steps 는 동결 복사본이라 원본 이력이 오염되지 않는다', b, async () => {
@@ -72,6 +133,78 @@ test('전송된 steps 는 동결 복사본이라 원본 이력이 오염되지 �
   await port.present('i1', original);
   assert.equal(JSON.stringify(original), snapshot);
   assert.equal(mutated, true, '동결된 복사본이어야 한다');
+});
+
+test('중첩 필드까지 동결돼 §8.1 이력이 오염되지 않는다(각주·선택지·축소 지시)', b, async () => {
+  // 얕은 동결은 `ui.items`·`citations`·`outage.disabled` 를 **원본과 같은 참조로** 넘긴다.
+  // 하필 그 셋이 "채널이 고쳐 쓰면 안 된다"고 적어 둔 값들이다: 각주를 다시 번호 매기면 본문의
+  // [n] 과 어긋나 고객이 다른 출처를 보고, 선택지를 다시 정렬하면 고객이 말한 번호와 다른
+  // 인텐트가 확정되고, 축소 지시를 고치면 §9.3 판정과 실제 동작이 갈라진다 — 원본까지 고쳐지면
+  // 그 거짓이 추가 전용 원장에 남는다.
+  const blocked = [];
+  const t = {
+    name: 'nested-mut',
+    async deliver(env) {
+      const s = env.steps[0];
+      for (const [what, mutate] of [
+        ['citation', () => { s.citations[0].marker = 9; }],
+        ['citations-push', () => { s.citations.push({ marker: 2, title: '가짜' }); }],
+        ['ui-items', () => { s.ui.items.reverse(); }],
+        ['ui-label', () => { s.ui.items[0].label = '변조'; }],
+        ['outage', () => { s.outage.disabled.push('speech_recognition'); }],
+        ['reprompt', () => { s.reprompt.attempt = 99; }],
+      ]) {
+        try { mutate(); } catch { blocked.push(what); }
+      }
+    },
+  };
+  const port = m.createChannelPort({ id: 'chatbot', activation: 'live', approvalRef: 'T', transport: t });
+  const original = [{
+    channel: 'chat', nodeId: 'n_ans', kind: 'Choice', text: '어느 쪽일까요 [1]',
+    ui: { type: 'buttons', items: [{ label: '잔액', value: 'balance' }, { label: '재발급', value: 'reissue' }] },
+    citations: [{ marker: 1, title: '수수료 안내' }],
+    outage: { disabled: ['voice_synthesis'], reasonKo: '축소 운영' },
+    reprompt: { reason: 'no_input', attempt: 2, exhausted: false },
+  }];
+  const snapshot = JSON.stringify(original);
+  await port.present('i1', original);
+  assert.equal(JSON.stringify(original), snapshot, '중첩 값이 원본 참조로 나갔다');
+  assert.deepEqual(
+    blocked.sort(),
+    ['citation', 'citations-push', 'outage', 'reprompt', 'ui-items', 'ui-label'],
+    '변조가 조용히 통과하면 그 포트는 "고쳐 썼는데 아무 일도 없었다"로 운영된다',
+  );
+  // 이 transport 는 변조 예외를 스스로 삼켰으므로 전달 자체는 접수된다.
+  assert.equal(port.failures.length, 0);
+});
+
+test('변조를 삼키지 않는 transport 에서는 그 시도가 전송 실패로 남는다(§13-3)', b, async () => {
+  // 조용히 넘기면 그 포트는 "고쳐 썼는데 아무 일도 없었다"로 운영된다 — 기록에 남아야 고친다.
+  const t = { name: 'mut', async deliver(env) { env.steps[0].citations[0].marker = 9; } };
+  const port = m.createChannelPort({ id: 'chatbot', activation: 'live', approvalRef: 'T', transport: t });
+  const original = [{ channel: 'chat', nodeId: 'n1', kind: 'Say', text: '답변 [1]', citations: [{ marker: 1, title: 'x' }] }];
+  await port.present('i1', original);        // 예외가 위로 새면 Core 턴이 통째로 죽는다
+  assert.equal(original[0].citations[0].marker, 1);
+  assert.equal(port.failures.length, 1);
+  assert.equal(port.failures[0].errorCode, 'E_TRANSPORT');
+});
+
+test('중첩 값을 읽기만 하는 transport 는 종전대로 통과한다(경계)', b, async () => {
+  const read = [];
+  const t = {
+    name: 'reader',
+    async deliver(env) {
+      for (const s of env.steps) read.push(`${s.ui?.items?.length ?? 0}/${s.citations?.length ?? 0}`);
+    },
+  };
+  const port = m.createChannelPort({ id: 'dars', activation: 'live', approvalRef: 'T', transport: t });
+  await port.present('i1', [{
+    channel: 'visual', nodeId: 'n1', kind: 'Choice', text: '고르세요',
+    ui: { type: 'buttons', items: [{ label: 'A', value: 'a' }] },
+    citations: [{ marker: 1, title: 'x' }],
+  }]);
+  assert.deepEqual(read, ['1/1']);
+  assert.equal(port.failures.length, 0);
 });
 
 test('실측 시계를 주입하면 소요시간이 기록되고, 없으면 만들어 넣지 않는다', b, async () => {

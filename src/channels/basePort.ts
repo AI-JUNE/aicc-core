@@ -125,6 +125,36 @@ function safeErrorText(e: unknown): string {
   return maskPii(raw).text;
 }
 
+/**
+ * transport 에 넘길 **동결 깊은 복사본**을 만든다(§8.1).
+ *
+ * 종전에는 단계 하나를 `Object.freeze({ ...s })` 로 **한 겹만** 얼렸다. 그런데 Core 가 단계에
+ * 싣는 값 중 뒤에 붙은 것들은 전부 **중첩**이다 — `ui.items`(선택지 라벨·값) · `citations`
+ * (지식 응대 각주) · `outage.disabled`(§9.3 끌 기능 목록) · `reprompt` · `disclosure`. 얕은
+ * 동결은 그 객체들을 **원본과 같은 참조로** 넘기므로 transport 가 고치면 **Core 쪽 배열이
+ * 고쳐진다**: 같은 배열이 그 턴의 §8.1 이벤트·이력·턴 결과에 쓰인다.
+ *
+ * 하필 그 중첩 값들이 "채널이 고쳐 쓰면 안 된다"고 적어 둔 바로 그 값들이다(`conformance.ts`
+ * 의 INTENT_CLARIFY·KNOWLEDGE_ANSWER·OUTAGE_HINTS 문구): 각주를 다시 번호 매기면 본문의
+ * `[n]` 과 어긋나 고객이 다른 출처를 보고, 선택지를 다시 정렬하면 고객이 말한 번호와 **다른
+ * 인텐트가 확정되며**, 축소 지시를 고쳐 쓰면 §9.3 판정과 실제 동작이 갈라진다 — 그리고
+ * 원본까지 고쳐지면 그 거짓이 **원장에 남는다**. 어느 쪽도 예외가 아니다.
+ *
+ * **얼리기 전에 복사한다.** 원본의 중첩 객체를 그대로 얼리면 Core 가 가진 객체가 얼고, 그건
+ * 베이스가 할 일이 아니다(이 파일은 전달만 한다) — 복사하면 Core 는 종전과 완전히 같다.
+ * 변조 시도는 strict mode 에서 예외가 되고, 그 예외는 전송 실패로 기록된다(§13-3 — 조용히
+ * 무시하면 그 포트는 "고쳐 썼는데 아무 일도 없었다"로 운영된다).
+ */
+function frozenDeepCopy<T>(v: T): T {
+  if (Array.isArray(v)) return Object.freeze(v.map((x) => frozenDeepCopy(x))) as unknown as T;
+  if (typeof v === 'object' && v !== null) {
+    const out: Record<string, unknown> = {};
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) out[k] = frozenDeepCopy(val);
+    return Object.freeze(out) as unknown as T;
+  }
+  return v;
+}
+
 async function withTimeout(p: Promise<void>, ms: number | undefined): Promise<void> {
   if (ms === undefined) return p;
   // 예산을 넘긴 뒤 뒤늦게 거부되는 promise 가 unhandled rejection 으로 프로세스를 죽이지 않게 한다.
@@ -154,8 +184,9 @@ async function withTimeout(p: Promise<void>, ms: number | undefined): Promise<vo
  *     **예외는 두 지시다**(`surfaced`): 기존 IVR 회귀·전환 초대는 거부가 Core 에 닿아야
  *     대체 경로가 돌기 때문에 접수되지 않았으면 올린다 — 같은 반환이 "접수했다"는 뜻이므로,
  *     삼키면 Core 는 아무 지시도 닿지 않은 통화를 "IVR 로 내렸다"·"링크를 보냈다"로 적는다.
- *  2) steps 는 동결 복사본으로 넘긴다. 같은 배열이 §8.1 이벤트·이력에 쓰이므로,
- *     transport 가 실수로 건드려도 Core 쪽 이력이 오염되지 않아야 한다.
+ *  2) steps 는 **중첩까지 동결한** 복사본으로 넘긴다. 같은 배열이 §8.1 이벤트·이력에 쓰이므로,
+ *     transport 가 실수로 건드려도 Core 쪽 이력이 오염되지 않아야 한다 — 한 겹만 얼리면
+ *     `ui.items`·`citations`·`outage.disabled` 가 원본 참조로 나간다(`frozenDeepCopy`).
  */
 export function createChannelPort(opts: ChannelPortOptions): BaseChannelPort {
   // **모르는 어댑터 id 를 여기서 막는다**(§2·§5.3). 아래 어긋남 검사로는 걸리지 않는다:
@@ -276,7 +307,9 @@ export function createChannelPort(opts: ChannelPortOptions): BaseChannelPort {
 
     async present(interactionId: string, steps: RenderedStep[]): Promise<void> {
       // 표시할 것이 없는 턴(Api 대기 등)에서도 예외 없이 지나가야 한다.
-      const copy = Object.freeze(steps.map((s) => Object.freeze({ ...s })));
+      // 중첩까지 얼린 복사본을 넘긴다 — 얕은 동결은 `ui.items`·`citations`·`outage.disabled` 를
+      // 원본 참조로 흘려 보내고, 그것을 고치면 §8.1 이력이 고쳐진다(`frozenDeepCopy` 주석).
+      const copy = Object.freeze(steps.map((s) => frozenDeepCopy(s)));
       await run(
         { interactionId, adapter: opts.id, channel: capabilities.channel, kind: 'present', steps: copy },
         { kind: 'present', interactionId, stepCount: copy.length },
@@ -291,17 +324,39 @@ export function createChannelPort(opts: ChannelPortOptions): BaseChannelPort {
       );
     },
 
+    /**
+     * 매체 내리기. **중복은 흡수하되, 접수되지 않은 종료는 흡수하지 않는다.**
+     *
+     * 멱등 표식을 시도 **뒤**로 옮긴 이유(2026-10-31): 종전에는 `ended.add` 가 전달보다 앞에
+     * 있어서, 첫 종료가 매체에서 거부되거나 예산 안에 정착하지 않으면 **그 뒤의 모든 종료가
+     * "중복 종료 흡수"로 성공 처리**됐다. 이 파일의 전제가 곧 그 경로다 — "고객 끊음과 Core
+     * 종료가 겹치면 반드시 생긴다"는 것은 **같은 통화에 종료 지시가 두 번 온다**는 뜻이고,
+     * 첫 번째가 실패한 상태에서 두 번째가 오는 것이 바로 회선 장애 시각의 모양이다.
+     *
+     * 그 상태의 증상은 전부 조용하다: 회선·세션은 **내려가지 않은 채** 남고(그 시간은 장애가
+     * 아니라 §11.2 요금으로 나타난다), 기록에는 실패 1건 + 성공(`suppressed`) 1건이 남아
+     * 운영은 "한 번 실패했고 그 다음은 중복이라 흡수했다"로 읽는다 — 즉 **다시 내릴 기회가
+     * 있었다는 사실 자체가 지워진다**. `onFailure` 를 붙인 호스트조차 재시도할 길이 없다.
+     *
+     * 되돌릴 수 있는 쪽은 한 번 더 내리는 것이다: 계약은 포트가 **모르는 세션을 무해하게
+     * 흡수할 것**을 이미 요구하므로(`UNKNOWN_SESSION`) 이미 내려간 회선에 온 두 번째 지시는
+     * 무해하고, 반대쪽(내려가지 않은 회선)은 사람이 손대기 전까지 열려 있다. 예산 초과도
+     * 같게 다룬다 — `surfaced` 가 타임아웃을 "접수되지 않았다"로 읽는 것과 같은 저울이다.
+     */
     async end(interactionId: string, reasonKo: string): Promise<void> {
       if (ended.has(interactionId)) {
         // 고객 끊음과 Core 종료가 겹치면 반드시 생기는 상황이다. 매체를 두 번 내리지 않는다.
         push({ kind: 'end', interactionId, ok: true, simulated: true, suppressed: true, detail: '중복 종료 흡수' });
         return;
       }
+      // 시도 중에 들어온 두 번째 종료는 막는다(재진입은 매체를 두 번 내린다) — 접수되지
+      // 않았으면 아래에서 표식을 거둔다. 그래서 흡수되는 것은 **접수된 종료의 중복**뿐이다.
       ended.add(interactionId);
-      await run(
+      const record = await run(
         { interactionId, adapter: opts.id, channel: capabilities.channel, kind: 'end', reasonKo },
         { kind: 'end', interactionId, detail: maskPii(reasonKo).text },
       );
+      if (!record.ok) ended.delete(interactionId);
     },
   };
 

@@ -141,6 +141,11 @@ agent.py 에 넣을 것은 훅마다 한 줄이다(이 파일은 agent.py 를 im
        링크를 이 호스트가 직접 만든다면 `include_switch_ticket=True` 로 켠다.
      - 전환 배선이 없어 토큰 없이 초대했다(`tokenless`) → 링크의 열쇠가 곧 id 인 **종전 상태**다.
      - 발급에 실패했다(`not_issued_ko`) → **링크를 보내서는 안 된다**. 사유를 운영에 알린다.
+   그리고 위 넷과 **직교하는 사실** 하나를 따로 읽는다(`not_delivered_ko`): 발급은 됐는데
+   **초대 지시가 매체에서 거부돼 링크가 나가지 않았다**. 발급 실패와 섞지 않는다 — 고칠 곳이
+   다르다(앞은 전환 배선·수신 확인, 뒤는 그 시각의 발송 경로다). 이 칸을 읽지 않으면 호스트가
+   보는 것은 `ticket_issued=True` 뿐이고 그러면 "링크를 보냈다"로 읽는데, 세션은 이미 화면
+   채널로 옮겨 가 있어 그 통화는 아무도 손쓰지 않는 채 끝난다(고객은 오지 않는 화면을 기다린다).
 14. **Core 가 끝낸 세션에는 더 보내지 않는다(§5.3·§8.1).** 세션을 끝내는 주체가 호스트만이
    아니다 — End 노드 도달·재시도 소진 이관·Api 순회 상한·장애 폴백은 Core 가 그 턴에서
    세션을 닫는다. 닫힌 세션에 온 입력은 **오류가 아니라 멱등 처리**라 `ok: True`·`events`
@@ -190,7 +195,9 @@ ConsentHook = Callable[[str, Dict[str, Any]], None]
 #: §7 5.2 준수 점검 요약. 세션이 끝난 응답에만 실리므로 통화당 한 번 불린다.
 ComplianceHook = Callable[[str, Dict[str, Any]], None]
 #: (call_id, {"to_channel", "from_channel", "ticket_issued", "token_included", "token",
-#: "expires_at", "tokenless", "not_issued_ko"}) — §5.2 전환 초대. 전환이 일어난 턴에만 불린다.
+#: "expires_at", "tokenless", "not_issued_ko", "not_delivered_ko"}) — §5.2 전환 초대.
+#: 전환이 일어난 턴에만 불린다. `not_delivered_ko` 는 **발급은 됐으나 지시가 매체에 접수되지
+#: 않은** 사유이며 발급 실패(`not_issued_ko`)와 **직교한다** — 고칠 곳이 다르다.
 #: 링크를 보내는 것은 **호스트**이며, 토큰이 없으면 **id 로 만들지 않는다**(머리말 13번).
 SwitchHook = Callable[[str, Dict[str, Any]], None]
 #: (call_id, status) — Core 가 이 세션을 닫았다. 통화당 한 번 불린다(머리말 14번).
@@ -270,6 +277,11 @@ class HookStats:
     switch_tokenless: int = 0
     #: 발급에 **실패한** 건수. 그 전환은 링크를 보내서는 안 된다(사유는 응답에 있다).
     switch_tickets_unissued: int = 0
+    #: 발급은 됐는데 **초대 지시가 매체에서 거부된** 건수(링크가 나가지 않았다). 위 넷과
+    #: **직교한다** — 토큰을 받은 건에서도 난다. 발급 실패와 합쳐 세지 않는다: 저쪽은 전환
+    #: 배선·수신 확인이고 이쪽은 그 시각의 발송 경로(SMS·알림톡 게이트웨이)라 고칠 곳이 다르다.
+    #: 이 수만큼 고객은 **오지 않는 화면을 기다린다** — 세션은 이미 화면 채널로 옮겨 가 있다.
+    switch_not_delivered: int = 0
     #: Core 가 **먼저 닫은** 세션 수(통화당 한 번). End 노드 도달·재시도 소진 이관·Api 순회
     #: 상한·장애 폴백이 전부 여기로 온다 — 호스트 종료(`calls_ended`)와 다른 숫자다.
     calls_closed_by_core: int = 0
@@ -1250,6 +1262,14 @@ class CallbotCoreHooks:
         - **네 상태를 섞지 않는다**: 토큰 수신 · 발급됐으나 토큰 미실림(이 호스트의 스위치) ·
           토큰 없는 초대(Core 쪽 배선 없음) · 발급 실패(링크를 보내면 안 된다). 합쳐 세면
           "링크를 못 보낸다"는 한 숫자가 되고, 고칠 곳이 셋으로 갈린다.
+        - **전달 거부는 그 넷과 직교한다**(`notDeliveredKo`): 발급은 됐고 토큰까지 왔는데
+          **초대 지시가 매체에서 거부돼 링크가 나가지 않은** 경우다. 그래서 위 사다리에 끼우지
+          않고 따로 본다 — 끼우면 토큰을 받은 건에서는 영영 보이지 않는다. 읽지 않으면 호스트가
+          보는 것은 `ticket_issued=True` 뿐이고, 그러면 "링크를 보냈다"로 읽는다. 세션은 이미
+          화면 채널로 옮겨 가 있어 그 통화는 아무도 손쓰지 않는 채 끝난다 — 하필 전환을 고른
+          이유가 인식 실패라 그 고객은 이미 두 번 되묻힌 상태이고, §5.1 사다리는 전환 칸을
+          썼으므로 상담사로 내려가지도 않는다. **발급 실패와 합쳐 세지 않는다**(고칠 곳이
+          다르다 — 앞은 전환 배선·수신 확인, 뒤는 그 시각의 발송 경로다).
         - **id 를 토큰 자리에 넣지 않는다**(§10.3): 어댑터는 `interaction_id` 를 이 payload 에
           담지 않는다 — 담으면 "토큰이 없으면 id 로 만든다"는 경로를 여기서 열어 주는 셈이다.
         - **턴 사실이라 되풀이되지 않는다**: Core 는 끝난 세션의 늦은 입력에 전환 초대를 싣지
@@ -1267,6 +1287,8 @@ class CallbotCoreHooks:
         tokenless = invite.get("tokenless") is True
         not_issued_ko = invite.get("notIssuedKo")
         not_issued_ko = not_issued_ko if isinstance(not_issued_ko, str) and not_issued_ko else None
+        not_delivered_ko = invite.get("notDeliveredKo")
+        not_delivered_ko = not_delivered_ko if isinstance(not_delivered_ko, str) and not_delivered_ko else None
         if token_included:
             self.stats.switch_tokens_received += 1
         elif ticket_issued:
@@ -1284,6 +1306,15 @@ class CallbotCoreHooks:
             self.stats.switch_tickets_unissued += 1
             self._report("E_SWITCH_NOT_ISSUED",
                          "전환 초대가 발급되지 않아 링크를 보내지 않아야 합니다. 사유는 응답에 있습니다.")
+        if not_delivered_ko is not None:
+            # 위 사다리와 **별개로** 센다(직교한다 — 토큰을 받은 건에서도 난다). **알린다**:
+            # 링크가 나가지 않은 것을 말해 주는 경로가 이 칸 하나뿐이고(통화는 오류 없이
+            # 계속 돌아간다), 세션은 이미 화면 채널로 옮겨 가 있다. 사유 원문은 싣지 않는다 —
+            # 발송 오류 문구는 Core 가 마스킹했지만 이 훅의 규칙은 "원문을 싣지 않는다"다(§10.3).
+            self.stats.switch_not_delivered += 1
+            self._report("E_SWITCH_NOT_DELIVERED",
+                         "전환 초대 지시가 매체에서 거부돼 링크가 나가지 않았습니다. "
+                         "세션은 이미 화면 채널로 옮겨 갔습니다 — 사유는 응답에 있습니다.")
         if self._on_switch is None:
             return
         from_channel = invite.get("fromChannel")
@@ -1298,6 +1329,7 @@ class CallbotCoreHooks:
             "expires_at": expires_at if isinstance(expires_at, str) and expires_at else None,
             "tokenless": tokenless,
             "not_issued_ko": not_issued_ko,
+            "not_delivered_ko": not_delivered_ko,
         }
         try:
             self._on_switch(call_id, payload)

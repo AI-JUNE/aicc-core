@@ -15,7 +15,6 @@
 //   if (!report.passed) process.exit(1);
 import type { ChannelKind } from '../domain/types.ts';
 import type { Flow, RenderedStep } from '../flow/types.ts';
-import { maskPii } from '../core/policyGuard.ts';
 import type { SwitchTicket } from '../core/executeSwitch.ts';
 import { DISCLOSURE_NODE_ID } from '../core/executeDisclosure.ts';
 import { CLARIFY_NODE_ID, renderClarifyStep } from '../nlu/executeIntentEntry.ts';
@@ -329,9 +328,19 @@ export async function runChannelConformance(opts: ConformanceOptions): Promise<C
   }
 
   // 9) 오류 메시지 개인정보(§10.3) — 실패를 알리되 원문을 되뱉으면 로그·오류리포트에 개인정보가 남는다.
+  //
+  //    **탐침을 마스킹해서 넣지 않는다**(2026-10-31). 종전에는 `maskPii(PII_PROBE).text` 를 단계
+  //    본문에 넣고 **원문**이 오류에 섞였는지를 봤다 — 포트에 원문을 준 적이 없으므로 그 판정은
+  //    언제나 거짓이었고, 즉 이 검사는 **아무것도 확인하지 않은 채 통과**했다. 입력을 오류에
+  //    그대로 되뱉는 포트(`throw new Error(JSON.stringify(steps))` 가 가장 흔한 모양이다)가
+  //    전 검사를 지나간 셈이다.
+  //    단계 본문에는 마스킹되지 않은 값이 실린다 — §10.3 은 **저장·로그** 경로의 규칙이고,
+  //    고객에게 자기 번호를 읽어 주지 못하면 상담이 성립하지 않는다(지식 응대 답변 본문·
+  //    업무시스템 조회 결과가 그대로 실리는 자리다). 그래서 포트가 받는 값은 원문이고,
+  //    **원문을 오류·로그로 옮기지 않는 것**이 포트의 책임이다.
+  //    실패 문구에는 탐침 값을 싣지 않는다(이 보고서가 곧 CI 로그다).
   {
-    const masked = maskPii(PII_PROBE).text;
-    const r = await withBudget(() => port.present('i_probe_pii', [step(channel, `연락처는 ${masked} 입니다`)]), budget);
+    const r = await withBudget(() => port.present('i_probe_pii', [step(channel, `연락처는 ${PII_PROBE} 입니다`)]), budget);
     const leaked = r.ok === false && !('timeout' in r) && errText((r as { error: unknown }).error).includes(PII_PROBE);
     add({
       id: 'PII_SAFE_ECHO',

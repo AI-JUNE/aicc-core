@@ -200,11 +200,35 @@ class BridgeResponse:
         링크에 쓸 1회용 토큰(`token`)은 `include_switch_ticket=True` 로 띄운 클라이언트에만
         실린다. 실리지 않았는데(`tokenIncluded` 가 False) 링크를 만들어야 한다면 **만들지 말고
         그 사실을 운영에 알린다** — Interaction id 로 만든 링크는 1회용도 만료도 회수도 없다(§10.3).
+
+        발급 여부(`ticketIssued`)와 **전달 여부는 다른 질문이다**: 초대 지시가 매체에서 거부되면
+        `notDeliveredKo` 가 함께 온다(`switch_not_delivered_ko` 로 읽는다). 그 칸을 읽지 않으면
+        호스트가 보는 것은 `ticketIssued: True` 뿐이고 그러면 "링크를 보냈다"로 읽는다.
         """
         if not self.ok or not isinstance(self.result, dict):
             return None
         invite = self.result.get("switchInvite")
         return invite if isinstance(invite, dict) else None
+
+    @property
+    def switch_not_delivered_ko(self) -> Optional[str]:
+        """§5.2 초대 지시가 **매체에 접수되지 않은** 사유. 접수됐으면 None.
+
+        발급 실패(`notIssuedKo`)와 **직교한다** — 토큰까지 받은 턴에서도 실린다. 고칠 곳이
+        다르기 때문에 Core 가 따로 적는다: 발급 쪽은 전환 배선·수신 확인이고, 이쪽은 그 시각의
+        발송 경로(SMS·알림톡 게이트웨이)다. 같게 읽으면 운영은 발급 설정을 뒤지는데 실제로
+        죽은 것은 게이트웨이다.
+
+        이 사유는 노출 스위치와 무관하게 온다(열쇠도 개인정보도 없는 마스킹된 문구다, §10.3) —
+        읽지 않으면 그 통화는 **아무도 손쓰지 않는 채** 끝난다: 세션은 이미 화면 채널로 옮겨
+        갔고 고객은 오지 않는 화면을 기다리며, §5.1 사다리는 전환 칸을 썼으므로 상담사로도
+        내려가지 않는다. 그 턴은 오류로 끝나지 않는다(`ok` 는 True 다).
+        """
+        invite = self.switch_invite
+        if invite is None:
+            return None
+        value = invite.get("notDeliveredKo")
+        return value if isinstance(value, str) and value else None
 
     @property
     def handoff(self) -> Optional[Dict[str, Any]]:

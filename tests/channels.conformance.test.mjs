@@ -149,6 +149,32 @@ test('오류 메시지에 개인정보 원문을 담는 구현을 잡는다(§10
   assert.equal(r.checks.find((c) => c.id === 'PII_SAFE_ECHO').passed, false);
 });
 
+test('받은 단계를 오류에 그대로 되뱉는 구현을 잡는다 — 탐침이 마스킹돼 있으면 영영 못 잡는다(§10.3)', b, async () => {
+  // 가장 흔한 모양은 원문을 손으로 적는 포트가 아니라 **입력을 그대로 되뱉는** 포트다
+  // (`throw new Error(JSON.stringify(steps))`). 탐침을 마스킹해서 넣던 동안 이 포트는
+  // 전 검사를 통과했다 — 포트에 원문을 준 적이 없으므로 "원문이 섞였나"는 언제나 거짓이었다.
+  const port = m.createDryRunPort({ id: 'chatbot' });
+  port.present = async (id, steps) => {
+    throw new Error(`전송 실패(${id}): ${JSON.stringify(steps)}`);
+  };
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  const check = r.checks.find((c) => c.id === 'PII_SAFE_ECHO');
+  assert.equal(check.passed, false);
+  assert.equal(r.passed, false);
+  // 보고서 자체가 CI 로그다 — 탐침 값을 실패 문구에 싣지 않는다.
+  assert.equal(JSON.stringify(r).includes('010-1234-5678'), false);
+  assert.equal(m.formatConformanceReport(r).includes('010-1234-5678'), false);
+});
+
+test('단계를 삼키지 않고 지나가는 구현은 그대로 통과한다(§10.3 — 단계 본문은 마스킹 대상이 아니다)', b, async () => {
+  // 단계 본문에는 마스킹되지 않은 값이 실린다(고객에게 자기 번호를 읽어 주지 못하면 상담이
+  // 성립하지 않는다). §10.3 이 요구하는 것은 **그 값을 오류·로그로 옮기지 않는 것**이다.
+  for (const id of ['callbot', 'chatbot', 'dars']) {
+    const r = await m.runChannelConformance({ port: m.createDryRunPort({ id }), timeoutMs: 500 });
+    assert.equal(r.checks.find((c) => c.id === 'PII_SAFE_ECHO').passed, true, id);
+  }
+});
+
 test('능력만 선언하고 구현이 없으면 정적 계약에서 등록 거부로 잡는다', b, async () => {
   const port = m.createDryRunPort({ id: 'callbot' });
   delete port.invite;   // crossChannelInvite=true 인데 구현 제거
