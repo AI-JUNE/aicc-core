@@ -13,6 +13,7 @@
     "./channels/bridge": "./src/channels/bridge.ts",
     "./channels/bridgeTranscript": "./src/channels/bridgeTranscript.ts",
     "./flow/types": "./src/flow/types.ts",
+    "./knowledge/rag": "./src/knowledge/rag.ts",
     "./conformance-runner": "./scripts/channel-conformance.mjs",
     "./bridge-runner": "./scripts/channel-bridge.mjs",
     "./transcript-runner": "./scripts/bridge-transcript.mjs",

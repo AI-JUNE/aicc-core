@@ -57,6 +57,8 @@ export const CHANNEL_SUBPATHS: Readonly<Record<string, string>> = Object.freeze(
   // 비-Node 호스트가 자기 클라이언트 구현을 CI 에서 판정하는 경로.
   './channels/bridgeTranscript': './src/channels/bridgeTranscript.ts',
   './flow/types': './src/flow/types.ts',
+  // 단위 제품(GOWON Platform 지식 검색)이 근거 판정 계약을 소비하는 경로.
+  './knowledge/rag': './src/knowledge/rag.ts',
   './conformance-runner': './scripts/channel-conformance.mjs',
   './bridge-runner': './scripts/channel-bridge.mjs',
   './transcript-runner': './scripts/bridge-transcript.mjs',

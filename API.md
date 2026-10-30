@@ -8,7 +8,7 @@ Core 는 **순수 라이브러리**다. 서버를 띄우지 않고, 엔진·회�
 - import 경로는 **package.json 의 exports 맵**으로 고정돼 있다(소스 파일을 옮겨도 채널이 깨지지 않는다):
   `import { createConversationCore } from 'aicc-core/channels/runtime'`
   - 채널 계약 경로(안정): `aicc-core/channels/{contract,basePort,conformance,profiles,runtime,bridge}` ·
-    `aicc-core/flow/types` · `aicc-core/conformance-runner` · `aicc-core/bridge-runner`
+    `aicc-core/flow/types` · `aicc-core/knowledge/rag` · `aicc-core/conformance-runner` · `aicc-core/bridge-runner`
   - 호스트(관리 포털·배치)용: `aicc-core/internal/<경로>` — **안정 계약이 아니다.** 이름에 그렇게 적어 뒀다.
   - 저장소를 직접 참조해 쓸 때는(레지스트리 배포는 **[승인 필요]**) `file:` 의존성으로 건다:
     `"aicc-core": "file:../6. AICC-Core"`
