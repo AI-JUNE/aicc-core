@@ -61,6 +61,20 @@ test('인자 해석: timeout 미지정이면 예산을 만들어 넣지 않는�
   assert.equal(cfg.timeoutMs, undefined);
 });
 
+test('--adapter 허용값은 채널 계약 하나에서 온다(§2) — 사본을 두면 새 채널만 게이트를 못 돌린다', async () => {
+  const C = await import('../src/channels/contract.ts');
+  for (const id of C.CHANNEL_ADAPTER_IDS) {
+    const cfg = parseHarnessArgs(['--port', './p.mjs', '--adapter', id]);
+    assert.equal(cfg.adapter, id);
+    assert.deepEqual(cfg.issuesKo, []);
+  }
+  // 거절 문구도 같은 목록에서 만든다 — 손으로 적으면 안내와 판정이 갈린다.
+  const bad = parseHarnessArgs(['--port', './p.mjs', '--adapter', 'calbot']);
+  assert.equal(bad.adapter, undefined);
+  assert.equal(bad.issuesKo.length, 1);
+  for (const id of C.CHANNEL_ADAPTER_IDS) assert.ok(bad.issuesKo[0].includes(id));
+});
+
 // ── 모듈에서 포트 꺼내기 ──────────────────────────────────────────────────────
 
 test('포트 해석: default·port·팩토리 세 관습을 모두 받는다', () => {

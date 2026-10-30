@@ -230,3 +230,93 @@ test('전환 티켓은 transport 로 그대로 가고 기록에는 토큰이 남
   assert.equal(seen[1].ticket, undefined);
   assert.match(port.records.filter((r) => r.kind === 'invite')[1].detail, /ticket=없음/);
 });
+
+// ── 접수되지 않은 지시는 Core 에 알린다 (§9.3·§5.2) ─────────────────────────
+// 베이스는 "메서드는 던지지 않는다"가 원칙이지만, 기존 IVR 회귀와 전환 초대는 **Core 가
+// 접수되지 않은 경우에 할 일을 정해 둔 두 지시**다(회귀 거부 → 상담사 이관, 초대 거부 →
+// 사유를 턴 결과에 싣고 턴의 나머지를 내보낸다). 그 대체는 거부가 Core 에 닿아야만 돈다 —
+// 삼키던 동안 이 베이스를 쓰는 저장소에서는 두 대체가 **한 번도 돌 수 없었다**.
+
+test('§9.3 회귀가 매체에서 거부되면 베이스가 Core 에 올린다 — 삼키면 이관이 돌지 않는다', b, async () => {
+  const notified = [];
+  const port = m.createChannelPort({
+    id: 'callbot',
+    capabilities: { adapter: 'callbot', channel: 'voice', dtmf: true, richUi: false, speech: true, transferToAgent: true, routeToLegacyIvr: true, crossChannelInvite: true },
+    activation: 'live',
+    approvalRef: 'T',
+    transport: { name: 'broken', async deliver() { throw new Error('IVR 게이트웨이 장애'); } },
+    onFailure: (r) => notified.push(r),
+  });
+  await assert.rejects(
+    () => port.routeToLegacyIvr('i1', '엔진 장애로 기존 IVR 로 돌립니다'),
+    (e) => e.code === 'E_TRANSPORT' && /접수되지 않았습니다/.test(e.message),
+  );
+  // 실패 기록·통지는 **그대로 남는다** — 올리는 것이 적는 것을 대신하지 않는다.
+  assert.equal(port.failures.length, 1);
+  assert.equal(notified.length, 1);
+});
+
+test('§5.2 초대가 매체에서 거부되면 베이스가 Core 에 올린다', b, async () => {
+  const port = m.createChannelPort({
+    id: 'callbot',
+    activation: 'live',
+    approvalRef: 'T',
+    transport: { name: 'broken', async deliver() { throw new Error('알림톡 발송 거부'); } },
+  });
+  await assert.rejects(() => port.invite('i1', 'visual'), (e) => e.code === 'E_TRANSPORT');
+  assert.equal(port.failures.length, 1);
+});
+
+test('올리는 사유에 개인정보 원문이 섞이지 않는다(§10.3)', b, async () => {
+  const port = m.createChannelPort({
+    id: 'callbot',
+    activation: 'live',
+    approvalRef: 'T',
+    transport: { name: 'leaky', async deliver() { throw new Error('수신번호 010-1234-5678 발송 거부'); } },
+  });
+  // Core 는 이 문구를 경고·턴 결과에 싣는다 — 여기서 새면 그 두 곳에 그대로 남는다.
+  await assert.rejects(() => port.invite('i1', 'visual'), (e) => !e.message.includes('010-1234-5678'));
+});
+
+test('예산 초과도 접수되지 않은 것으로 올린다(경계: 타임아웃)', b, async () => {
+  const port = m.createChannelPort({
+    id: 'callbot',
+    capabilities: { adapter: 'callbot', channel: 'voice', dtmf: true, richUi: false, speech: true, transferToAgent: true, routeToLegacyIvr: true, crossChannelInvite: true },
+    activation: 'live', approvalRef: 'T', timeoutMs: 20,
+    transport: { name: 'hang', deliver: () => new Promise(() => {}) },
+  });
+  await assert.rejects(() => port.routeToLegacyIvr('i1', '엔진 장애'), (e) => e.code === 'E_TIMEOUT');
+});
+
+test('나머지 세 지시는 종전대로 던지지 않는다 — Core 에 대체 경로가 없다', b, async () => {
+  const port = m.createChannelPort({
+    id: 'callbot', activation: 'live', approvalRef: 'T',
+    transport: { name: 'broken', async deliver() { throw new Error('회선 거부'); } },
+  });
+  await port.present('i1', [step('voice')]);
+  await port.transfer('i1', 'q_vip', '요약');
+  await port.end('i1', '종료');
+  assert.equal(port.failures.length, 3);
+});
+
+test('dry_run 에서는 두 지시도 접수로 끝난다 — 적합성 검사가 실회선 없이 돌아야 한다', b, async () => {
+  const port = m.createChannelPort({
+    id: 'callbot',
+    capabilities: { adapter: 'callbot', channel: 'voice', dtmf: true, richUi: false, speech: true, transferToAgent: true, routeToLegacyIvr: true, crossChannelInvite: true },
+    transport: { name: 'broken', async deliver() { throw new Error('부르지 않아야 한다'); } },
+  });
+  await port.routeToLegacyIvr('i1', '엔진 장애');
+  await port.invite('i1', 'visual');
+  assert.equal(port.failures.length, 0);
+  assert.ok(port.records.every((r) => r.simulated));
+});
+
+test('모르는 어댑터 id 는 포트 생성 단계에서 거부된다(§2·§5.3)', b, () => {
+  assert.throws(
+    () => m.createChannelPort({ id: 'calbot' }),
+    (e) => e.code === 'E_CONFIG' && /알 수 없는 채널 어댑터/.test(e.message),
+  );
+  // 아는 id 세 개는 그대로 만들어진다 — 목록은 계약 하나에서 온다.
+  const set = m.createChannelPortSet();
+  assert.deepEqual(Object.keys(set).sort(), ['callbot', 'chatbot', 'dars']);
+});

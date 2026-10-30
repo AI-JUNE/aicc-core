@@ -33,6 +33,30 @@ export const ADAPTER_CHANNEL: Record<ChannelAdapterId, ChannelKind> = {
 };
 
 /**
+ * 어댑터 id 목록 — **이 표 하나에서 파생시킨다**(§2).
+ *
+ * 손으로 적어 둔 사본이 세 벌이었다(적합성 실행기의 `--adapter` 허용값 · 베이스 포트 묶음 ·
+ * 관측 허용 목록). 값이 같았으므로 증상은 없었지만, **채널이 하나 늘어나는 날 늘지
+ * 않은 쪽만 틀린다** — 그리고 세 사본의 어긋남이 전부 조용하다: 실행기는 그 채널의 CI 를
+ * `--adapter 값이 올바르지 않습니다` 로 거절하고(그 저장소는 게이트를 아예 못 돌린다),
+ * 관측 허용 목록은 그 채널의 `adapter` 필드를 **로그·수집기 보고에서 빼므로** 그 채널의
+ * 실패만 어느 채널의 것인지 알 수 없는 상태로 남는다(`BRIDGE_OPS` 와 같은 자리다).
+ */
+export const CHANNEL_ADAPTER_IDS: readonly ChannelAdapterId[] = Object.keys(ADAPTER_CHANNEL) as ChannelAdapterId[];
+
+/**
+ * 계약 안에 있는 어댑터 id 인가. **`ADAPTER_CHANNEL` 의 키만** 참으로 본다.
+ *
+ * 왜 판정을 함수로 두는가: 모르는 id 는 **반쪽 능력 선언**을 만든다(`profileFor` 는
+ * `CHANNEL_PROFILES` 에 없는 id 에 `{ adapter: '오타', channel: undefined }` 를 돌려준다).
+ * 그 상태에서 `capabilities.channel !== ADAPTER_CHANNEL[port.id]` 는 `undefined !== undefined`
+ * 이므로 **참이 되지 않는다** — 즉 어긋남 검사가 통째로 통과한다(§5.3).
+ */
+export function isChannelAdapterId(v: unknown): v is ChannelAdapterId {
+  return typeof v === 'string' && Object.prototype.hasOwnProperty.call(ADAPTER_CHANNEL, v);
+}
+
+/**
  * 언어 중립 브리지(JSONL)의 op 목록 — **이 계약의 와이어 형태**다.
  *
  * 선언이 여기 있는 이유: 종전에는 세 모듈이 각자 목록을 들고 있었다(브리지 디스패치·
@@ -268,6 +292,20 @@ export interface SwitchInviteNote {
   /** 티켓이 없는 사유(운영·감사용). 고객 문안이 아니며 토큰은 실리지 않는다(§10.3). */
   notIssuedKo?: string;
   /**
+   * 초대 **지시가 매체에 접수되지 않은** 사유(§5.2·§9.3). 접수됐으면 실리지 않는다.
+   *
+   * 왜 발급 사유와 따로 적는가: `notIssuedKo` 는 "열쇠를 만들지 못했다"이고 이 칸은
+   * **"열쇠는 만들었는데 링크가 나가지 않았다"**다 — 고칠 곳이 다르다(앞은 전환 배선·
+   * 수신 확인, 뒤는 그 시각의 발송 경로다). 둘을 같게 적으면 운영은 발급 설정을 뒤지는데
+   * 실제로 죽은 것은 SMS·알림톡 게이트웨이다.
+   *
+   * 이 칸이 없던 동안 포트의 거부는 **턴을 통째로 예외로 끝냈다**: 세션은 이미 화면 채널로
+   * 바뀌고 이벤트도 발행됐는데 그 턴의 단계·이관·종료 지시는 **아무것도 나가지 않았다**
+   * (`channels/runtime.ts` 의 `deliverSwitchInvite` 주석). 포트 메서드의 반환은 "지시를
+   * 접수했다"까지만 뜻하므로 거부는 접수되지 않았다는 뜻이고, 그 사실은 사유로 남는다.
+   */
+  notDeliveredKo?: string;
+  /**
    * 1회용 합류 토큰. **Core 내부·Node 포트 경로에서만 채워진다** — 와이어로 내보내는 쪽은
    * 노출 스위치를 지나야 한다(§10.3). 세션에 보관되는 복사본에서는 제거된다(재발급 없이
    * 같은 토큰이 다음 응답에 다시 실리면 1회용이 무의미해진다).
@@ -409,6 +447,20 @@ export interface ChannelRegistration {
 
 export type ContractIssueCode =
   | 'E_VERSION_MISMATCH'
+  /**
+   * 포트가 밝힌 어댑터 id 가 **계약 밖**이다(오타·삭제된 id, §2·§5.3).
+   *
+   * 이 판정이 없던 동안 그 포트는 등록도 되고 **적합성 게이트도 통과했다**. 모르는 id 는
+   * `profileFor` 에서 `{ adapter: '오타', channel: undefined }` 라는 반쪽 능력 선언을 받고,
+   * 그러면 아래 채널 어긋남 검사가 `undefined !== undefined` 로 거짓이 되어 지나간다 —
+   * 그 상태의 적합성 보고는 `[오타/undefined] 통과(오류 0)` 다. 능력 전부가 거짓이므로
+   * 전환 초대·기존 IVR 회귀 검사는 **"해당 없음"** 으로 적히고(선언하지 않은 채널과 같은
+   * 모양이다), 검사 단계는 `channel: undefined` 로 렌더돼 매체 모양을 한 번도 보지 않는다.
+   * 즉 **CI 는 초록인데 확인된 것이 없다** — 브리지는 같은 오타를 기동 시점에 거절한다(§2).
+   *
+   * 되돌릴 수 있는 쪽은 등록 거절이므로 error 다(`E_FOREIGN_COMPONENT` 와 같은 저울).
+   */
+  | 'E_UNKNOWN_ADAPTER'
   | 'E_CHANNEL_MISMATCH'
   | 'E_MISSING_CAPABILITY_IMPL'
   | 'E_UNDECLARED_COMPONENT'
@@ -426,6 +478,12 @@ export type ContractIssueCode =
    * 교차채널 초대를 할 수 있는 채널이 등록됐는데 전환 배선이 없다(§5.2·§10.3).
    * 이 상태의 합류는 **Interaction id 하나로 통과**하므로, 링크를 본 사람은 누구나
    * 진행 중인 상담 화면을 열 수 있다. 금지는 아니지만(종전 동작) 운영이 반드시 알아야 한다.
+   *
+   * **같은 코드가 통화 중에도 난다**(`W_FALLBACK_LEGACY_IVR` 과 같은 규칙): 전환 초대를
+   * 발급하지 못한 경우 · 수신 가능 확인(`reachable`)이 예외로 끝난 경우 · 발급은 됐는데
+   * **초대 지시가 매체에서 거부된 경우**(발송 경로 장애)다. 마지막 것은 고객이 링크를
+   * 받지 못한 유일한 신호이며, 세션은 이미 화면 채널로 옮겨 가 있다 — 사유는 턴 결과의
+   * `switchInvite.notDeliveredKo` 에도 함께 남는다(비-Node 호스트가 읽는 자리다, §5.2).
    */
   | 'W_CHANNEL_SWITCH_UNBOUND'
   /** 고지 설정은 실렸으나 일부 채널 문구가 비어 있는 등, 막지는 않되 운영이 알아야 하는 상태(§10.1). */
@@ -688,7 +746,18 @@ export function validateRegistration(reg: ChannelRegistration): ContractIssue[] 
   if (port.capabilities.adapter !== port.id) {
     issues.push({ code: 'E_CHANNEL_MISMATCH', severity: 'error', messageKo: `capabilities.adapter(${port.capabilities.adapter})가 포트 id(${port.id})와 다릅니다.` });
   }
-  if (port.capabilities.channel !== ADAPTER_CHANNEL[port.id]) {
+  // **모르는 id 를 먼저 거른다**(`E_UNKNOWN_ADAPTER` 주석). 아래 채널 어긋남 검사는 기대값이
+  // 있을 때만 의미가 있다 — 모르는 id 의 기대값은 `undefined` 이고, 그러면 "undefined 여야
+  // 합니다" 라는 문구와 함께 **능력 선언이 비어 있을 때만** 통과하는 검사가 된다.
+  if (!isChannelAdapterId(port.id)) {
+    issues.push({
+      code: 'E_UNKNOWN_ADAPTER',
+      severity: 'error',
+      messageKo: `알 수 없는 채널 어댑터입니다: ${String(port.id)} — 가능한 값은 `
+        + `${CHANNEL_ADAPTER_IDS.join('·')} 입니다. 모르는 id 의 능력 선언은 반쪽이고`
+        + '(채널이 비어 모든 능력이 거짓이다) 그 상태의 적합성 검사는 아무것도 확인하지 못한 채 통과합니다(§5.3).',
+    });
+  } else if (port.capabilities.channel !== ADAPTER_CHANNEL[port.id]) {
     issues.push({ code: 'E_CHANNEL_MISMATCH', severity: 'error', messageKo: `${port.id} 어댑터의 채널은 ${ADAPTER_CHANNEL[port.id]} 여야 합니다.` });
   }
   if (port.capabilities.routeToLegacyIvr && typeof port.routeToLegacyIvr !== 'function') {

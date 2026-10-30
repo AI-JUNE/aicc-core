@@ -536,10 +536,13 @@ const flowRetry = {
 };
 
 /** 전환이 실제로 일어나는 배치: 음성 + 화면 채널 등록 + 전환 배선(토큰 발급). */
-async function switchBridge(bridgeOver = {}, { wired = true } = {}) {
+async function switchBridge(bridgeOver = {}, { wired = true, denyInvite = false } = {}) {
   const CS = await import('../src/core/channelSwitch.ts');
   const callbot = BP.createChannelPort({ id: 'callbot' });
   const dars = BP.createChannelPort({ id: 'dars' });
+  // 발송 경로 장애(SMS·알림톡 게이트웨이). 포트의 반환은 "지시를 접수했다"까지만 뜻하므로
+  // 거부는 접수되지 않았다는 뜻이고, 그 사실이 호스트에 닿는 자리는 이 응답 하나뿐이다.
+  if (denyInvite) callbot.invite = async () => { throw new Error('알림톡 발송 거부'); };
   let n = 0;
   const core = R.createConversationCore({
     scope: SCOPE,
@@ -606,6 +609,25 @@ test('전환 배선이 없으면 "토큰 없는 링크"라는 사실이 호스�
   assert.equal(r.result.switchInvite.tokenless, true);
   assert.equal(r.result.switchInvite.tokenIncluded, false);
   assert.match(r.result.switchInvite.notIssuedKo, /세션의 열쇠/);
+});
+
+test('초대 지시가 거부되면 "링크가 나가지 않았다"가 호스트까지 간다 — 턴은 오류로 끝나지 않는다(§5.2)', b, async () => {
+  const r = await switchBridge({}, { denyInvite: true });
+  // 종전에는 이 응답이 `E_INTERNAL` 이었다 — 고객은 그 턴의 안내도 받지 못했다.
+  assert.equal(r.ok, true, JSON.stringify(r.error));
+  const s = r.result.switchInvite;
+  assert.equal(s.ticketIssued, true, '발급은 됐다 — 막힌 것은 발송이다');
+  assert.match(s.notDeliveredKo, /링크가 나가지 않았습니다/);
+  assert.equal(s.notIssuedKo, undefined, '고칠 곳이 다르므로 두 사유를 같게 적지 않는다');
+  // 노출 스위치와 무관하게 나간다(열쇠도 개인정보도 없다) — 감추면 호스트는 ticketIssued 만
+  // 보고 "링크를 보냈다"로 읽는다. 열쇠는 그대로 빠진다.
+  assert.equal(s.tokenIncluded, false);
+  assert.equal(JSON.stringify(r.result).includes('tk_sw_1'), false);
+});
+
+test('접수된 초대에는 발송 사유가 실리지 않는다(경계)', b, async () => {
+  const r = await switchBridge();
+  assert.equal('notDeliveredKo' in r.result.switchInvite, false);
 });
 
 test('전환이 없는 턴에는 실리지 않는다 — 매 턴 실리면 호스트가 링크를 다시 보낸다', b, async () => {

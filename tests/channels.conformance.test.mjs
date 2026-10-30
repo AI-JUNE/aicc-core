@@ -593,3 +593,83 @@ test('LEGACY_IVR_ROUTE: 선언만 하고 구현이 없는 상태도 오류로 �
   // 같은 사실을 REGISTRATION 도 적지만(등록 거부) 여기서는 **그 뒤에 무엇이 일어나는가**를 적는다.
   assert.match(c.messageKo, /상담사 이관으로 대신하고/);
 });
+
+// ── §5.2 전환 초대 접수 (CHANNEL_INVITE) ────────────────────────────────────
+// 티켓 흡수는 보고 있었지만 **지시를 접수하는가**(Promise 반환)는 보지 않았다. 그 구멍은
+// `LEGACY_IVR_ROUTE` 가 막은 것과 같다: Core 의 `await` 가 링크가 나가기 전에 통과하면
+// 그 뒤 발송 실패는 아무 데도 남지 않고, 결과에는 "티켓 발급됨" 만 남는다.
+
+test('CHANNEL_INVITE: 정상 구현은 통과하고 티켓 유무 양쪽으로 실제로 불린다', b, async () => {
+  const port = m.createDryRunPort({ id: 'callbot' });   // 기본 프로파일: crossChannelInvite=true
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  const c = r.checks.find((x) => x.id === 'CHANNEL_INVITE');
+  assert.equal(c.passed, true, c.messageKo);
+  assert.notEqual(c.skipped, true);
+  const invites = port.calls.filter((x) => x.method === 'invite');
+  assert.equal(invites.length, 2, '티켓 유무 양쪽으로 부르지 않았다');
+  assert.equal(invites.filter((x) => x.detail.includes('ticket=있음')).length, 1);
+  assert.equal(r.passed, true);
+});
+
+test('CHANNEL_INVITE: Promise 를 돌려주지 않는 초대를 잡는다 — 다른 검사는 전부 통과하는 포트다', b, async () => {
+  const port = m.createDryRunPort({ id: 'callbot' });
+  const seen = [];
+  port.invite = (id, target, ticket) => { seen.push([target, ticket !== undefined]); };   // 동기 구현
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  assert.equal(r.checks.find((x) => x.id === 'REGISTRATION').passed, true);
+  assert.equal(r.checks.find((x) => x.id === 'ASYNC_CONTRACT').passed, true);
+  const c = r.checks.find((x) => x.id === 'CHANNEL_INVITE');
+  assert.equal(c.passed, false);
+  assert.equal(c.severity, 'error');
+  assert.match(c.messageKo, /Promise 를 돌려주지 않습니다/);
+  // 불리기는 했다 — 즉 "모양은 맞고 접수 여부만 알 수 없는" 구현이 바로 이 검사의 대상이다.
+  assert.equal(seen.length, 2);
+  assert.equal(r.passed, false);
+});
+
+test('CHANNEL_INVITE: 거부·미정착도 오류로 잡는다(경계)', b, async () => {
+  const deny = m.createDryRunPort({ id: 'callbot' });
+  deny.invite = async () => { throw new Error('알림톡 발송 거부'); };
+  const rDeny = await m.runChannelConformance({ port: deny, timeoutMs: 500 });
+  const cDeny = rDeny.checks.find((x) => x.id === 'CHANNEL_INVITE');
+  assert.equal(cDeny.passed, false);
+  assert.match(cDeny.messageKo, /전환 초대에서 실패했습니다/);
+
+  const hang = m.createDryRunPort({ id: 'callbot' });
+  hang.invite = () => new Promise(() => {});   // 영원히 정착하지 않는다
+  const rHang = await m.runChannelConformance({ port: hang, timeoutMs: 30 });
+  const cHang = rHang.checks.find((x) => x.id === 'CHANNEL_INVITE');
+  assert.equal(cHang.passed, false);
+  assert.match(cHang.messageKo, /예산 초과/);
+});
+
+// ── 모르는 어댑터 id (§2·§5.3) ──────────────────────────────────────────────
+// 브리지는 같은 오타를 기동 시점에 거절한다. 적합성 게이트는 통과시켰다 —
+// 모르는 id 의 능력 선언은 `{ adapter: '오타', channel: undefined }` 라서 채널 어긋남 검사가
+// `undefined !== undefined` 로 거짓이 되고, 능력 전부가 거짓이라 선택 메서드 검사는
+// "해당 없음" 으로 적힌다. 즉 **CI 는 초록인데 확인된 것이 없었다**.
+
+test('오타 난 어댑터 id 는 적합성 게이트가 거절한다 — 통과로 적지 않는다', b, async () => {
+  const port = m.createDryRunPort({ id: 'calbot' });
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  const c = r.checks.find((x) => x.id === 'REGISTRATION');
+  assert.equal(c.passed, false, `오타 난 id 가 통과했다: ${m.formatConformanceReport(r)}`);
+  assert.match(c.messageKo, /알 수 없는 채널 어댑터입니다/);
+  assert.equal(r.passed, false);
+  assert.equal(r.errorCount >= 1, true);
+});
+
+test('아는 어댑터 세 개는 그대로 통과한다 — 거절은 계약 밖 id 뿐이다(경계)', b, async () => {
+  const C = await import('../src/channels/contract.ts');
+  assert.deepEqual([...C.CHANNEL_ADAPTER_IDS], Object.keys(C.ADAPTER_CHANNEL));
+  for (const id of C.CHANNEL_ADAPTER_IDS) {
+    const r = await m.runChannelConformance({ port: m.createDryRunPort({ id }), timeoutMs: 500 });
+    assert.equal(r.checks.find((x) => x.id === 'REGISTRATION').passed, true, `${id} 가 거절됐다`);
+    assert.equal(r.channel, C.ADAPTER_CHANNEL[id]);
+  }
+  assert.equal(C.isChannelAdapterId('callbot'), true);
+  assert.equal(C.isChannelAdapterId('calbot'), false);
+  // 프로토타입 체인으로 통과하지 않는다(`hasOwnProperty` 로 본다).
+  assert.equal(C.isChannelAdapterId('toString'), false);
+  assert.equal(C.isChannelAdapterId(undefined), false);
+});

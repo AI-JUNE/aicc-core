@@ -69,7 +69,7 @@ import type { LogContext, LogLevel, Logger } from './logger.ts';
 import type { CaptureContext, ErrorMonitor, ErrorReport } from './errorMonitor.ts';
 import { normalizeError } from './errorMonitor.ts';
 import type { ChannelAdapterId, ChannelTurnResult } from '../channels/contract.ts';
-import { BRIDGE_OPS } from '../channels/contract.ts';
+import { BRIDGE_OPS, CHANNEL_ADAPTER_IDS, isChannelAdapterId } from '../channels/contract.ts';
 import type { HealthSample, HealthState } from '../ops/fallback.ts';
 
 export const OBSERVABILITY_CONTRACT_VERSION = 1;
@@ -88,8 +88,16 @@ export const OP_EVENT: Record<CoreOp, string> = {
 /** 식별자 길이 상한. 긴 값이 모든 로그 줄을 밀어내지 않게 한다. */
 const MAX_ID_LEN = 128;
 
-/** 알려진 어댑터 — 계약 밖 문자열을 로그에 그대로 싣지 않기 위한 허용 목록. */
-const KNOWN_ADAPTERS: readonly string[] = ['callbot', 'chatbot', 'dars'];
+/**
+ * 알려진 어댑터 — 계약 밖 문자열을 로그에 그대로 싣지 않기 위한 허용 목록.
+ *
+ * 목록은 **채널 계약 하나**에서 온다(§2 — `BRIDGE_OPS` 와 같은 자리다). 사본을 들고
+ * 있던 동안, 채널이 하나 늘어나면 **늘어난 것을 모르는 이쪽만 틀렸다**: 그 채널의
+ * `adapter` 는 허용 목록에 없으므로 로그 필드·수집기 보고에서 조용히 빠지고, 그러면
+ * 그 채널의 실패만 **어느 채널의 것인지 알 수 없는 상태**로 쌓인다(사후분석에서 필요한
+ * 셋 중 하나가 그 값이다). 예외는 나지 않는다.
+ */
+const KNOWN_ADAPTERS: readonly string[] = CHANNEL_ADAPTER_IDS;
 
 export type LoggableId =
   | { ok: true; value: string }
@@ -737,7 +745,10 @@ export function reportRef(report: ErrorReport | undefined): { fingerprint: strin
   return report === undefined ? undefined : { fingerprint: report.fingerprint, code: report.code };
 }
 
-/** 어댑터 문자열이 계약 안에 있는가. 로그에 싣기 전 확인용. */
+/**
+ * 어댑터 문자열이 계약 안에 있는가. 로그에 싣기 전 확인용.
+ * 판정은 계약 하나를 빌려 온다(§2) — 목록과 판정을 따로 적으면 한쪽만 고쳐진다.
+ */
 export function isKnownAdapter(value: unknown): value is ChannelAdapterId {
-  return typeof value === 'string' && KNOWN_ADAPTERS.includes(value);
+  return isChannelAdapterId(value);
 }

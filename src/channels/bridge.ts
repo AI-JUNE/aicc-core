@@ -161,6 +161,15 @@ export interface BridgeSwitchInvitePayload {
   expiresAt?: string;
   tokenless?: boolean;
   notIssuedKo?: string;
+  /**
+   * 초대 **지시가 매체에 접수되지 않은** 사유(§5.2). 접수됐으면 실리지 않는다.
+   *
+   * 노출 스위치와 무관하게 나간다 — 여기에는 열쇠도 개인정보도 없고(Core 가 마스킹한 사유
+   * 문구뿐이다), 감추면 호스트는 **링크가 나가지 않았다는 사실**을 알 길이 없다. 그 호스트가
+   * 보게 되는 것은 `ticketIssued: true` 뿐이고, 그러면 "링크를 보냈다"로 읽는다 — 세션은
+   * 이미 화면 채널로 옮겨 가 있으므로 그 통화는 아무도 손쓰지 않는 채 끝난다.
+   */
+  notDeliveredKo?: string;
   token?: string;
 }
 
@@ -880,6 +889,7 @@ function projectTurn(r: ChannelTurnResult, opts: BridgeOptions): BridgeTurnPaylo
       ...(s.expiresAt !== undefined ? { expiresAt: s.expiresAt } : {}),
       ...(s.tokenless === true ? { tokenless: true } : {}),
       ...(s.notIssuedKo !== undefined ? { notIssuedKo: s.notIssuedKo } : {}),
+      ...(s.notDeliveredKo !== undefined ? { notDeliveredKo: s.notDeliveredKo } : {}),
       ...(tokenIncluded ? { token: s.token } : {}),
     };
   }

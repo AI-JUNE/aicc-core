@@ -382,6 +382,20 @@ test('계약 밖 어댑터 문자열은 로그에 싣지 않는다', b, () => {
   assert.equal(O.isKnownAdapter('nope'), false);
 });
 
+test('허용 목록은 채널 계약 하나에서 온다(§2) — 사본이면 새 채널의 실패만 익명으로 쌓인다', b, async () => {
+  const C = await import('../src/channels/contract.ts');
+  for (const id of C.CHANNEL_ADAPTER_IDS) {
+    assert.equal(O.isKnownAdapter(id), true, `${id} 가 허용 목록에 없다 — 사본이 낡았다`);
+    const w = wiring();
+    const d = w.observer.record({
+      op: 'health', scope: SCOPE, adapter: id,
+      health: { adapter: id, registered: true, offered: 0, accepted: [], ignored: 0 },
+    });
+    // 이 값이 빠지면 그 채널의 실패만 **어느 채널의 것인지 알 수 없는 상태**로 남는다.
+    assert.equal(d.fields.adapter, id);
+  }
+});
+
 test('샘플 0건 보고는 "상태를 올렸다"로 읽지 않는다', b, () => {
   const w = wiring();
   const d = w.observer.record({

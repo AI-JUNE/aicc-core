@@ -558,6 +558,91 @@
         `tests/channels.runtime.test.mjs`(7건 추가, 총 224건) ·
         `fixtures/reference-engines.mjs`(지식 파생 선언 예시) · `API.md` 반영
 - [ ] 채널 어댑터 계약 실적용 — Callbot·챗봇·D-ARS가 Core를 실제로 소비하도록 연결
+      · Core 측 완료(89): **초대가 거절되면 그 턴이 통째로 사라졌고, 베이스 포트가 그 거절을
+        삼켰고, 초대를 접수하는지 아무도 묻지 않았고, 오타 난 어댑터로 적합성 게이트가
+        통과했다(2026-10-30)** — 넷 다 **§5.2 전환 초대의 "접수했는가"가 어느 자리에서도
+        확인되지 않아서** 갈라지는 결함이다(§5.2·§9.3·§2·§5.3). (88)이 §9.3 기존 IVR 회귀
+        쪽에서 같은 네 자리를 고쳤고, 여기는 **나머지 한 지시**(초대)와 그 거절이 지나는 길이다.
+        전부 예외가 아니다 — 평시에는 네 자리 모두 전 검사를 통과한다.
+        - **초대 지시가 거절되면 그 턴의 나머지가 아무 데도 가지 않았다**(`channels/runtime.ts`
+          `deliverSwitchInvite`). 거부는 그대로 호출자까지 올라갔고, 전달은 `present` **보다
+          앞**이라 그 뒤에 남은 것이 없다: 세션은 이미 화면 채널로 바뀌고 `state.channel` 기준
+          렌더가 확정되고 이벤트도 발행됐는데 **그 턴의 단계·이관 지시·종료 지시는 하나도
+          나가지 않는다**. 통화 중인 고객은 링크도 못 받고 그 턴의 안내도 못 듣고, 호스트는
+          Core 예외를 수집기에 쌓는다 — 하필 전환을 고른 이유가 **인식 실패**라 그 고객은 이미
+          두 번 되묻힌 상태이고, §5.1 사다리는 전환 칸을 썼으므로 상담사로 내려가지도 않는다.
+          거절을 "접수했다"로 읽지 않는 근거는 (88)과 같은 계약 문구다(`ChannelPort` — 반환은
+          "지시를 접수했다"까지만 뜻한다). 다만 여기서 할 **대체 지시는 없다**: 링크를 보낼 다른
+          경로가 Core 에 없고(발송 수단은 호스트 설정이다, §13-3) 세션을 음성으로 되돌리면 이미
+          발급된 토큰·발행된 이벤트와 어긋난다. 그래서 하는 일은 둘이다 — **사실을 남기고**
+          (`W_CHANNEL_SWITCH_UNBOUND` + 턴 결과의 `switchInvite.notDeliveredKo`) **턴의 나머지를
+          그대로 내보낸다**. 발급 사유(`notIssuedKo`)와 **따로** 적는다: 고칠 곳이 다르다(앞은
+          전환 배선·수신 확인, 뒤는 그 시각의 발송 경로다) — 같게 적으면 운영은 발급 설정을
+          뒤지는데 실제로 죽은 것은 게이트웨이다. 사유는 호스트가 만든 문구라 `maskPii` 를
+          지난다(§10.3 — 발송 오류 문구에 수신번호가 섞이는 현장이 있다).
+        - **베이스 포트가 그 거절을 삼켰다**(`channels/basePort.ts`). 베이스는 "메서드는 예외를
+          던지지 않는다"가 원칙이고(계약이 "접수했다"까지만 약속한다) 실패를 `failures`·
+          `onFailure` 로만 적었다. 그런데 Core 가 **접수되지 않은 경우에 할 일을 정해 둔 지시는
+          둘**이고(회귀 거부 → 상담사 이관, 초대 거부 → 위 항목), 그 대체는 **거부가 Core 에
+          닿아야만** 돈다 — 즉 이 베이스를 쓰는 저장소 세 곳에서는 (88)이 만든 대체가 **한 번도
+          돌 수 없었다**. 그 상태의 §9.3 은 더 나쁘다: Core 는 `routedToIvr = true` 로 보고
+          이관을 **건너뛰며** 원장에는 "IVR 로 내렸다"가 남는다(아무 지시도 닿지 않았다).
+          `onFailure` 를 붙인 호스트는 전송 실패를 알지만, 그 시점에 고객을 어디로 보낼지
+          판정할 수 있는 것은 Core 뿐이다. 그래서 그 **두 지시만** 올린다(`surfaced`):
+          `present`·`transfer`·`end` 는 종전대로 던지지 않는다(Core 에 대체 경로가 없고, 거기서
+          던지면 통화 자체가 끊긴다). 기록·통지는 그대로 남고 `dry_run` 도 종전과 같다 —
+          적합성 검사는 실회선 없이 돌아야 한다. 올리는 사유는 이미 마스킹을 지난 문구다(§10.3 —
+          Core 가 그것을 경고·턴 결과에 싣는다).
+        - **초대가 지시를 접수하는지 스위트가 묻지 않았다**(`channels/conformance.ts`
+          `CHANNEL_INVITE`). 티켓 흡수·비변형·능력 선언 일치는 보고 있었는데 **반환값은 보지
+          않았다** — (88)이 `LEGACY_IVR_ROUTE` 에서 막은 것과 같은 구멍이고 남아 있던 쪽이
+          여기다. Promise 를 돌려주지 않는 초대 구현에서는 Core 의 `await` 가 **링크가 나가기
+          전에** 통과하고, 그 뒤 발송 경로의 실패는 아무 데도 남지 않는다(결과에는
+          `ticketIssued: true` 만 남고 세션은 이미 화면 채널이다). 예산 검사도 같이 무력화된다 —
+          정착을 기다릴 Promise 가 없으면 매달린 발송이 즉시 통과한다. **무엇을 하는지는 검사하지
+          않는다**(§13-3): 링크 문자열·발송 수단은 포트 안의 일이고, 그 사실은 종전처럼 실패
+          문구에 못박아 둔다.
+        - **오타 난 어댑터 id 로 적합성 게이트가 통과했다**(`channels/contract.ts`
+          `E_UNKNOWN_ADAPTER`). (88)이 브리지 기동에서 막은 것과 **같은 오타, 다른 게이트**다.
+          모르는 id 는 `profileFor` 에서 `{ adapter: '오타', channel: undefined }` 라는 반쪽 능력
+          선언을 받고, 그러면 채널 어긋남 검사가 `undefined !== undefined` 로 **거짓이 되어
+          지나간다**. 실측 출력이 `[calbot/undefined] 채널 계약 v1 적합성: 통과 (오류 0 · 경고 0)`
+          였다 — 능력 전부가 거짓이므로 전환 초대·기존 IVR 회귀는 **"해당 없음"** 으로 적히고
+          (선언하지 않은 채널과 같은 모양이다) 검사 단계는 `channel: undefined` 로 렌더돼 매체
+          모양을 한 번도 보지 않는다. 즉 **CI 는 초록인데 확인된 것이 없고**, 그 포트는 Core
+          등록까지 통과한다. 되돌릴 수 있는 쪽은 등록 거절이므로 거기서 막고(브리지·
+          `E_FOREIGN_COMPONENT` 와 같은 저울), 같이 **목록 사본 세 벌을 하나로 모았다**(§2):
+          어댑터 id 목록·판정은 `ADAPTER_CHANNEL` 에서 파생시킨다(`CHANNEL_ADAPTER_IDS`·
+          `isChannelAdapterId`). 사본이던 동안의 결말은 전부 조용했다 — 채널이 하나 늘면
+          실행기는 그 저장소의 CI 를 `--adapter 값이 올바르지 않습니다` 로 거절하고(게이트를
+          아예 못 돌린다), 관측 허용 목록은 그 채널의 `adapter` 를 **로그·수집기 보고에서 빼므로**
+          그 채널의 실패만 어느 채널의 것인지 알 수 없는 상태로 쌓인다.
+        **변이 검증(도구 출력 그대로)**: 초대 거절 처리를 빼면 3건 실패 · 거절 사유를 결과에
+        싣지 않으면 3건 실패 · 브리지 투영에서 그 사유를 빼면 1건 실패 · 베이스의 접수 판정을
+        빼면 4건 실패 · 베이스의 모르는 어댑터 검사를 빼면 1건 실패 · 적합성의 초대 Promise
+        검사를 빼면 1건 실패 · 등록의 모르는 어댑터 검사를 빼면 1건 실패 · 어댑터 목록을
+        사본으로 되돌리면 3건 실패 — 전부 원본에서는 통과한다.
+        **같이 고친 검사 결함**: `tests/channels.contract.test.mjs` 의 포트·등록 헬퍼가
+        `...over` 를 **뒤에** 펴서 `over.capabilities`·`over.port` 를 합치는 대신 **덮어썼다** —
+        그래서 "채널이 어긋난 포트"를 본다던 등록 검사 세 건은 실제로 **어댑터 id 가 없는 포트**를
+        보고 통과하고 있었다(`present`·`transfer`·`end` 도 없는 객체였다).
+        실호출 없음(가짜 포트·드라이런 포트·가짜 transport 로만 검증 — `live` 베이스 포트 검사도
+        전송 구현이 가짜다). 실발신(SMS·알림톡)·실회선 IVR 회귀 연결은 **[승인 필요]**.
+        남은 것은 호스트·채널 저장소 몫이다 — 발송 수단·재발송 정책은 §13-3 테넌트 값이고,
+        Core 는 지시와 거절 처리·사실 기록만 책임진다.
+        근거: `src/channels/runtime.ts`(`deliverSwitchInvite` 의 거절 처리·`notDeliveredKo` 적용) ·
+        `src/channels/contract.ts`(`E_UNKNOWN_ADAPTER`·`CHANNEL_ADAPTER_IDS`·`isChannelAdapterId`·
+        `SwitchInviteNote.notDeliveredKo`) · `src/channels/basePort.ts`(`surfaced`·기동 시점
+        어댑터 검사) · `src/channels/conformance.ts`(`CHANNEL_INVITE` 의 Promise 판정) ·
+        `src/channels/bridge.ts`(`BridgeSwitchInvitePayload.notDeliveredKo`) ·
+        `src/channels/harness.ts`·`src/obs/executeObservability.ts`(목록 단일화) ·
+        `tests/channels.runtime.test.mjs`(3건 추가, 총 279건) ·
+        `tests/channels.runtime.fallbackWiring.test.mjs`(1건 추가, 총 22건) ·
+        `tests/channels.basePort.test.mjs`(6건 추가, 총 27건) ·
+        `tests/channels.conformance.test.mjs`(5건 추가, 총 52건) ·
+        `tests/channels.bridge.test.mjs`(2건 추가, 총 71건) ·
+        `tests/channels.harness.test.mjs`(1건 추가) · `tests/obs.executeObservability.test.mjs`(1건 추가) ·
+        `tests/channels.contract.test.mjs`(헬퍼 결함 수정) · `API.md` 반영
       · Core 측 완료(88): **§9.3 회귀를 아무도 불러 본 적이 없고, 거절되면 고객이 아무 데도
         가지 않았고, 오타 난 어댑터로도 브리지가 기동했고, 열쇠가 섞인 기록이 게이트를
         지났다(2026-10-29)** — 넷 다 **계약을 지키는지 보는 자리(게이트)가 반쪽**이어서

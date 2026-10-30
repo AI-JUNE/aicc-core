@@ -192,6 +192,34 @@ test('거절 사유는 마스킹을 지난다 — 회선 오류 문구에 발신
   assert.equal(/010-1234-5678/.test(w.messageKo), false, '경고 문구에 개인정보 원문이 남았다');
 });
 
+test('베이스 포트로 붙인 채널에서도 그 대체가 돈다 — 거절을 삼키면 한 번도 돌지 않는다', b, async () => {
+  // 위 검사들은 **손으로 만든 포트**가 던진다는 전제다. 저장소 3곳이 실제로 쓰는 경로는
+  // `createChannelPort` 이고, 그 베이스가 전송 실패를 `failures` 로만 적고 성공을 돌려주던
+  // 동안 이 대체는 그 배치에서 **한 번도 돌 수 없었다** — Core 는 "IVR 로 내렸다"로 적고
+  // 이관은 하지 않는다(§9.3·`basePort.ts` 의 `surfaced`).
+  const BP = await import('../src/channels/basePort.ts');
+  const notified = [];
+  const port = BP.createChannelPort({
+    id: 'callbot',
+    capabilities: P.profileFor('callbot', { routeToLegacyIvr: true }),
+    activation: 'live',
+    approvalRef: 'TEST-ONLY-NO-REAL-LINE',
+    transport: {
+      name: 'ivr-down',
+      async deliver(env) { if (env.kind === 'routeToLegacyIvr') throw new Error('IVR 게이트웨이 응답 없음'); },
+    },
+    onFailure: (r) => notified.push(r),
+  });
+  const { core } = build({ port, samples: [sample('llm', 'down')], policy: { legacyIvrAvailable: true, fallbackQueue: 'q_care' } });
+  const r = await core.start(reqOf());
+  assert.equal(r.fallback.mode, 'legacy_ivr');
+  const transfer = port.records.find((x) => x.kind === 'transfer' && x.ok);
+  assert.ok(transfer, '회귀도 이관도 없이 끝났다 — 베이스가 거절을 삼켰다');
+  assert.ok(core.warnings().some((x) => x.code === 'W_FALLBACK_LEGACY_IVR' && /거절돼 상담사 이관으로 대신했습니다/.test(x.messageKo)));
+  // 실패 통지는 그대로 간다 — 올리는 것이 적는 것을 대신하지 않는다.
+  assert.equal(notified.filter((x) => x.kind === 'routeToLegacyIvr').length, 1);
+});
+
 test('거절 뒤 이관까지 실패하면 그 예외는 올린다 — 더 시도할 경로가 없다(경계)', b, async () => {
   const port = fakePort('callbot', {
     async routeToLegacyIvr() { throw new Error('IVR 거부'); },

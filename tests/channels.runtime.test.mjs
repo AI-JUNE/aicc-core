@@ -1265,6 +1265,61 @@ test('발급이 막힌 전환은 결과에 사유가 적힌다 — 링크를 보
   assert.equal(port.log.some((l) => l[0] === 'invite'), false, '매체 전달은 종전과 같이 하지 않는다');
 });
 
+// 초대 **지시가 거부된** 경우(발송 경로 장애). 종전에는 그 거부가 호출자까지 올라가 턴을
+// 통째로 끝냈다 — 세션은 이미 화면 채널로 바뀌고 이벤트도 발행됐는데 그 턴의 단계·이관·종료
+// 지시는 **아무것도 나가지 않았다**(전달이 `present` 보다 앞이다). 포트 메서드의 반환은
+// "지시를 접수했다"까지만 뜻하므로 거부는 접수되지 않았다는 뜻이고, Core 는 사실을 적고
+// 턴의 나머지를 그대로 내보낸다(§5.2·§9.3).
+
+test('초대 지시가 거부돼도 턴의 나머지는 나간다 — 예외로 끝내지 않는다(§5.2)', b, async () => {
+  const sw = switchWiring();
+  const port = fakePort('callbot', {}, {
+    async invite() { throw new Error('알림톡 발송 거부'); },
+  });
+  const { core } = build({ flows: [flowRetry], ports: [port, darsPort()], channelSwitch: sw.binding });
+  await core.start(req({ flowId: 'retry' }));
+  await core.send('i_test1', { input: { kind: 'timeout' } });
+  const before = port.log.filter((l) => l[0] === 'present').length;
+  const r = await core.send('i_test1', { input: { kind: 'timeout' } });
+
+  // 발급은 됐다 — 막힌 것은 발송이다(고칠 곳이 다르므로 사유를 따로 적는다).
+  assert.equal(r.switchInvite.ticketIssued, true);
+  assert.match(r.switchInvite.notDeliveredKo, /링크가 나가지 않았습니다/);
+  assert.match(r.switchInvite.notDeliveredKo, /알림톡 발송 거부/);
+  assert.equal(r.switchInvite.notIssuedKo, undefined, '발급 사유와 발송 사유를 같게 적지 않는다');
+  // 그 턴의 안내는 그대로 나간다 — 종전에는 이 호출이 통째로 예외였다.
+  assert.ok(port.log.filter((l) => l[0] === 'present').length > before, '거부가 그 턴의 단계를 삼켰다');
+  // 사실은 경고에도 남는다(운영이 발송 경로를 보러 갈 유일한 신호다).
+  const w = core.warnings().filter((i) => i.code === 'W_CHANNEL_SWITCH_UNBOUND');
+  assert.equal(w.length, 1);
+  assert.match(w[0].messageKo, /링크가 나가지 않았습니다/);
+});
+
+test('거부 사유에 개인정보 원문이 섞여 와도 마스킹 후 적는다(§10.3)', b, async () => {
+  const sw = switchWiring();
+  const port = fakePort('callbot', {}, {
+    async invite() { throw new Error('수신번호 010-1234-5678 발송 실패'); },
+  });
+  const { core } = build({ flows: [flowRetry], ports: [port, darsPort()], channelSwitch: sw.binding });
+  await core.start(req({ flowId: 'retry' }));
+  await core.send('i_test1', { input: { kind: 'timeout' } });
+  const r = await core.send('i_test1', { input: { kind: 'timeout' } });
+  const dump = JSON.stringify(r.switchInvite) + JSON.stringify(core.warnings());
+  assert.equal(dump.includes('010-1234-5678'), false);
+  assert.match(r.switchInvite.notDeliveredKo, /발송 실패/);
+});
+
+test('접수된 초대에는 발송 사유를 적지 않는다 — 없는 칸을 실패로 읽히게 하지 않는다(경계)', b, async () => {
+  const sw = switchWiring();
+  const port = fakePort();
+  const { core } = build({ flows: [flowRetry], ports: [port, darsPort()], channelSwitch: sw.binding });
+  await core.start(req({ flowId: 'retry' }));
+  await core.send('i_test1', { input: { kind: 'timeout' } });
+  const r = await core.send('i_test1', { input: { kind: 'timeout' } });
+  assert.equal(r.switchInvite.notDeliveredKo, undefined);
+  assert.equal(core.warnings().some((i) => i.code === 'W_CHANNEL_SWITCH_UNBOUND'), false);
+});
+
 test('전환 배선이 없으면 토큰 없는 초대라는 사실을 결과에 적는다(§5.2·§10.3)', b, async () => {
   const { core, port } = build({ flows: [flowRetry] });
   await core.start(req({ flowId: 'retry' }));

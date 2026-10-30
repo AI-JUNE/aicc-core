@@ -20,7 +20,7 @@ import type { Flow } from '../flow/types.ts';
 import { maskPii } from '../core/policyGuard.ts';
 import { shortenPaths, stripSecrets } from '../obs/errorMonitor.ts';
 import type { ChannelAdapterId, ChannelPort, ChannelRegistration } from './contract.ts';
-import { ADAPTER_CHANNEL } from './contract.ts';
+import { ADAPTER_CHANNEL, CHANNEL_ADAPTER_IDS, isChannelAdapterId } from './contract.ts';
 import type { ConformanceReport } from './conformance.ts';
 import { runChannelConformance } from './conformance.ts';
 
@@ -64,7 +64,10 @@ export interface HarnessResult {
   dryRunDeclared: boolean;
 }
 
-const KNOWN_ADAPTERS: readonly ChannelAdapterId[] = ['callbot', 'chatbot', 'dars'];
+// 허용값 목록은 **채널 계약 하나**에서 온다(§2 — `CHANNEL_ADAPTER_IDS` 주석). 손으로 적어
+// 두었던 동안, 채널이 하나 늘어나면 그 저장소는 `--adapter 값이 올바르지 않습니다` 로
+// **적합성 게이트 자체를 돌릴 수 없었다**(Core 등록·브리지는 그 id 를 받는다).
+const KNOWN_ADAPTERS: readonly ChannelAdapterId[] = CHANNEL_ADAPTER_IDS;
 
 /**
  * 예외 원문을 CI 로그에 올려도 되는 형태로 바꾼다(§10.3).
@@ -78,9 +81,8 @@ export function safeReasonText(e: unknown): string {
   return maskPii(stripSecrets(shortenPaths(raw))).text;
 }
 
-function isAdapterId(v: unknown): v is ChannelAdapterId {
-  return typeof v === 'string' && (KNOWN_ADAPTERS as readonly string[]).includes(v);
-}
+// 판정도 계약 하나다(§2) — 목록과 판정을 따로 적으면 한쪽만 고쳐진다.
+const isAdapterId = isChannelAdapterId;
 
 /**
  * argv 해석. 빈 입력·값 없는 플래그·음수 예산을 전부 issuesKo 로 모은다 —

@@ -42,7 +42,7 @@ export type ConformanceCheckId =
   | 'FLOW_SUPPORT'        // 선언한 능력으로 대상 Flow 를 렌더할 수 있는가(§5.3)
   | 'TURN_HINTS'          // 재시도·타이밍 힌트가 붙은 단계를 흡수하는가(§5.1)
   | 'CONNECTOR_WAIT'      // 한 턴에 present 가 두 번 와도(대기 안내 → 결과) 되는가(§6.1)
-  | 'CHANNEL_INVITE'      // 전환 초대에 티켓이 실려도 흡수하는가 — 링크는 토큰으로 만든다(§5.2·§10.3)
+  | 'CHANNEL_INVITE'      // 전환 초대를 티켓 유무 양쪽에서 **접수하는가**(Promise) — 링크는 토큰으로 만든다(§5.2·§10.3)
   | 'LEGACY_IVR_ROUTE'    // §9.3 기존 IVR 회귀를 **실제로** 수행하는가(선언만 보지 않는다)
   | 'AI_DISCLOSURE'       // 시나리오 노드가 아닌 AI 고지 단계를 그대로 내보내는가(§10.1·§7 7.4)
   | 'INTENT_CLARIFY'      // 시나리오에 없는 **선택지 단계**(명확화)를 렌더할 수 있는가(§5.1)
@@ -420,21 +420,40 @@ export async function runChannelConformance(opts: ConformanceOptions): Promise<C
       expiresAt: '2026-01-01T00:00:00.000Z',
     };
     const snapshot = JSON.stringify(ticket);
+    const inviteFn = port.invite as NonNullable<ChannelPort['invite']>;
     // 배선 전(티켓 없음)과 배선 후(티켓 있음)가 **둘 다** 동작해야 한다. 한쪽만 되는 구현은
     // 배선을 켜는 순간, 또는 되돌리는 순간 전환이 죽는다.
-    const bare = await withBudget(() => (port.invite as NonNullable<ChannelPort['invite']>)('i_probe_switch', 'visual'), budget);
-    const withTicket = await withBudget(() => (port.invite as NonNullable<ChannelPort['invite']>)('i_probe_switch', 'visual', ticket), budget);
+    //
+    // 반환값도 본다(`LEGACY_IVR_ROUTE`·`ASYNC_CONTRACT` 와 같은 이유): **Promise 를 돌려주지
+    // 않는 구현에서는 Core 의 `await` 가 링크가 나가기 전에 통과한다.** 그 뒤 발송 경로에서
+    // 실패해도 Core 는 초대를 접수된 것으로 적고, 그 턴의 결과에는 `ticketIssued: true` 만
+    // 남는다 — 고객은 오지 않는 화면을 기다리고 세션은 이미 화면 채널로 옮겨 가 있다(§5.2).
+    // 예산 검사도 같이 무력화된다: 정착을 기다릴 Promise 가 없으면 매달린 발송이 즉시 통과한다.
+    let bareReturned: unknown;
+    let ticketReturned: unknown;
+    const bare = await withBudget(() => {
+      bareReturned = inviteFn('i_probe_switch', 'visual');
+      return bareReturned as Promise<void>;
+    }, budget);
+    const withTicket = await withBudget(() => {
+      ticketReturned = inviteFn('i_probe_switch', 'visual', ticket);
+      return ticketReturned as Promise<void>;
+    }, budget);
     const unchanged = JSON.stringify(ticket) === snapshot;
+    const thenable = isThenable(bareReturned) && isThenable(ticketReturned);
     const failing = bare.ok !== true ? bare : withTicket;
     add({
       id: 'CHANNEL_INVITE',
-      passed: bare.ok === true && withTicket.ok === true && unchanged,
+      passed: bare.ok === true && withTicket.ok === true && unchanged && thenable,
       severity: 'error',
-      messageKo: bare.ok === true && withTicket.ok === true && unchanged
+      messageKo: bare.ok === true && withTicket.ok === true && unchanged && thenable
         ? '전환 초대를 티켓 유무 양쪽에서 흡수하고 티켓을 변형하지 않습니다. 티켓이 실리면 링크는 token 으로 만드세요 — interactionId 로 만들면 1회용·만료가 무의미해집니다(§5.2·§10.3).'
         : !unchanged
           ? '전환 티켓을 invite 가 변형했습니다. 같은 객체가 만료 안내·감사 기록에 쓰입니다(§5.2).'
-          : `전환 초대에서 실패했습니다: ${'timeout' in failing ? '예산 초과' : errText((failing as { error: unknown }).error)}. 모르는 인자는 무시하세요 — 전환 배선을 켜는 순간 전 전환이 깨집니다(§5.2).`,
+          : bare.ok === true && withTicket.ok === true && !thenable
+            ? 'invite 가 Promise 를 돌려주지 않습니다 — Core 의 await 가 링크가 나가기 전에 통과하고, '
+              + '그 뒤 발송 경로의 실패는 아무 데도 남지 않습니다(결과에는 "티켓 발급됨" 만 남고 고객은 오지 않는 화면을 기다립니다, §5.2).'
+            : `전환 초대에서 실패했습니다: ${'timeout' in failing ? '예산 초과' : errText((failing as { error: unknown }).error)}. 모르는 인자는 무시하세요 — 전환 배선을 켜는 순간 전 전환이 깨집니다(§5.2).`,
     });
   }
 

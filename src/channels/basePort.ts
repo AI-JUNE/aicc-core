@@ -20,7 +20,7 @@ import type { RenderedStep } from '../flow/types.ts';
 import { maskPii } from '../core/policyGuard.ts';
 import type { SwitchTicket } from '../core/executeSwitch.ts';
 import type { ChannelAdapterId, ChannelCapabilities, ChannelPort } from './contract.ts';
-import { ADAPTER_CHANNEL } from './contract.ts';
+import { ADAPTER_CHANNEL, CHANNEL_ADAPTER_IDS, isChannelAdapterId } from './contract.ts';
 import { profileFor } from './profiles.ts';
 
 /** http.ts 의 Activation 과 같은 뜻이다. 채널도 같은 규칙으로 잠근다. */
@@ -151,10 +151,22 @@ async function withTimeout(p: Promise<void>, ms: number | undefined): Promise<vo
  * 설계 결정 두 가지:
  *  1) 메서드는 예외를 던지지 않는다. 채널 계약이 "접수했다"까지만 약속하기 때문이다.
  *     대신 실패는 failures·onFailure 로 드러나고, 이 값이 §9.3 헬스 보고의 입력이 된다.
+ *     **예외는 두 지시다**(`surfaced`): 기존 IVR 회귀·전환 초대는 거부가 Core 에 닿아야
+ *     대체 경로가 돌기 때문에 접수되지 않았으면 올린다 — 같은 반환이 "접수했다"는 뜻이므로,
+ *     삼키면 Core 는 아무 지시도 닿지 않은 통화를 "IVR 로 내렸다"·"링크를 보냈다"로 적는다.
  *  2) steps 는 동결 복사본으로 넘긴다. 같은 배열이 §8.1 이벤트·이력에 쓰이므로,
  *     transport 가 실수로 건드려도 Core 쪽 이력이 오염되지 않아야 한다.
  */
 export function createChannelPort(opts: ChannelPortOptions): BaseChannelPort {
+  // **모르는 어댑터 id 를 여기서 막는다**(§2·§5.3). 아래 어긋남 검사로는 걸리지 않는다:
+  // `profileFor` 가 모르는 id 에 `{ adapter: '오타', channel: undefined }` 를 돌려주므로
+  // `capabilities.channel !== ADAPTER_CHANNEL[opts.id]` 가 `undefined !== undefined` 로
+  // 거짓이 된다. 그 포트는 **모든 능력이 거짓인 반쪽 선언**을 들고 다니며 등록·적합성 검사를
+  // 지나갔고(`E_UNKNOWN_ADAPTER` 주석), 브리지는 같은 오타를 기동 시점에 거절한다.
+  if (!isChannelAdapterId(opts.id)) {
+    throw new ChannelPortError('E_CONFIG',
+      `알 수 없는 채널 어댑터입니다: ${String(opts.id)} — 가능한 값은 ${CHANNEL_ADAPTER_IDS.join('·')} 입니다.`);
+  }
   const capabilities = opts.capabilities ?? profileFor(opts.id);
   if (capabilities.adapter !== opts.id || capabilities.channel !== ADAPTER_CHANNEL[opts.id]) {
     throw new ChannelPortError('E_CONFIG', `능력 선언이 어댑터(${opts.id})와 어긋납니다. 등록이 거부됩니다.`);
@@ -182,7 +194,15 @@ export function createChannelPort(opts: ChannelPortOptions): BaseChannelPort {
     }
   }
 
-  async function run(env: DeliveryEnvelope, base: Omit<DeliveryRecord, 'ok' | 'simulated'>): Promise<void> {
+  /**
+   * 한 번의 전달 시도. **접수됐는지를 돌려준다** — 던지지 않는다.
+   *
+   * 돌려주기 시작한 이유(2026-10-30): 지시마다 실패의 뒷처리가 다르다(아래 `surfaced` 주석).
+   * 종전에는 `void` 였으므로 호출부가 성공·실패를 구분할 방법이 아예 없었다.
+   */
+  async function run(
+    env: DeliveryEnvelope, base: Omit<DeliveryRecord, 'ok' | 'simulated'>,
+  ): Promise<DeliveryRecord> {
     const started = opts.clock?.();
     const finish = (): number | undefined => {
       if (started === undefined || !opts.clock) return undefined;
@@ -190,23 +210,57 @@ export function createChannelPort(opts: ChannelPortOptions): BaseChannelPort {
     };
     if (activation !== 'live' || !opts.transport) {
       // dry_run: 매체를 건드리지 않는다. 기록만 남기고 성공으로 접수한다 — [승인 필요].
-      push({ ...base, ok: true, simulated: true, durationMs: finish() });
-      return;
+      const record: DeliveryRecord = { ...base, ok: true, simulated: true, durationMs: finish() };
+      push(record);
+      return record;
     }
     try {
       await withTimeout(Promise.resolve(opts.transport.deliver(env)), opts.timeoutMs);
-      push({ ...base, ok: true, simulated: false, durationMs: finish() });
+      const record: DeliveryRecord = { ...base, ok: true, simulated: false, durationMs: finish() };
+      push(record);
+      return record;
     } catch (e) {
       const code = e instanceof ChannelPortError ? e.code : 'E_TRANSPORT';
-      push({
+      const record: DeliveryRecord = {
         ...base,
         ok: false,
         simulated: false,
         errorCode: code,
         detail: `${base.detail ? `${base.detail} ` : ''}${safeErrorText(e)}`,
         durationMs: finish(),
-      });
+      };
+      push(record);
+      return record;
     }
+  }
+
+  /**
+   * **접수되지 않은 지시는 Core 에 알린다**(§9.3·§5.2).
+   *
+   * 설계 결정 1("메서드는 예외를 던지지 않는다")의 **예외 두 개**이고, 이유는 계약 문구에 있다 —
+   * 포트 메서드의 반환은 "지시를 접수했다"까지만 뜻한다(`ChannelPort`). 기존 IVR 회귀와 전환
+   * 초대는 Core 가 **접수되지 않은 경우에 할 일을 정해 둔 유일한 두 지시**다: 회귀가 거부되면
+   * 상담사 이관으로 대신하고, 초대가 거부되면 사유를 턴 결과에 싣고 그 턴의 나머지(단계·이관·
+   * 종료)를 그대로 내보낸다(`channels/runtime.ts`).
+   *
+   * 그 대체는 **거부가 Core 에 닿아야만** 돈다. 베이스가 실패를 `failures`·`onFailure` 로만
+   * 적고 성공을 돌려주던 동안, 이 베이스를 쓰는 저장소 세 곳에서는 그 두 대체가 **한 번도
+   * 돌 수 없었다** — Core 는 "IVR 로 내렸다"로 적고 이관은 하지 않으며(고객은 죽은 AI 와
+   * 남는다), 전환은 "링크를 보냈다"로 적힌다. 증상은 전부 조용하다: `onFailure` 를 붙인
+   * 호스트는 전송 실패를 알지만, 그 시점에 고객을 어디로 보낼지는 Core 만 판정할 수 있다.
+   *
+   * `present`·`transfer`·`end` 는 **종전과 같이 던지지 않는다**: Core 에 대체 경로가 없고
+   * (이관까지 실패하면 더 시도할 곳이 없다) 거기서 던지면 통화 자체가 끊긴다.
+   */
+  async function surfaced(
+    env: DeliveryEnvelope, base: Omit<DeliveryRecord, 'ok' | 'simulated'>,
+  ): Promise<void> {
+    const record = await run(env, base);
+    if (record.ok) return;
+    // 원문은 이미 마스킹을 지났다(`run` 의 `detail`). Core 는 이 문구를 경고·턴 결과에
+    // 싣으므로 여기서 개인정보가 섞인 매체 오류가 그대로 올라가면 안 된다(§10.3).
+    throw new ChannelPortError(record.errorCode ?? 'E_TRANSPORT',
+      `${env.kind} 지시가 매체에 접수되지 않았습니다: ${record.detail ?? '사유 없음'}`);
   }
 
   const port: BaseChannelPort & {
@@ -253,7 +307,8 @@ export function createChannelPort(opts: ChannelPortOptions): BaseChannelPort {
 
   if (capabilities.routeToLegacyIvr) {
     port.routeToLegacyIvr = async (interactionId, reasonKo) => {
-      await run(
+      // 접수되지 않으면 올린다 — Core 가 상담사 이관으로 대신한다(`surfaced` 주석).
+      await surfaced(
         { interactionId, adapter: opts.id, channel: capabilities.channel, kind: 'routeToLegacyIvr', reasonKo },
         { kind: 'routeToLegacyIvr', interactionId, detail: maskPii(reasonKo).text },
       );
@@ -264,7 +319,8 @@ export function createChannelPort(opts: ChannelPortOptions): BaseChannelPort {
       // 티켓은 transport 로 **그대로** 넘긴다 — 링크를 만들려면 토큰이 필요하다. 반면 기록에는
       // 토큰을 남기지 않는다: 초대 토큰은 세션 열쇠라, 로그에 남으면 그 로그를 읽을 수 있는
       // 누구나 진행 중인 상담에 합류할 수 있다(§10.3).
-      await run(
+      // 접수되지 않으면 올린다 — Core 가 사유를 턴 결과에 싣고 그 턴의 나머지를 내보낸다.
+      await surfaced(
         {
           interactionId, adapter: opts.id, channel: capabilities.channel, kind: 'invite', target,
           ...(ticket !== undefined ? { ticket } : {}),
@@ -283,9 +339,10 @@ export function createChannelPort(opts: ChannelPortOptions): BaseChannelPort {
 export function createChannelPortSet(
   overrides: Partial<Record<ChannelAdapterId, Omit<ChannelPortOptions, 'id'>>> = {},
 ): Record<ChannelAdapterId, BaseChannelPort> {
-  const ids: ChannelAdapterId[] = ['callbot', 'chatbot', 'dars'];
+  // 목록은 `ADAPTER_CHANNEL` 하나에서 온다(§2) — 손으로 적어 두면 채널이 하나 늘어나는 날
+  // 이 묶음만 모르고, 그 채널은 "저장소 3곳이 그대로 쓰는 묶음"에서 조용히 빠진다.
   const out = {} as Record<ChannelAdapterId, BaseChannelPort>;
-  for (const id of ids) out[id] = createChannelPort({ id, ...(overrides[id] ?? {}) });
+  for (const id of CHANNEL_ADAPTER_IDS) out[id] = createChannelPort({ id, ...(overrides[id] ?? {}) });
   return out;
 }
 

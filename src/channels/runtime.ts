@@ -3218,12 +3218,40 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     };
   }
 
-  /** 발급된 초대를 매체에 넘긴다. 순서는 종전과 같다(이벤트 발행 뒤, 단계 렌더 전). */
-  async function deliverSwitchInvite(plan: SwitchInvitePlan, rec: SessionRecord, reg: ChannelRegistration): Promise<void> {
-    if (!plan.deliver) return;
+  /**
+   * 발급된 초대를 매체에 넘긴다. 순서는 종전과 같다(이벤트 발행 뒤, 단계 렌더 전).
+   *
+   * **거절은 턴을 끝내지 않는다**(§5.2·§9.3). 종전에는 `invite` 의 거부가 그대로 호출자까지
+   * 올라갔고, 그 뒤에 남은 것이 없었다: 세션은 이미 화면 채널로 바뀌고 이벤트도 발행됐는데
+   * **그 턴의 단계·이관 지시·종료 지시는 아무것도 나가지 않는다**(전달은 `present` 보다
+   * 앞이다). 그래서 통화 중인 고객은 링크도 못 받고 그 턴의 안내도 못 듣고, 호스트는 Core
+   * 예외를 받아 수집기에 쌓는다 — 하필 전환을 고른 이유가 **인식 실패**이므로 그 고객은 이미
+   * 두 번 되묻힌 상태이고, §5.1 사다리는 전환을 썼으므로 상담사로 내려가지도 않는다.
+   *
+   * 거절을 "접수했다"로 읽지 않는 근거는 계약이다(`ChannelPort` — 반환은 "지시를 접수했다"
+   * 까지만 뜻한다). 다만 여기서 할 **대체 지시는 없다**: 링크를 보낼 다른 경로가 Core 에
+   * 없고(발송 수단은 호스트 설정이다, §13-3) 세션을 음성으로 되돌리면 이미 발급된 토큰·
+   * 발행된 이벤트와 어긋난다. 그래서 하는 일은 둘이다 — **사실을 남기고**(경고 + 턴 결과의
+   * `notDeliveredKo`, 비-Node 호스트가 읽는 자리) **턴의 나머지를 그대로 내보낸다**.
+   * 사유는 호스트가 만든 문구라 `maskPii` 를 지난다(§10.3 — 발송 오류 문구에 수신번호가
+   * 섞이는 현장이 있다).
+   */
+  async function deliverSwitchInvite(
+    plan: SwitchInvitePlan, rec: SessionRecord, reg: ChannelRegistration,
+  ): Promise<string | undefined> {
+    if (!plan.deliver) return undefined;
     const invite = reg.port.invite;
-    if (typeof invite !== 'function') return;
-    await invite(rec.interactionId, plan.note.toChannel, plan.ticket);
+    if (typeof invite !== 'function') return undefined;
+    try {
+      await invite(rec.interactionId, plan.note.toChannel, plan.ticket);
+      return undefined;
+    } catch (e) {
+      const why = maskPii(e instanceof Error ? e.message : String(e)).text;
+      warnOnce('W_CHANNEL_SWITCH_UNBOUND',
+        `§5.2 전환 초대 지시가 ${reg.port.capabilities.adapter} 채널에서 거절돼 링크가 나가지 않았습니다: ${why}`
+        + ' — 세션은 이미 화면 채널로 옮겨 갔고 고객은 오지 않는 화면을 기다립니다(발송 경로를 확인하세요).');
+      return `초대 지시가 매체에서 거절돼 링크가 나가지 않았습니다: ${why}`;
+    }
   }
 
   /**
@@ -3864,7 +3892,13 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       rec.lastResult = withoutSwitchToken(result);
       sessions.put(rec);
       await publish(events);
-      if (invitePlan !== undefined) await deliverSwitchInvite(invitePlan, rec, reg);
+      if (invitePlan !== undefined) {
+        const notDeliveredKo = await deliverSwitchInvite(invitePlan, rec, reg);
+        // 거절되면 **사실을 결과에 싣고 턴을 계속한다**(`deliverSwitchInvite` 주석). 보관
+        // 복사본(`rec.lastResult`)은 손대지 않는다 — 전환 사실은 늦은 입력에 되풀이하지
+        // 않는 칸이라 이미 걷혀 있다(`TURN_FACT_KEYS`).
+        if (notDeliveredKo !== undefined) result.switchInvite = { ...invitePlan.note, notDeliveredKo };
+      }
       const shown = visibleSteps(drained.steps.slice(drained.presented));
       if (shown.length > 0) await reg.port.present(interactionId, shown);
       await deliverHandoff(reg, rec, summaryMasked, result);

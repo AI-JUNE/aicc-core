@@ -12,17 +12,21 @@ const caps = (over = {}) => ({
   adapter: 'callbot', channel: 'voice', dtmf: true, richUi: false, speech: true,
   transferToAgent: true, routeToLegacyIvr: false, crossChannelInvite: false, ...over,
 });
+// `...over` 를 **먼저** 펴고 합친 값을 뒤에 둔다. 거꾸로 두었던 동안 `over.capabilities`·
+// `over.port` 가 합쳐지는 대신 **덮어썼다** — 즉 `port({ capabilities: { channel: 'chat' } })`
+// 는 `id`·`present`·`transfer`·`end` 가 **없는** 포트를 만들었고, 아래 등록 검사 몇 건은
+// "채널이 어긋난 포트"가 아니라 "어댑터 id 가 없는 포트"를 보고 통과하고 있었다.
 const port = (over = {}) => ({
   id: 'callbot',
-  capabilities: caps(over.capabilities),
   present: async () => {}, transfer: async () => {}, end: async () => {},
   ...over,
+  capabilities: caps(over.capabilities),
 });
 const reg = (over = {}) => ({
-  port: port(over.port ?? {}),
   reportsComponents: ['telephony', 'stt', 'tts'],
   contractVersion: c ? c.CHANNEL_CONTRACT_VERSION : 1,
   ...over,
+  port: port(over.port ?? {}),
 });
 
 test('정상 등록은 오류 없음', b, () => {
