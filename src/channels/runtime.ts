@@ -2145,10 +2145,39 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     return durationMs === undefined ? {} : { durationMs };
   }
 
+  /**
+   * 호스트 보고 훅 한 번. **던져도 통화를 끊지 않는다**(§6.2·§9.3 — `W_HOST_REPORT` 주석).
+   *
+   * 이 규칙은 이미 두 자리에 있었다(`routing.offers.onStep`·`qa.onReport` 는 각자 try 로
+   * 감싸고 사유를 적어 두었다). 나머지 다섯 훅(`onPublish`·`onRecord`·`onResult`·`onIssue`·
+   * `onBlock`)만 예외였고, 그 비대칭의 결말이 조용하다: 보고는 **매체 지시보다 앞**이므로
+   * (`present`·`transfer`·`end`·`invite` 가 전부 그 뒤다) 알림 하나가 던지면 §8.1 원장에는
+   * "이관했다"·"종료했다"가 남고 회선은 올라간 채 남는다(§11.2 요금).
+   *
+   * **훅 이름당 경고 한 건**이다 — 던져진 값을 문구에 싣지 않는다(§10.3, 그리고 그 값이
+   * 호출마다 다르면 `warnOnce` 가 경고를 호출 횟수만큼 쌓는다). 전문이 필요한 쪽은 자기
+   * 훅 안에서 잡는다.
+   */
+  function report(hookKo: string, whatKo: string, call: () => void): void {
+    try {
+      call();
+    } catch {
+      warnOnce('W_HOST_REPORT',
+        `호스트 보고 훅(${hookKo})이 예외로 끝나 ${whatKo} 사실이 전달되지 않았습니다 — `
+        + '통화·종료는 그대로 진행했습니다(§6.2).');
+    }
+  }
+
   async function publish(events: InteractionEvent[]): Promise<void> {
     if (!opts.bus || events.length === 0) return;
     const results = await opts.bus.publishAll(events);
-    opts.onPublish?.(results);
+    // **이 훅이 던지면 그 턴의 매체 지시가 하나도 나가지 않는다** — 발행은 `present`·
+    // `transfer`·`end`·`invite` 보다 앞이고, 장애 폴백(§9.3)에서는 원장이 이미 "이관했다"로
+    // 적힌 뒤다. 발행 자체의 실패는 종전처럼 올린다(그건 보고가 아니라 §8.1 기록이다).
+    if (opts.onPublish !== undefined) {
+      const hook = opts.onPublish;
+      report('onPublish', '§8.1 이벤트 발행 결과', () => { hook(results); });
+    }
   }
 
   /** 이벤트에 담긴 마스킹 완료 발화만 대화 이력으로 남긴다(§10.3). */
@@ -2492,14 +2521,15 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
         outcome: 'FAILED', turnCount: rec.state.turnCount, ...sessionDuration(rec, mFailed.occurredAt),
       }));
       rec.ended = true;
-      await publish(events);
       // 폴백으로 끝난 통화도 점검한다 — `end()` 에만 걸면 이 통화는 영영 점검되지 않는다(§7 5.2).
       const result: ChannelTurnResult = {
         interactionId: id, state: rec.state, steps: [], status: 'failed', events, fallback: decision,
         ...complianceSlot(rec, events),
       };
+      // **발행보다 먼저 저장한다** — 다른 네 경로와 같은 순서다(아래 이관 분기의 긴 주석).
       rec.lastResult = result;
       sessions.put(rec);
+      await publish(events);
       await reg.port.end(id, decision.reasonKo);
       return result;
     }
@@ -2515,14 +2545,32 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     }));
     const summaryMasked = attachSummary(rec, events);
     rec.ended = true;
-    await publish(events);
     const result: ChannelTurnResult = {
       interactionId: id, state: rec.state, steps: [], status: 'transferred', events, fallback: decision,
       handoff: { ...(queue !== undefined ? { queue } : {}), ...(summaryMasked !== undefined ? { summaryMasked } : {}) },
       ...complianceSlot(rec, events),
     };
+    /**
+     * **발행보다 먼저 저장한다**(§9.3·§6.2·§11.2).
+     *
+     * 다른 네 경로는 전부 그렇게 한다 — `start`·`send`·`end` 는 "전달 실패로 상태를 잃지
+     * 않도록 먼저 저장한다"고 적어 두었고, `join` 도 같은 이유로 고쳐졌다("`lastResult` 까지
+     * 같은 `put` 에 담는다"). **장애 폴백만 거꾸로였다**: 발행이 먼저고 저장이 뒤였다.
+     *
+     * 그 순서에서 발행이 던지면(호스트가 끼운 버스·영속 멱등 저장소는 §9.3 을 유발한 장애와
+     * **같은 시각에** 흔들린다) 이 턴의 모든 결론이 사라진다. 인메모리 저장소에서는 같은
+     * 객체라 보이지 않지만, 직렬화하는 저장소에서는 저장된 레코드가 **여전히 `running`·
+     * `ended: false`** 다 — 세션은 닫히지 않고(그 시간은 장애가 아니라 §11.2 요금이다),
+     * `buf.reviewed` 가 풀려 §7 5.2 점검 잠금이 사라지고, 다음 입력은 **조기 반환 경로에
+     * 닿지 못해** 폴백 전체를 한 번 더 돌린다(원장에 같은 종료가 다시 쌓인다).
+     *
+     * 먼저 저장해도 이 턴의 매체 지시(아래 회귀·이관)는 발행이 던지면 나가지 않는다 —
+     * 그건 발행 자체의 실패이고 호출자에게 올라간다. 여기서 고치는 것은 **그 실패가 세션
+     * 상태까지 잃게 만들던 것**이다.
+     */
     rec.lastResult = result;
     sessions.put(rec);
+    await publish(events);
 
     /**
      * **회귀 지시가 거절되면 상담사 이관으로 대신한다**(§9.3).
@@ -2647,16 +2695,25 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
           });
           input = hop.input;
           // 설정 오류·동의 조립 예외를 삼키지 않는다. 보고 훅이 없으면 조용히 진행한다(§13-3).
-          if (binding.onBlock && (hop.block !== undefined || hop.consentError !== undefined)) {
-            binding.onBlock({
-              interactionId: rec.interactionId, connectorId,
-              ...(hop.block !== undefined ? { block: hop.block } : {}),
-              ...(hop.consentError !== undefined ? { consentError: hop.consentError } : {}),
+          // **훅이 던져도 이행을 끊지 않는다**(`report` 주석): 이 훅은 조회가 **막혔을 때만**
+          // 불리므로, 깨진 훅은 정상 턴을 전부 통과시키고 이미 막힌 턴만 통째로 잃게 만든다 —
+          // 그것도 업무시스템을 부른 뒤라 command 커넥터에서는 호출만 남고 안내가 없다(§6.1).
+          const onBlock = binding.onBlock;
+          if (onBlock && (hop.block !== undefined || hop.consentError !== undefined)) {
+            report('connectors.onBlock', '§6.1 조회 차단', () => {
+              onBlock({
+                interactionId: rec.interactionId, connectorId,
+                ...(hop.block !== undefined ? { block: hop.block } : {}),
+                ...(hop.consentError !== undefined ? { consentError: hop.consentError } : {}),
+              });
             });
           }
         }
-        if (hops >= limit && binding.onBlock) {
-          binding.onBlock({ interactionId: rec.interactionId, connectorId, block: 'hop_limit' });
+        if (hops >= limit && binding.onBlock !== undefined) {
+          const onBlock = binding.onBlock;
+          report('connectors.onBlock', '§6.1 순회 상한 차단', () => {
+            onBlock({ interactionId: rec.interactionId, connectorId, block: 'hop_limit' });
+          });
         }
 
         const next = runnerSend(rec.flow, rec.state, input, runnerCtx(rec, reg.port.capabilities));
@@ -2723,15 +2780,18 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       // 여기서 판정을 다시 하지 않는다(무엇을 끌지는 `decideFallbackMode` 하나다, §2) ·
       // **엔진 상태로 집계하지 않는다**(이미 그 상태 때문에 끈 것이다 — 또 적으면 한 번의 장애가
       // 두 번 집계되고 복구 판정이 그만큼 늦어진다, §9.3).
-      binding.onResult?.({
-        interactionId: rec.interactionId,
-        answered: false,
-        cause: 'disabled_by_fallback',
-        infraFailed: false,
-        partial: false,
-        citations: 0,
-        reasonKo: `§9.3 판정으로 지식 응대를 끈 상태라 호출하지 않았습니다: ${decision.reasonKo}`,
-        usage: { embedChars: 0, storeQueries: 0, hits: 0, promptChars: 0, responseChars: 0 },
+      // 보고가 던져도 턴은 간다(`report` 주석) — 하필 이 갈래는 **이미 축소 운영 중인** 턴이다.
+      report('knowledge.onResult', '§5.2 지식 응대 결과', () => {
+        binding.onResult?.({
+          interactionId: rec.interactionId,
+          answered: false,
+          cause: 'disabled_by_fallback',
+          infraFailed: false,
+          partial: false,
+          citations: 0,
+          reasonKo: `§9.3 판정으로 지식 응대를 끈 상태라 호출하지 않았습니다: ${decision.reasonKo}`,
+          usage: { embedChars: 0, storeQueries: 0, hits: 0, promptChars: 0, responseChars: 0 },
+        });
       });
       return runnerSend(rec.flow, rec.state, { kind: 'unrecognized', text, ...latency }, ctx);
     }
@@ -2742,14 +2802,18 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       { retriever: parts.retriever, answerer: parts.answerer, policy: binding.policy },
       { scope: rec.scope, channel: rec.state.channel, text },
     );
-    binding.onResult?.({
-      interactionId: rec.interactionId,
-      answered: outcome.kind === 'answer',
-      ...(outcome.kind === 'no_answer' ? { cause: outcome.cause, infraFailed: outcome.infraFailed } : { infraFailed: false }),
-      partial: outcome.partial,
-      citations: outcome.kind === 'answer' ? outcome.citations.length : 0,
-      reasonKo: outcome.reasonKo,
-      usage: outcome.usage,
+    // 보고가 던지면 **엔진은 이미 불렸고**(§11.2 비용은 발생했다) 답변만 고객에게 나가지
+    // 않는다 — 알림 실패를 응대 실패로 바꾸지 않는다(`report` 주석).
+    report('knowledge.onResult', '§5.2 지식 응대 결과', () => {
+      binding.onResult?.({
+        interactionId: rec.interactionId,
+        answered: outcome.kind === 'answer',
+        ...(outcome.kind === 'no_answer' ? { cause: outcome.cause, infraFailed: outcome.infraFailed } : { infraFailed: false }),
+        partial: outcome.partial,
+        citations: outcome.kind === 'answer' ? outcome.citations.length : 0,
+        reasonKo: outcome.reasonKo,
+        usage: outcome.usage,
+      });
     });
     if (outcome.kind === 'answer') {
       return knowledgeTurn(rec.flow, rec.state, ctx, outcome.step, {
@@ -2828,8 +2892,12 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
           // 설정 누락이다. 조용히 두면 "봇이 못 알아듣더라"로만 남는다 — 통화는 이관으로 살리되
           // 원인은 운영 화면과 호스트 양쪽에 드러낸다.
           warnOnce('W_INTENT_ROUTING', `확정된 인텐트에 연결된 시나리오가 없어 상담사로 넘겼습니다: ${outcome.intent}`);
-          binding.onIssue?.({
-            interactionId: rec.interactionId, kind: 'unrouted', reasonKo: outcome.reasonKo, intent: outcome.intent,
+          // 보고가 던져도 이관은 간다(`report` 주석) — 이 훅은 **못 알아들었거나 라우트가 없는
+          // 턴에만** 불리므로, 깨진 훅은 정상 턴을 전부 통과시키고 이미 나빠진 턴만 잃게 만든다.
+          report('intent.onIssue', '§5.1 인텐트 이슈', () => {
+            binding.onIssue?.({
+              interactionId: rec.interactionId, kind: 'unrouted', reasonKo: outcome.reasonKo, intent: outcome.intent,
+            });
           });
         }
         return handoffFromIntent(rec.state, ctx, outcome.reason, { ...turn, intent: outcome.intent });
@@ -2841,11 +2909,13 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       case 'fallback': {
         // 선택지는 버리고 **시도 횟수만 이어받는다** — 0 으로 되돌리면 명확화 한도가 무의미해진다.
         rec.intentClarify = { options: [], attempt: rec.intentClarify?.attempt ?? 0 };
-        binding.onIssue?.({
-          interactionId: rec.interactionId,
-          kind: outcome.classifierFailed ? 'classifier_failed' : 'unmatched',
-          reasonKo: outcome.reasonKo,
-          ...(outcome.classifierStatus !== undefined ? { status: outcome.classifierStatus } : {}),
+        report('intent.onIssue', '§5.1 인텐트 이슈', () => {
+          binding.onIssue?.({
+            interactionId: rec.interactionId,
+            kind: outcome.classifierFailed ? 'classifier_failed' : 'unmatched',
+            reasonKo: outcome.reasonKo,
+            ...(outcome.classifierStatus !== undefined ? { status: outcome.classifierStatus } : {}),
+          });
         });
         return runnerSend(rec.flow, rec.state, { kind: 'unrecognized', text, ...latency }, ctx);
       }
@@ -3373,17 +3443,24 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
           out.notRecordedKo = `${plan.purpose} 동의가 확정됐으나 이력 저장이 실패해 기록되지 않았습니다 — `
             + '그 동의는 근거가 없고, 개인정보 조회는 게이트에서 막힙니다(§10.1·§6.1).';
         }
-        cb.onRecord?.({
-          interactionId: rec.interactionId, purpose: plan.purpose, recorded: appended, state: plan.state,
-          ...(out.notRecordedKo !== undefined ? { reasonKo: out.notRecordedKo } : {}),
+        // **기록 실패가 통화를 끊지 않는다면 보고 실패도 끊을 수 없다**(위 주석과 같은 저울,
+        // `report` 주석). 여기서 던지면 동의는 이미 추가 전용 이력에 쌓인 뒤이고, 고객에게는
+        // 그 턴의 안내가 하나도 나가지 않는다 — 받은 동의와 나간 안내가 갈라진다(§10.1).
+        report('consent.onRecord', '§10.1 동의 처리', () => {
+          cb.onRecord?.({
+            interactionId: rec.interactionId, purpose: plan.purpose, recorded: appended, state: plan.state,
+            ...(out.notRecordedKo !== undefined ? { reasonKo: out.notRecordedKo } : {}),
+          });
         });
       } else if (plan.code !== 'not_consent_turn' && plan.code !== 'unanswered') {
         // 설정 문제다(주체 미설정·미승인 정책·정책 미선언). 삼키면 "동의를 받았다고 생각하는데
         // 이력이 없다"가 몇 주 뒤에 발견된다. 되묻는 중(`unanswered`)은 정상이므로 올리지 않는다.
         out.notRecordedKo = plan.reasonKo;
-        cb.onRecord?.({
-          interactionId: rec.interactionId, recorded: false, reasonKo: plan.reasonKo,
-          ...(plan.purpose !== undefined ? { purpose: plan.purpose } : {}),
+        report('consent.onRecord', '§10.1 동의 설정 문제', () => {
+          cb.onRecord?.({
+            interactionId: rec.interactionId, recorded: false, reasonKo: plan.reasonKo,
+            ...(plan.purpose !== undefined ? { purpose: plan.purpose } : {}),
+          });
         });
       }
     }

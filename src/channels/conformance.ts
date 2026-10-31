@@ -15,6 +15,7 @@
 //   if (!report.passed) process.exit(1);
 import type { ChannelKind } from '../domain/types.ts';
 import type { Flow, RenderedStep } from '../flow/types.ts';
+import { maskPii } from '../core/policyGuard.ts';
 import type { SwitchTicket } from '../core/executeSwitch.ts';
 import { DISCLOSURE_NODE_ID } from '../core/executeDisclosure.ts';
 import { CLARIFY_NODE_ID, renderClarifyStep } from '../nlu/executeIntentEntry.ts';
@@ -272,15 +273,39 @@ export async function runChannelConformance(opts: ConformanceOptions): Promise<C
   }
 
   // 5) 모르는 세션 — 재시도·중복 이벤트로 이미 끝난 id 가 다시 온다. 예외를 던지면 Core 턴이 통째로 실패한다.
+  //
+  //    **세 지시를 다 묻는다**(2026-11-01). 종전에는 `present` 하나만 찔렀는데, 이 검사의
+  //    결과에 기대고 있는 Core 동작은 하필 `end` 다: 접수되지 않은 종료를 다시 내리는 길
+  //    (`basePort.ts` 의 `end` 멱등 표식)이 "계약은 포트가 모르는 세션을 무해하게 흡수할 것을
+  //    이미 요구하므로(`UNKNOWN_SESSION`) 이미 내려간 회선에 온 두 번째 지시는 무해하다"를
+  //    근거로 열려 있다 — 그런데 그 성질을 **아무도 `end` 에 대해 물어본 적이 없었다**.
+  //    `transfer` 도 같다: §9.3 폴백 이관은 이미 끝난 세션 id 로 재전송되는 자리다.
+  //    `present` 만 흡수하고 `end` 에서 던지는 포트는 전 검사를 통과하고, 그 포트에서는
+  //    **다시 내릴 유일한 기회**가 전송 실패로 끝난다(회선은 올라간 채 남는다, §11.2).
+  //    심각도는 종전과 같이 warning 이다 — 모르는 id 를 어떻게 다룰지는 매체 사정이 섞이고
+  //    (`--strict-warnings` 로 조이는 것은 저장소가 정한다), 올리면 지금까지 통과한 세
+  //    저장소의 게이트 판정이 이 변경 하나로 뒤집힌다(§13-3).
   {
-    const r = await withBudget(() => port.present('i_does_not_exist', [step(channel, '유령 세션')]), budget);
+    const probes: [string, () => Promise<void>][] = [
+      ['present', () => port.present('i_does_not_exist', [step(channel, '유령 세션')])],
+      ['transfer', () => port.transfer('i_does_not_exist', undefined, undefined)],
+      ['end', () => port.end('i_does_not_exist', '유령 세션 종료')],
+    ];
+    const failed: string[] = [];
+    for (const [name, call] of probes) {
+      const r = await withBudget(call, budget);
+      if (r.ok === true) continue;
+      failed.push(`${name}(${'timeout' in r ? '예산 초과' : errText((r as { error: unknown }).error)})`);
+    }
     add({
       id: 'UNKNOWN_SESSION',
-      passed: r.ok === true,
+      passed: failed.length === 0,
       severity: 'warning',
-      messageKo: r.ok
-        ? '알 수 없는 interactionId 를 무해하게 흡수합니다.'
-        : '알 수 없는 interactionId 에서 예외가 납니다. 재시도·중복 전달 시 턴 전체가 실패합니다(§8.1).',
+      messageKo: failed.length === 0
+        ? '알 수 없는 interactionId 를 present·transfer·end 세 지시 모두에서 무해하게 흡수합니다.'
+        : `알 수 없는 interactionId 에서 예외가 납니다: ${failed.join(' / ')}. 재시도·중복 전달 시 `
+          + '턴 전체가 실패하고(§8.1), end 에서 던지면 접수되지 않은 종료를 다시 내릴 길이 '
+          + '막혀 회선이 올라간 채 남습니다(§11.2).',
     });
   }
 
@@ -731,7 +756,13 @@ export function createDryRunPort(opts: DryRunPortOptions): DryRunPort {
       });
     },
     async end(interactionId: string, reasonKo: string): Promise<void> {
-      calls.push({ method: 'end', interactionId, detail: reasonKo });
+      // **사유는 마스킹을 지난다**(§10.3 — `RecordedCall.detail` 의 선언이 그것이다).
+      // 종전에는 원문을 그대로 넣었다: `reasonKo` 는 **호스트가 만든 문구**이고(회선 해제
+      // 사유·고객 종료 사유) 현장에서 거기에 발신번호·고객명이 섞인다. 베이스 포트는 같은
+      // 값을 `maskPii` 로 가려 기록하는데 이 참조 구현만 그대로 담았고, 하필 이 파일이
+      // **세 저장소가 복사해 가는 예시**다 — 그 복사본의 `calls` 는 CI 로그·운영 덤프로
+      // 그대로 나간다. 가려도 잃는 것이 없다(기록의 쓸모는 "왜 내렸는가"이지 번호가 아니다).
+      calls.push({ method: 'end', interactionId, detail: maskPii(reasonKo).text });
     },
   };
 
@@ -741,7 +772,9 @@ export function createDryRunPort(opts: DryRunPortOptions): DryRunPort {
   };
   if (capabilities.routeToLegacyIvr) {
     port.routeToLegacyIvr = async (interactionId, reasonKo) => {
-      calls.push({ method: 'routeToLegacyIvr', interactionId, detail: reasonKo });
+      // `end` 와 같은 규칙(§10.3). §9.3 회귀 사유는 Core 가 만들지만, 호스트가 자기 포트에
+      // 직접 넘기는 경로도 있고 베이스 포트는 이 값도 마스킹해 기록한다.
+      calls.push({ method: 'routeToLegacyIvr', interactionId, detail: maskPii(reasonKo).text });
     };
   }
   if (capabilities.crossChannelInvite) {

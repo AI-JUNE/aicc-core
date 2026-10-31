@@ -699,3 +699,96 @@ test('아는 어댑터 세 개는 그대로 통과한다 — 거절은 계약 �
   assert.equal(C.isChannelAdapterId('toString'), false);
   assert.equal(C.isChannelAdapterId(undefined), false);
 });
+
+// ── 모르는 세션은 세 지시 전부에서 묻는다 (§8.1·§11.2) ──────────────────────
+// 이 검사의 결과에 기대고 있는 Core 동작은 하필 `end` 다: 접수되지 않은 종료를 다시 내리는
+// 길(`basePort.ts` 의 `end` 멱등 표식)이 "계약은 포트가 모르는 세션을 무해하게 흡수할 것을
+// 이미 요구한다(`UNKNOWN_SESSION`)"를 근거로 열려 있는데, 그 성질을 **`end` 에 대해서는
+// 아무도 물어본 적이 없었다**(종전 검사는 `present` 하나만 찔렀다). `transfer` 도 같다 —
+// §9.3 폴백 이관은 이미 끝난 세션 id 로 재전송되는 자리다.
+
+test('end 가 모르는 세션에서 던지면 UNKNOWN_SESSION 이 잡는다 — 다시 내릴 길이 막힌다', b, async () => {
+  const port = m.createDryRunPort({ id: 'callbot' });
+  const orig = port.end.bind(port);
+  port.end = async (id, reason) => {
+    if (id === 'i_does_not_exist') throw new Error('세션 없음');
+    return orig(id, reason);
+  };
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  const c = r.checks.find((x) => x.id === 'UNKNOWN_SESSION');
+  assert.equal(c.passed, false, `end 에서 던지는 포트가 통과했다: ${m.formatConformanceReport(r)}`);
+  assert.match(c.messageKo, /end\(/);
+  assert.match(c.messageKo, /회선이 올라간 채/);
+  // 심각도는 종전과 같다 — 세 저장소의 게이트 판정을 이 변경 하나로 뒤집지 않는다(§13-3).
+  assert.equal(c.severity, 'warning');
+  assert.equal(r.errorCount, 0);
+});
+
+test('transfer 가 모르는 세션에서 던지면 같은 항목이 잡는다 — §9.3 이관 재전송 자리다', b, async () => {
+  const port = m.createDryRunPort({ id: 'chatbot' });
+  const orig = port.transfer.bind(port);
+  port.transfer = async (id, q, s) => {
+    if (id === 'i_does_not_exist') throw new Error('세션 없음');
+    return orig(id, q, s);
+  };
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  const c = r.checks.find((x) => x.id === 'UNKNOWN_SESSION');
+  assert.equal(c.passed, false);
+  assert.match(c.messageKo, /transfer\(/);
+  // 큐·요약이 있는 정상 이관은 멀쩡하므로 TRANSFER_OPTIONALS 는 그대로 통과한다.
+  assert.equal(r.checks.find((x) => x.id === 'TRANSFER_OPTIONALS').passed, true);
+});
+
+test('세 지시를 다 흡수하면 통과하고 문구에 그 사실이 적힌다(정상 경로)', b, async () => {
+  const port = m.createDryRunPort({ id: 'callbot' });
+  const r = await m.runChannelConformance({ port, timeoutMs: 500 });
+  const c = r.checks.find((x) => x.id === 'UNKNOWN_SESSION');
+  assert.equal(c.passed, true);
+  assert.match(c.messageKo, /present·transfer·end/);
+  // 모르는 세션 탐침이 `END_REPEATABLE` 의 멱등 표식을 건드리지 않는다(다른 id 를 쓴다).
+  assert.equal(r.checks.find((x) => x.id === 'END_REPEATABLE').passed, true);
+});
+
+test('모르는 세션에서 정착하지 않는 end 도 같은 항목이 잡는다(경계)', b, async () => {
+  const port = m.createDryRunPort({ id: 'callbot' });
+  port.end = (id) => (id === 'i_does_not_exist' ? new Promise(() => {}) : Promise.resolve());
+  const r = await m.runChannelConformance({ port, timeoutMs: 30 });
+  const c = r.checks.find((x) => x.id === 'UNKNOWN_SESSION');
+  assert.equal(c.passed, false);
+  assert.match(c.messageKo, /예산 초과/);
+});
+
+// ── 드라이런 참조 포트의 기록도 마스킹을 지난다 (§10.3) ─────────────────────
+// `RecordedCall.detail` 의 선언이 "마스킹을 통과한 값만 담는다"인데, `end`·`routeToLegacyIvr`
+// 만 원문을 그대로 담았다. 그 값은 **호스트가 만든 문구**(회선 해제·고객 종료 사유)이고
+// 현장에서 거기에 발신번호·고객명이 섞인다 — 베이스 포트는 같은 값을 가려 기록한다.
+// 하필 이 파일이 세 저장소가 복사해 가는 예시이고, 그 복사본의 `calls` 는 CI 로그로 나간다.
+
+test('end 사유의 개인정보는 기록에 남지 않는다(§10.3)', b, async () => {
+  const port = m.createDryRunPort({ id: 'callbot' });
+  await port.end('i1', '발신번호 010-1234-5678 고객이 끊었습니다');
+  const dump = JSON.stringify(port.calls);
+  assert.equal(dump.includes('010-1234-5678'), false, `원문이 기록에 남았다: ${dump}`);
+  // 가려도 쓸모는 남는다 — "왜 내렸는가"가 사라지면 기록이 아니다.
+  assert.match(port.calls[0].detail, /끊었습니다/);
+});
+
+test('routeToLegacyIvr 사유도 같은 규칙을 받는다(§9.3·§10.3)', b, async () => {
+  const port = m.createDryRunPort({
+    id: 'callbot',
+    capabilities: {
+      adapter: 'callbot', channel: 'voice', dtmf: true, richUi: false, speech: true,
+      transferToAgent: true, routeToLegacyIvr: true, crossChannelInvite: true,
+    },
+  });
+  await port.routeToLegacyIvr('i1', '회선 장애(담당 010-9999-8888)로 IVR 로 돌립니다');
+  const dump = JSON.stringify(port.calls);
+  assert.equal(dump.includes('010-9999-8888'), false, `원문이 기록에 남았다: ${dump}`);
+  assert.match(port.calls[0].detail, /IVR 로 돌립니다/);
+});
+
+test('경계: 개인정보가 없는 사유는 그대로 남는다 — 가리느라 지우지 않는다', b, async () => {
+  const port = m.createDryRunPort({ id: 'chatbot' });
+  await port.end('i1', '시나리오 정상 종료');
+  assert.equal(port.calls[0].detail, '시나리오 정상 종료');
+});
