@@ -1209,3 +1209,34 @@ test('가려진 칸은 값만 빠지고 사실은 남는다 — 스위치를 끈
   assert.equal(r.result.switchInvite.tokenIncluded, false);
   assert.equal(r.result.switchInvite.ticketIssued, true, '발급 사실은 스위치와 무관하다');
 });
+
+test('§11.2 과금 근거의 배열도 호스트가 고칠 수 없다 — 버려진 수량 목록을 비울 수 없다', b, async () => {
+  // 한 겹 복사만 하던 동안 `usageConflicts`·`usageRejected` 는 **원본 참조로** 나갔다.
+  // 이 둘은 "합산하지 않고 빼낸 항목"·"실측으로 볼 수 없어 버린 항목", 즉 **버려진 수량의
+  // 유일한 목록**이고 같은 배열이 Core 의 보관 복사본에 들어 있다 — 직렬화 전에 비우면
+  // 그 응답은 "충돌·거절 없음"이 되고 그 판정은 "Core 가 그렇게 적었다"로 남는다(§2·§11.2).
+  const payload = {
+    ...fullResultCore.payload,
+    billing: {
+      usageAttached: true,
+      usageConflicts: ['stt_audio_ms'],
+      usageRejected: ['channel.llm_prompt_tokens'],
+    },
+  };
+  const bridge = BR.createBridge({
+    core: {
+      contractVersion: 1,
+      start: async () => payload, send: async () => payload, end: async () => payload,
+      reportHealth: () => undefined,
+    },
+    adapter: 'callbot',
+    scope: SCOPE,
+  });
+  const r = await bridge.handleLine(line({ id: '1', op: 'start', req: { flowId: 'billing', entryPoint: 'inbound_call' } }));
+  assert.deepEqual(r.result.billing.usageConflicts, ['stt_audio_ms']);
+  assert.deepEqual(r.result.billing.usageRejected, ['channel.llm_prompt_tokens']);
+  r.result.billing.usageConflicts.length = 0;
+  r.result.billing.usageRejected.push('호스트가 끼워 넣음');
+  assert.deepEqual(payload.billing.usageConflicts, ['stt_audio_ms'], 'Core 의 판정이 고쳐졌다');
+  assert.deepEqual(payload.billing.usageRejected, ['channel.llm_prompt_tokens']);
+});

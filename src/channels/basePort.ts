@@ -346,7 +346,17 @@ export function createChannelPort(opts: ChannelPortOptions): BaseChannelPort {
     async end(interactionId: string, reasonKo: string): Promise<void> {
       if (ended.has(interactionId)) {
         // 고객 끊음과 Core 종료가 겹치면 반드시 생기는 상황이다. 매체를 두 번 내리지 않는다.
-        push({ kind: 'end', interactionId, ok: true, simulated: true, suppressed: true, detail: '중복 종료 흡수' });
+        // `simulated` 는 **활성화 상태의 사실**이다(그 선언이 "dry_run 이라 매체로 나가지 않은
+        // 경우"다) — 흡수한 중복에 `true` 를 박아 두던 동안, live 포트의 기록에도 드라이런
+        // 표식이 섞여 나왔다. 하필 그 값이 "실전송으로 교체되면 false 가 되어야 한다"고 적힌
+        // 전환 확인용 칸이라(`DryRunPort.dryRun` 과 같은 쓰임), live 전환 직후의 스모크가
+        // 중복 종료 하나를 보고 "아직 드라이런"으로 읽는다. 흡수했다는 사실은 `suppressed`
+        // 가 이미 말한다 — 두 칸이 다른 질문에 답한다(§13-3).
+        push({
+          kind: 'end', interactionId, ok: true,
+          simulated: activation !== 'live' || !opts.transport,
+          suppressed: true, detail: '중복 종료 흡수',
+        });
         return;
       }
       // 시도 중에 들어온 두 번째 종료는 막는다(재진입은 매체를 두 번 내린다) — 접수되지

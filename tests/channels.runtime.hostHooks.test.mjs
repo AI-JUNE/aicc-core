@@ -109,7 +109,7 @@ function serializingSessionStore() {
 
 function build({
   flows = [flowSay()], samples = [], port = fakePort(), bus, sessions,
-  onPublish, consent, connectors,
+  onPublish, consent, connectors, qa,
 } = {}) {
   const collector = B.createCollectorSink('t');
   const health = F.createHealthRegistry(samples);
@@ -132,6 +132,7 @@ function build({
     ...(onPublish !== undefined ? { onPublish } : {}),
     ...(consent !== undefined ? { consent } : {}),
     ...(connectors !== undefined ? { connectors } : {}),
+    ...(qa !== undefined ? { qa } : {}),
   });
   return { core, port, collector, health };
 }
@@ -233,6 +234,59 @@ test('connectors.onBlock 이 던져도 §6.1 이행이 계속된다 — 이미 �
   const w = hookWarns(core);
   assert.equal(w.length, 1);
   assert.match(w[0].messageKo, /connectors\.onBlock/);
+});
+
+// ── 2-1) 점검 전문 보고(§7 5.2) — 보고 실패가 **요약을 지웠다** ────────────────
+//
+// 여덟 번째 훅이다. 종전에는 판정(`reviewCompliance`)과 보고(`onReport`)가 같은 try 안에
+// 있었고 catch 가 `{}` 를 돌려줬다 — 그런데 판정은 **어떤 경우에도 던지지 않으므로**(그 파일
+// 머리말) 그 catch 에 닿는 유일한 길은 호스트의 `onReport` 가 던지는 것이고, 그러면 리뷰 큐
+// 적재 실패 하나가 **Core 가 이미 끝낸 점검 요약을 지웠다**. 다시 만들 기회도 없다(`reviewed`
+// 가 이미 잠긴 뒤다 — 한 세션에 한 번이다).
+// 하필 그 요약이 **비-Node 호스트가 점검 결과를 받는 유일한 자리**이고, 참조 파이썬
+// 클라이언트는 칸이 없는 종료 응답을 "점검이 배선되지 않았다"로 센다(`ends_without_compliance`).
+
+const QA_FP = [{ id: 'f1', phrase: '무조건 승인', severity: 'major', reasonKo: '확정적 표현 금지' }];
+const qaBinding = (over = {}) => ({ disclosureMarkers: ['AI 상담'], forbiddenPhrases: QA_FP, ...over });
+
+test('qa.onReport 가 던져도 점검 요약은 턴 결과에 실린다(§7 5.2)', b, async () => {
+  const { core, port } = build({ qa: qaBinding({ onReport: () => { throw new Error('리뷰 큐 적재 실패'); } }) });
+  await core.start(reqOf());
+  const r = await core.send('i_hook1', { input: { kind: 'utterance', text: '홍길동' } });
+  assert.equal(r.status, 'completed');
+  // 종전에는 이 칸이 통째로 사라졌고, 호스트는 그것을 "점검 미배선"으로 읽었다.
+  assert.equal(r.compliance.reviewed, true);
+  assert.deepEqual(r.compliance.counts, { critical: 0, major: 0, minor: 0 });
+  // 그 턴의 안내는 종전처럼 매체로 나간다(보고는 매체 지시보다 앞이다).
+  assert.deepEqual(port.log.at(-1), ['present', 'i_hook1', ['bye']]);
+  const w = hookWarns(core);
+  assert.equal(w.length, 1);
+  assert.match(w[0].messageKo, /qa\.onReport/);
+  assert.equal(/리뷰 큐 적재 실패/.test(w[0].messageKo), false, '던져진 값은 문구에 싣지 않는다(§10.3)');
+});
+
+test('qa.onReport 가 던져도 점검은 한 세션에 한 번이다 — 늦은 입력이 다시 돌리지 않는다', b, async () => {
+  let calls = 0;
+  const { core } = build({ qa: qaBinding({ onReport: () => { calls += 1; throw new Error('리뷰 큐 적재 실패'); } }) });
+  await core.start(reqOf());
+  await core.send('i_hook1', { input: { kind: 'utterance', text: '홍길동' } });
+  const late = await core.send('i_hook1', { input: { kind: 'utterance', text: '여보세요' } });
+  assert.equal(calls, 1);
+  // 요약은 **서 있는 사실**이라 늦은 입력에도 그대로 되풀이된다(`STANDING_RESULT_KEYS`).
+  assert.equal(late.compliance.reviewed, true);
+  assert.equal(hookWarns(core).length, 1);
+});
+
+test('정상 경로: qa.onReport 가 멀쩡하면 전문과 요약이 둘 다 간다', b, async () => {
+  const reports = [];
+  const { core } = build({ qa: qaBinding({ onReport: (i) => reports.push(i) }) });
+  await core.start(reqOf());
+  const r = await core.send('i_hook1', { input: { kind: 'utterance', text: '홍길동' } });
+  assert.equal(reports.length, 1);
+  assert.equal(reports[0].interactionId, 'i_hook1');
+  assert.equal(reports[0].note.reviewed, true);
+  assert.equal(r.compliance.reviewed, true);
+  assert.deepEqual(hookWarns(core), []);
 });
 
 test('경계: 같은 훅이 여러 번 던져도 경고는 훅 이름당 한 건이다', b, async () => {

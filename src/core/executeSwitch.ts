@@ -203,10 +203,27 @@ export function issueSwitch(p: IssueSwitchParams): IssueSwitchResult {
   };
 }
 
-/** 오류 문구에서 토큰을 지운다. 토큰이 섞인 메시지는 통째로 버린다 — 부분 치환은 조각을 남긴다. */
+/**
+ * 문구에서 1회용 토큰을 지운다. **섞여 있으면 통째로 버린다** — 부분 치환은 조각을 남긴다(§10.3).
+ *
+ * 왜 내보내는가(2026-11-02): 같은 규칙이 필요한 자리가 **발급 실패 하나가 아니었다**. 초대
+ * 지시를 매체에 넘기는 쪽(`channels/runtime.ts` 의 `deliverSwitchInvite`)은 포트가 던진
+ * **호스트 문구**를 그대로 경고·턴 결과(`switchInvite.notDeliveredKo`)에 실어 왔는데, 그 칸은
+ * 노출 스위치와 무관하게 와이어로 나간다(사유는 개인정보가 아니라는 전제다) — 즉 입력을
+ * 되뱉는 포트 하나로 **토큰 노출을 끈 호스트에게 토큰이 도착한다**. 토큰은 진행 중인 세션의
+ * 열쇠이므로(`maskPii` 는 열쇠를 가리지 않는다) 판정을 두 벌로 두지 않고 이 함수를 쓴다(§2).
+ *
+ * 대체 문구는 호출자가 준다 — 어디서 거절됐는지는 호출자만 안다(발급 레지스트리 / 매체).
+ */
+export function redactSwitchToken(raw: string, token: string | undefined, insteadKo: string): string {
+  if (token === undefined || token === '') return raw;
+  return raw.includes(token) ? insteadKo : raw;
+}
+
+/** 발급 경로용 얇은 겹. 판정은 위 한 곳이다(§2). */
 function redactToken(e: unknown, token: string): string {
   const raw = e instanceof Error ? e.message : String(e);
-  return raw.includes(token) ? '레지스트리 거절(상세는 토큰이 포함되어 생략)' : raw;
+  return redactSwitchToken(raw, token, '레지스트리 거절(상세는 토큰이 포함되어 생략)');
 }
 
 /** 합류 거절 사유. `checkRedeem` 의 판정에 **Interaction 불일치** 하나를 더한 것이다. */

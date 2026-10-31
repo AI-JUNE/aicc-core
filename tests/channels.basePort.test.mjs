@@ -116,6 +116,23 @@ test('dry_run 의 종료는 접수로 적히므로 중복은 종전대로 흡수
   await port.end('i1', '종료');
   assert.equal(t.seen.length, 0);
   assert.equal(port.records[1].suppressed, true);
+  assert.equal(port.records[1].simulated, true, 'dry_run 이면 흡수한 중복도 드라이런이다');
+});
+
+test('live 포트가 흡수한 중복 종료는 드라이런으로 적히지 않는다(§13-3)', b, async () => {
+  // `simulated` 의 선언은 "dry_run 이라 매체로 나가지 않은 경우"다 — 활성화 상태의 사실이고,
+  // 흡수했다는 사실은 `suppressed` 가 따로 말한다(두 칸이 다른 질문에 답한다). 흡수한 중복에
+  // `true` 를 박아 두던 동안 live 포트의 기록에 드라이런 표식이 섞였고, 하필 그 값이
+  // "실전송으로 교체되면 false 가 되어야 한다"고 적힌 전환 확인용 칸이다 — live 전환 직후의
+  // 스모크가 중복 종료 하나를 보고 "아직 드라이런"으로 읽는다.
+  const t = recording();
+  const port = m.createChannelPort({ id: 'callbot', activation: 'live', approvalRef: 'T', transport: t });
+  await port.end('i1', '고객 종료');
+  await port.end('i1', '고객 종료');
+  assert.equal(t.seen.length, 1, '매체를 두 번 내리지 않는다(종전과 같다)');
+  assert.equal(port.records[1].suppressed, true);
+  assert.equal(port.records[1].simulated, false);
+  assert.ok(port.records.every((r) => !r.simulated), 'live 기록에 드라이런 표식이 섞이면 안 된다');
 });
 
 test('전송된 steps 는 동결 복사본이라 원본 이력이 오염되지 않는다', b, async () => {

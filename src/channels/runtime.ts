@@ -50,7 +50,7 @@ import {
   emptyOfferLedger, expiredOffers, offerPolicyIssues, openOffer, openOfferOf, settleOffer,
 } from '../routing/executeOffer.ts';
 import type { InviteDeliveryKind, InviteRegistry, SlotCarryPolicy, SwitchReason, SwitchTargetChannel } from '../core/channelSwitch.ts';
-import { issueSwitch, redeemSwitch } from '../core/executeSwitch.ts';
+import { issueSwitch, redactSwitchToken, redeemSwitch } from '../core/executeSwitch.ts';
 import type { SwitchTicket } from '../core/executeSwitch.ts';
 import type { AiDisclosureConfig } from '../portal/aiDisclosure.ts';
 import { DISCLOSURE_NODE_ID, planDisclosure, validateDisclosureBinding } from '../core/executeDisclosure.ts';
@@ -90,7 +90,7 @@ import { createObserver, isKnownAdapter } from '../obs/executeObservability.ts';
 import type { RateLimiter } from '../api/rateLimit.ts';
 import { enforceRateLimit, rateLimitKey } from '../api/rateLimit.ts';
 import type { ForbiddenPhraseRule, QaReport, QaRuleSet } from '../qa/compliance.ts';
-import type { ComplianceBuffer, ComplianceTurnNote } from '../qa/executeCompliance.ts';
+import type { ComplianceBuffer, ComplianceReview, ComplianceTurnNote } from '../qa/executeCompliance.ts';
 import {
   appendForReview, buildQaRuleSet, newComplianceBuffer, reviewCompliance, validateComplianceBinding,
 } from '../qa/executeCompliance.ts';
@@ -2393,6 +2393,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
    * - **판정하지 않는다.** 위반·리뷰 분기·건수는 `qa/compliance.ts` 하나다(§2).
    * - **던지지 않는다.** 점검도, 점검 결과를 받는 훅도 종료를 막을 수 없다 — 이 경로에서 예외는
    *   채널의 `end` 지시가 호출되지 않는 것으로 나타나고, 그 세션 누수는 장애가 아니라 요금이다.
+   * - **보고 실패가 요약을 삼키지 않는다.** 아래 주석이 그 비대칭을 적어 두었다.
    */
   function complianceSlot(
     rec: SessionRecord, events: readonly InteractionEvent[],
@@ -2404,18 +2405,42 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     appendForReview(buf, events, binding.maxEvents);
     if (!rec.ended || buf.reviewed) return {};
     buf.reviewed = true;
+    let review: ComplianceReview;
     try {
-      const review = reviewCompliance({ buffer: buf, rules, scope: rec.scope });
+      review = reviewCompliance({ buffer: buf, rules, scope: rec.scope });
+    } catch {
+      // `reviewCompliance` 는 **어떤 경우에도 던지지 않기로** 되어 있다(그 파일 머리말 — 수집
+      // 0건·격리 위반·판정 예외를 전부 `reviewed: false` + 사유로 돌려준다). 그래도 종료를
+      // 막지 않는다. 다만 **조용히 지나가지 않는다**: 요약이 없는 것은 "위반 0건"이 아니라
+      // "점검 결과가 없다"이고, 그 구분이 사라지면 리뷰 큐는 영원히 깨끗하다(§7 5.2·§13-3).
+      warnOnce('W_QA',
+        '준수 점검 판정이 예외로 끝나 이 세션의 요약을 만들지 못했습니다 — '
+        + '종료는 그대로 진행했습니다. 요약 없음은 "위반 0건"이 아닙니다(§7 5.2).');
+      return {};
+    }
+    /**
+     * **전문 보고가 던져도 요약은 결과에 싣는다**(`report` 주석과 같은 저울).
+     *
+     * 종전에는 판정과 보고가 같은 try 안에 있었고, catch 가 `{}` 를 돌려줬다. `reviewCompliance`
+     * 는 던지지 않으므로 그 catch 에 닿는 유일한 길은 **호스트의 `onReport` 가 던지는 것**이고,
+     * 그러면 리뷰 큐 적재 실패 하나가 **Core 가 이미 끝낸 점검 요약을 지웠다** — 그것도
+     * `reviewed` 가 이미 잠긴 뒤라 그 세션에서는 다시 만들 기회가 없다(한 세션에 한 번이다).
+     *
+     * 하필 이 요약이 **비-Node 호스트가 §7 5.2 점검 결과를 받는 유일한 자리**다(전문은
+     * `onReport`, 요약은 턴 결과 — `ComplianceBinding.onReport` 주석). 그 호스트가 보는 것은
+     * `compliance` 칸이 없는 종료 응답이고, 참조 파이썬 클라이언트는 그것을 **"점검이 배선되지
+     * 않았다"**(`ends_without_compliance`)로 센다 — 배선은 돼 있고 점검도 돌았는데 그렇게 적힌다.
+     * 증상은 예외가 아니다: 통화는 정상으로 끝나고, 위반이 있던 통화가 리뷰 큐에도 호스트
+     * 집계에도 남지 않는다.
+     */
+    report('qa.onReport', '§7 5.2 준수 점검 전문', () => {
       binding.onReport?.({
         interactionId: rec.interactionId,
         ...(review.report !== undefined ? { report: review.report } : {}),
         note: review.note,
       });
-      return { compliance: review.note };
-    } catch {
-      // 점검 결과를 받는 쪽이 던진 경우다. 점검을 돌렸다는 사실은 남기되(reviewed) 종료는 그대로 간다.
-      return {};
-    }
+    });
+    return { compliance: review.note };
   }
 
   function interactionOf(rec: SessionRecord, reason: Handoff['reason']): Interaction {
@@ -3316,7 +3341,26 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       await invite(rec.interactionId, plan.note.toChannel, plan.ticket);
       return undefined;
     } catch (e) {
-      const why = maskPii(e instanceof Error ? e.message : String(e)).text;
+      /**
+       * **토큰이 섞인 사유는 통째로 버린다**(§10.3 — `redactSwitchToken`).
+       *
+       * 이 문구의 출처는 **호스트의 포트**이고, 그 포트가 받은 값에는 1회용 토큰이 들어 있다
+       * (링크를 만들려면 필요하다). 입력을 그대로 되뱉는 구현(`throw new Error(JSON.stringify(env))`
+       * — §10.3 되뱉기 검사가 "가장 흔한 모양"으로 적어 둔 바로 그것)이면 그 토큰이 두 경로로
+       * 나간다: `warnings()` 와 턴 결과의 `notDeliveredKo` 다. 뒤쪽이 더 나쁘다 — 사유 칸은
+       * **노출 스위치와 무관하게** 와이어로 나가므로(개인정보가 아니라는 전제다) 토큰을 받지
+       * 않도록 설정한 호스트에게 토큰이 도착하고, 그 로그를 읽는 누구나 진행 중인 상담에
+       * 합류할 수 있다. `maskPii` 는 열쇠를 가리지 않으므로 가려지지도 않는다.
+       *
+       * 발급 실패 쪽은 같은 규칙을 이미 받고 있었다(`E_ISSUE_FAILED`) — 빠진 자리는 전달
+       * 거부뿐이었다. 지우는 순서가 중요하다: 마스킹을 먼저 하면 토큰이 들어 있는지 대조할
+       * 원문이 없어진다.
+       */
+      const why = maskPii(redactSwitchToken(
+        e instanceof Error ? e.message : String(e),
+        plan.ticket?.token,
+        '매체 거절(상세는 1회용 합류 토큰이 포함되어 생략)',
+      )).text;
       warnOnce('W_CHANNEL_SWITCH_UNBOUND',
         `§5.2 전환 초대 지시가 ${reg.port.capabilities.adapter} 채널에서 거절돼 링크가 나가지 않았습니다: ${why}`
         + ' — 세션은 이미 화면 채널로 옮겨 갔고 고객은 오지 않는 화면을 기다립니다(발송 경로를 확인하세요).');

@@ -1309,6 +1309,48 @@ test('거부 사유에 개인정보 원문이 섞여 와도 마스킹 후 적는
   assert.match(r.switchInvite.notDeliveredKo, /발송 실패/);
 });
 
+// 거부 사유에 **1회용 토큰**이 섞여 오는 경우. 개인정보와 다른 문제다 — `maskPii` 는 열쇠를
+// 가리지 않으므로 그대로 통과했고, 하필 이 사유 칸은 **노출 스위치와 무관하게** 와이어로
+// 나간다(브리지의 `includeSwitchTicket` 을 끈 호스트에도 간다). 그 로그를 읽는 누구나
+// 진행 중인 상담에 합류할 수 있다. 발급 실패 쪽은 같은 규칙을 이미 받고 있었다(§5.2·§10.3).
+test('거부 사유에 1회용 토큰이 섞여 오면 사유를 통째로 버린다(§10.3)', b, async () => {
+  const sw = switchWiring();
+  const port = fakePort('callbot', {}, {
+    // 입력을 그대로 되뱉는 포트다 — §10.3 되뱉기 검사가 "가장 흔한 모양"으로 적어 둔 그것.
+    async invite(iid, target, ticket) { throw new Error(`발송 실패: ${JSON.stringify(ticket)}`); },
+  });
+  const { core } = build({ flows: [flowRetry], ports: [port, darsPort()], channelSwitch: sw.binding });
+  await core.start(req({ flowId: 'retry' }));
+  await core.send('i_test1', { input: { kind: 'timeout' } });
+  const r = await core.send('i_test1', { input: { kind: 'timeout' } });
+
+  assert.equal(r.switchInvite.ticketIssued, true);
+  // 토큰 자체는 Node 경로의 결과에 실린다(링크를 만들 쪽이 쓴다) — 막아야 하는 것은 **사유 칸**
+  // 과 경고다. 그 둘은 노출 스위치와 무관하게 와이어·로그로 나간다.
+  assert.equal(r.switchInvite.notDeliveredKo.includes('tk_switch_1'), false,
+    '1회용 합류 토큰이 사유로 나가면 안 된다');
+  assert.equal(JSON.stringify(core.warnings()).includes('tk_switch_1'), false);
+  // 사실은 그대로 남는다 — 링크가 나가지 않았다는 것을 말해 주는 경로가 이 칸 하나뿐이다.
+  assert.match(r.switchInvite.notDeliveredKo, /링크가 나가지 않았습니다/);
+  assert.match(r.switchInvite.notDeliveredKo, /토큰이 포함되어 생략/);
+  const w = core.warnings().filter((i) => i.code === 'W_CHANNEL_SWITCH_UNBOUND');
+  assert.equal(w.length, 1);
+  assert.match(w[0].messageKo, /토큰이 포함되어 생략/);
+});
+
+test('경계: 토큰이 섞이지 않은 거부 사유는 종전처럼 그대로 적는다', b, async () => {
+  const sw = switchWiring();
+  const port = fakePort('callbot', {}, {
+    async invite() { throw new Error('알림톡 게이트웨이 5xx'); },
+  });
+  const { core } = build({ flows: [flowRetry], ports: [port, darsPort()], channelSwitch: sw.binding });
+  await core.start(req({ flowId: 'retry' }));
+  await core.send('i_test1', { input: { kind: 'timeout' } });
+  const r = await core.send('i_test1', { input: { kind: 'timeout' } });
+  assert.match(r.switchInvite.notDeliveredKo, /알림톡 게이트웨이 5xx/);
+  assert.equal(/토큰이 포함되어 생략/.test(r.switchInvite.notDeliveredKo), false);
+});
+
 test('접수된 초대에는 발송 사유를 적지 않는다 — 없는 칸을 실패로 읽히게 하지 않는다(경계)', b, async () => {
   const sw = switchWiring();
   const port = fakePort();
@@ -3000,7 +3042,12 @@ test('수집 상한을 넘으면 전수 규칙을 점검 완료로 적지 않는
   assert.ok(r.compliance.skipped.some((s) => s.ruleId === 'pii_exposed' && /상한/.test(s.reasonKo)));
 });
 
-test('점검 결과를 받는 훅이 던져도 종료는 그대로 간다 — 그 예외는 세션 누수가 된다', b, async () => {
+test('점검 결과를 받는 훅이 던져도 종료는 그대로 가고 요약은 결과에 실린다', b, async () => {
+  // 종전에는 판정과 보고가 같은 try 안에 있어서, **전문을 올리지 못한 것 때문에 요약까지
+  // 사라졌다**(그 자리의 검사가 `r.compliance === undefined` 를 고정하고 있었다). 그런데
+  // `reviewCompliance` 는 던지지 않으므로 그 catch 에 닿는 유일한 길은 호스트의 `onReport`
+  // 이고, 그 훅은 **리뷰 큐 적재**다 — 적재 실패가 Core 가 이미 끝낸 점검 결과를 지울 이유가
+  // 없다. 하필 그 요약이 비-Node 호스트가 점검 결과를 받는 유일한 자리다(§7 5.2·§6.2).
   const { core, port } = build({
     disclosure: DISC(),
     qa: qaWiring({ onReport: () => { throw new Error('리뷰 큐 장애'); } }).binding,
@@ -3008,8 +3055,13 @@ test('점검 결과를 받는 훅이 던져도 종료는 그대로 간다 — �
   await core.start(req());
   const r = await core.end('i_test1', '고객 종료');
   assert.equal(r.status, 'completed');
-  assert.equal(r.compliance, undefined);               // 올리지 못한 판정을 결과에 싣지 않는다
+  assert.equal(r.compliance.reviewed, true);
   assert.ok(port.log.some((l) => l[0] === 'end'));     // 채널에는 종료 지시가 나갔다
+  // 보고가 전달되지 않은 사실은 다른 일곱 훅과 같은 경고로 남는다(훅 이름당 한 건).
+  const w = core.warnings().filter((i) => i.code === 'W_HOST_REPORT');
+  assert.equal(w.length, 1);
+  assert.match(w[0].messageKo, /qa\.onReport/);
+  assert.equal(/리뷰 큐 장애/.test(w[0].messageKo), false);
 });
 
 test('배선 거부: 비교할 수 없는 금칙어는 생성 시점에 막는다 — 통화 중에는 드러나지 않는다', b, () => {

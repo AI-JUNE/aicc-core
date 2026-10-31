@@ -896,7 +896,24 @@ function projectTurn(r: ChannelTurnResult, opts: BridgeOptions): BridgeTurnPaylo
   // 고지 사실은 어떤 노출 스위치와도 무관하게 나간다 — 슬롯 값·상담사용 요약과 달리
   // 여기에는 개인정보가 없고, 감추면 "고지했다"를 증명할 길이 호스트에 남지 않는다(§10.1).
   if (r.disclosure !== undefined) payload.disclosure = { ...r.disclosure };
-  if (r.billing !== undefined) payload.billing = { ...r.billing };
+  /**
+   * §11.2 과금 근거도 **배열을 복사해서** 내보낸다(폴백·이관·동의·점검 투영과 같은 규칙).
+   *
+   * 한 겹 복사(`{ ...r.billing }`)만 하던 동안 `usageConflicts`·`usageRejected` 는 **원본
+   * 참조로** 나갔다 — 이 두 배열은 "합산하지 않고 빼낸 항목"·"실측으로 볼 수 없어 버린 항목"
+   * 이라 **버려진 수량의 유일한 목록**이고, 같은 배열이 Core 의 보관 복사본(`lastResult.billing`)
+   * 에 그대로 들어 있다. 호스트가 직렬화 전에 `pop()`·`length = 0` 으로 비우면 그 응답은
+   * "충돌·거절 없음"이 되고, 그 판정은 "Core 가 그렇게 적었다"로 남는다. 대사에서 몇 주 뒤
+   * '미설명 차이'로 돌아오는 그 수량이 바로 이 목록이다(§2·§11.2).
+   */
+  if (r.billing !== undefined) {
+    const bn = r.billing;
+    payload.billing = {
+      ...bn,
+      ...(bn.usageConflicts !== undefined ? { usageConflicts: [...bn.usageConflicts] } : {}),
+      ...(bn.usageRejected !== undefined ? { usageRejected: [...bn.usageRejected] } : {}),
+    };
+  }
   // §6.1 반영 사실도 **필드별로 다시 적는다**(이관·전환 투영과 같은 규칙).
   if (r.connector !== undefined) {
     payload.connector = {
