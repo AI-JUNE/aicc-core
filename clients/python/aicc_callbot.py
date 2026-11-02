@@ -336,6 +336,11 @@ class HookStats:
     health_samples_accepted: int = 0
     #: 선언되지 않은 컴포넌트라 **버려진** 샘플 수. 0 이 아니면 선언 목록·오타를 봐야 한다.
     health_samples_ignored: int = 0
+    #: **실측으로 볼 수 없어 기록되지 않은** 샘플 수(모르는 상태·해석 불가 관측 시각·음수·NaN).
+    #: `health_samples_ignored` 와 **합치지 않는다** — 고칠 곳이 다르다: 저쪽은 등록 선언이고
+    #: 이쪽은 호스트가 조립한 값(엔진 SDK 응답 매핑)이다. 0 이 아니면 그 컴포넌트는 이 보고로
+    #: 갱신되지 않았고, 그 상태는 §9.3 판정에서 **정상과 구분되지 않는다**(§13-3).
+    health_samples_rejected: int = 0
     #: 접수 범위를 **알 수 없었던** 보고 수(Core 구현이 돌려주지 않음). 접수됨으로 세지 않는다(§13-3).
     health_intake_unknown: int = 0
     #: 헬스 보고가 한도로 거절된 횟수. 헬스는 통화 경로 op 라 제한 대상이다(유지 루프와 다르다).
@@ -886,6 +891,7 @@ class CallbotCoreHooks:
                     self.stats.health_samples_offered += offered
                 accepted = res.health_accepted
                 ignored = res.health_ignored
+                rejected = res.health_rejected
                 if res.health_intake_known is not True:
                     self.stats.health_intake_unknown += 1
                 else:
@@ -893,6 +899,8 @@ class CallbotCoreHooks:
                         self.stats.health_samples_accepted += accepted
                     if ignored is not None:
                         self.stats.health_samples_ignored += ignored
+                    if rejected is not None:
+                        self.stats.health_samples_rejected += rejected
                     if res.health_registered is False:
                         self._report("E_HEALTH_NOT_REGISTERED",
                                      "이 어댑터가 Core 에 등록돼 있지 않아 헬스 샘플이 한 건도 "
@@ -901,6 +909,14 @@ class CallbotCoreHooks:
                         self._report("E_HEALTH_UNDECLARED_COMPONENT",
                                      "선언되지 않은 컴포넌트의 헬스 샘플이 버려졌습니다 — "
                                      "선언 목록은 응답의 declared 에 있습니다(§9.3).")
+                    # **선언 밖 컴포넌트와 따로 올린다**(고칠 곳이 다르다): 이쪽은 우리가 조립한
+                    # 값이 실측으로 성립하지 않는 것이고, 버려진 샘플은 §9.3 판정에서 "정상"과
+                    # 구분되지 않는다. `elif` 로 묶지 않는다 — 한 보고에 둘이 같이 날 수 있다.
+                    if rejected:
+                        self._report("E_HEALTH_SAMPLE_REJECTED",
+                                     "실측으로 볼 수 없는 헬스 샘플이 기록되지 않았습니다"
+                                     "(모르는 상태·해석 불가 관측 시각·음수·NaN) — "
+                                     "그 컴포넌트는 이 보고로 갱신되지 않았습니다(§9.3·§13-3).")
             elif res.rate_limited:
                 # 한도 초과는 장애가 아니다(턴과 같은 규칙) — degraded 로 올리지 않는다.
                 self.stats.health_reports_rate_limited += 1

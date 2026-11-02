@@ -1037,6 +1037,35 @@ test('모르는 상태는 거절한다 — 상태 없는 샘플을 up 으로 읽
   }
 });
 
+test('§9.3 샘플 모양 판정은 Core 와 같은 함수다 — 해석할 수 없는 관측 시각도 거절한다', b, async () => {
+  const { bridge } = build();
+  // 종전에는 `observedAt` 이 **비어 있지만 않으면** 통과했다. 해석되지 않는 시각은 레지스트리의
+  // 도착 순서 판정을 무너뜨려 그 컴포넌트를 사람이 손대기 전까지 갱신되지 않게 만든다(§9.3).
+  const bads = [
+    { component: 'stt', state: 'up', observedAt: '방금' },
+    { component: 'stt', state: 'up', errorRate: -1 },
+    { component: 'stt', state: 'up', latencyMs: Number.NaN },
+    { component: 'stt', state: 'up', detail: 7 },
+    { component: '   ', state: 'up' },
+  ];
+  for (const sample of bads) {
+    const r = await bridge.handleLine(line({ id: '1', op: 'health', report: { observedAt: NOW, samples: [sample] } }));
+    assert.equal(r.ok, false, `거절되지 않았다: ${JSON.stringify(sample)}`);
+    assert.equal(r.error.code, 'E_BAD_REQUEST');
+  }
+  // 보고 전체의 시각을 쓰는 종전 동작(샘플에 시각이 없다)은 그대로다.
+  const ok = await bridge.handleLine(line({
+    id: '2', op: 'health', report: { observedAt: NOW, samples: [{ component: 'stt', state: 'up' }] },
+  }));
+  assert.equal(ok.ok, true, JSON.stringify(ok.error));
+  assert.equal(ok.result.rejected, 0, '브리지가 먼저 거절하므로 이 경로의 거절 수는 0 이다');
+  // 모르는 칸은 §9.3 레지스트리로 넘기지 않는다(투영과 같은 규칙).
+  const extra = await bridge.handleLine(line({
+    id: '3', op: 'health', report: { observedAt: NOW, samples: [{ component: 'stt', state: 'up', 비밀: 'x' }] },
+  }));
+  assert.equal(extra.ok, true, JSON.stringify(extra.error));
+});
+
 // ── 계약 버전 불일치(§2) ─────────────────────────────────────────────────────
 
 test('Core 계약 버전이 브리지와 다르면 기동을 거절한다 — Node 경로와 같은 판정이다', b, () => {

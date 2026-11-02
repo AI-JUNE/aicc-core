@@ -1069,9 +1069,46 @@ h.close()
   assert.equal(out.stats.health_samples_offered, 2);
   assert.equal(out.stats.health_samples_accepted, 1);
   assert.equal(out.stats.health_samples_ignored, 1);
+  assert.equal(out.stats.health_samples_rejected, 0, '성립한 샘플을 거절로 셌다');
   assert.equal(out.stats.health_intake_unknown, 0);
   assert.deepEqual(out.errors, ['E_HEALTH_UNDECLARED_COMPONENT'],
     '버려진 샘플을 조용히 두면 선언 오타가 영구히 남는다');
+});
+
+test('§9.3 실측으로 볼 수 없어 기록되지 않은 샘플은 선언 밖 컴포넌트와 따로 센다(실패 경로)', b, () => {
+  // Core 는 이 보고를 **막지 않는다**(막으면 장애가 정상으로 집계된다) — 그래서 버린 사실은
+  // 접수 범위로만 돌아온다. 읽지 않으면 "올리고 있다"와 "한 건도 §9.3 에 닿지 않는다"가 같다.
+  // (이 프로토콜에서는 브리지가 같은 판정으로 줄 자체를 거절하므로 `rejected > 0` 은 Node
+  //  호스트 경로·판정이 갈라진 배치에서 온다 — 그 응답을 그대로 흉내 낸다.)
+  const out = parse(runDriver(`${PRELUDE}
+from aicc_bridge import BridgeResponse
+
+class Intake:
+    def __init__(self):
+        self.transcript = None
+    def hello(self): return BridgeResponse(id="1", ok=True, result={})
+    def report_health(self, samples, observed_at):
+        return BridgeResponse(id="2", ok=True, result={
+            "registered": True, "offered": 3, "accepted": 1, "ignored": 1, "rejected": 1,
+            "declared": ["telephony"], "acceptedKnown": True})
+    def close(self): pass
+
+h = CallbotCoreHooks(lambda: Intake(), flow_id="f", on_error=lambda code, m: errors.append(code))
+res = h.report_health([{"component": "telephony", "state": "down"}], "2026-10-25T00:00:00.000Z")
+json.dump({"transcript": None, "stats": h.stats.as_dict(), "errors": errors,
+           "offered": res.health_offered, "accepted": res.health_accepted,
+           "ignored": res.health_ignored, "rejected": res.health_rejected},
+          sys.stdout, ensure_ascii=False)
+h.close()
+`));
+  assert.equal(out.offered, 3);
+  assert.equal(out.accepted, 1);
+  assert.equal(out.ignored, 1);
+  assert.equal(out.rejected, 1, '실측으로 볼 수 없어 버려진 샘플을 읽지 않았다(§9.3)');
+  assert.equal(out.stats.health_samples_rejected, 1);
+  assert.equal(out.stats.health_samples_ignored, 1, '두 사유를 합쳐 세면 고칠 곳을 잘못 찾는다');
+  // 둘은 같은 보고에서 함께 날 수 있다 — 하나로 묶으면 다른 하나가 사라진다.
+  assert.deepEqual(out.errors, ['E_HEALTH_UNDECLARED_COMPONENT', 'E_HEALTH_SAMPLE_REJECTED']);
 });
 
 test('§9.3 접수 범위를 알 수 없는 응답을 접수됨으로 세지 않는다(실패·경계 경로)', b, () => {

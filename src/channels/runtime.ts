@@ -33,7 +33,7 @@ import type { EventMeta, InteractionEvent, LatencyMs, TurnCompletedEvent, Handof
 import { measuredDurationMs, sessionStarted, sessionEnded, handoffRequested, turnCompleted } from '../events/schema.ts';
 import type { EventBus, PublishResult } from '../events/bus.ts';
 import type { ComponentId, FallbackDecision, FallbackPolicy, HealthRegistry, HealthSample } from '../ops/fallback.ts';
-import { decideFallbackMode, mediaDisabledBy } from '../ops/fallback.ts';
+import { decideFallbackMode, healthSampleDefect, mediaDisabledBy } from '../ops/fallback.ts';
 import type { BuildInfo, DependencyProbe, Scheduler } from '../ops/health.ts';
 import type { CoreReadinessReport } from '../ops/executeHealth.ts';
 import { runReadiness } from '../ops/executeHealth.ts';
@@ -4185,16 +4185,52 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
     send: (interactionId, turn) => observe('send', { interactionId }, () => impl.send(interactionId, turn)),
     end: (interactionId, reasonKo, input) => observe('end', { interactionId }, () => impl.end(interactionId, reasonKo, input)),
 
+    /**
+     * §9.3 헬스 샘플 접수. **던지지 않는다**(위 `rateLimiter` 주석과 같은 저울 — 샘플을
+     * 떨어뜨리면 장애가 정상으로 집계된다).
+     *
+     * **모양을 검사한다**(2026-11-03). 종전에는 이 경로에 검사가 **한 줄도 없었다** —
+     * 브리지(JSONL)는 상태·시각·숫자·문구를 전부 검증하는데, 실제로 Core 를 소비하기 시작한
+     * 두 저장소(챗봇·D-ARS)는 TypeScript 호스트라 **이 경로**를 쓴다(`ChannelTurnInput.usage`
+     * 와 같은 모양의 비대칭이고, 그때와 같이 보호가 아무도 지나가지 않는 길에 걸려 있었다).
+     * 타입은 방어선이 아니다: 샘플은 대개 엔진 SDK 응답·설정 문자열에서 조립되고 그 자리에
+     * `any`·`as` 가 섞인다.
+     *
+     * 통과하지 못한 샘플은 **기록하지 않고 센다**(`rejected`) — `ignored`(선언 밖 컴포넌트)와
+     * 섞지 않는다: 한쪽은 "그 채널이 올릴 수 없는 컴포넌트"이고 한쪽은 "실측으로 볼 수 없는
+     * 값"이라 고칠 곳이 다르다(§13-3). 판정은 `healthSampleDefect` 하나이며 여기서 다시 쓰지
+     * 않는다(§2). 사유는 `W_HEALTH_SAMPLE` 로 드러낸다 — 조용히 버리면 "헬스를 올리고 있다"와
+     * "한 건도 §9.3 에 닿지 않는다"가 바깥에서 구분되지 않는다.
+     */
     reportHealth(report: ChannelHealthReport): HealthIntakeReceipt {
       const allowed = declared.get(report.adapter);
       const accepted: HealthSample[] = [];
       let ignored = 0;
+      let rejected = 0;
+      // **순회 전에 형태를 본다.** 아래 `offered` 는 이미 배열 여부를 확인하는데, 순회 쪽은
+      // 확인하지 않아 배열이 아닌 보고가 등록된 어댑터로 오면 그 자리에서 `TypeError` 였다 —
+      // 막지 않기로 한 진입점이 호스트의 조립 실수 하나로 통화 쪽 코드를 깨뜨린다.
+      const samples: readonly unknown[] = Array.isArray(report.samples) ? report.samples : [];
       if (allowed !== undefined) {
-        for (const s of report.samples) {
+        for (const raw of samples) {
+          const defect = healthSampleDefect(raw);
+          if (defect !== undefined) {
+            rejected += 1;
+            warnOnce('W_HEALTH_SAMPLE',
+              `${isKnownAdapter(report.adapter) ? report.adapter : '등록된'} 채널이 올린 §9.3 헬스 샘플을 `
+              + `실측으로 볼 수 없어 기록하지 않았습니다: ${defect} — `
+              + '그 컴포넌트는 이 보고로 갱신되지 않습니다(샘플 누락은 "정상"이 아닙니다, §13-3).');
+            continue;
+          }
+          const s = raw as HealthSample;
           // 선언하지 않은 컴포넌트의 샘플은 무시한다 — 아무 채널이나 전체 폴백을 유발할 수 없다(§9.3).
           if (allowed.has(s.component)) {
-            opts.health.record(s);
-            accepted.push(s);
+            // 호스트가 보낸 자유 문구다. **저장 경로로 들어가기 전에** 마스킹한다(§10.3 —
+            // 브리지가 같은 자리에서 같은 일을 한다). 원본 객체는 손대지 않고, 관측에 넘기는
+            // 쪽도 같은 복사본이다(두 벌을 들고 다니면 한쪽만 원문으로 남는다).
+            const stored = s.detail === undefined ? s : { ...s, detail: maskPii(s.detail).text };
+            opts.health.record(stored);
+            accepted.push(stored);
           } else {
             ignored += 1;
           }
@@ -4202,7 +4238,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
       }
       // 등록되지 않은 채널의 보고는 순회하지 않으므로(종전 동작) 개수만 센다 —
       // 배열이 아닌 값을 0 으로 적지 않기 위해 형태를 확인한다.
-      const offered = Array.isArray(report.samples) ? report.samples.length : 0;
+      const offered = samples.length;
       // 버려진 보고를 관측에 남긴다. 이 자리는 **조용한 실패의 전형**이었다 — 등록되지 않은
       // 채널이나 선언하지 않은 컴포넌트의 샘플은 통째로 사라지는데, 헬스를 성실히 올리는 채널과
       // 아무 신호도 전달되지 않는 채널이 바깥에서 구분되지 않았다(§9.3).
@@ -4216,6 +4252,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
           offered,
           accepted,
           ignored,
+          rejected,
         },
       });
       // **접수 범위를 호출자에게도 돌려준다.** 관측 배선은 Node 쪽에만 있으므로, 이 값이
@@ -4227,6 +4264,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
         offered,
         accepted: accepted.length,
         ignored,
+        rejected,
         declared: allowed === undefined ? [] : [...allowed],
       };
     },

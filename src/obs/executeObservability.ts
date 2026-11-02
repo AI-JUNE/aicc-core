@@ -163,6 +163,11 @@ export interface ObservedHealth {
   accepted: readonly HealthSample[];
   /** 선언하지 않은 컴포넌트라 버려진 샘플 수. */
   ignored: number;
+  /**
+   * 실측으로 볼 수 없어 버려진 샘플 수(모르는 상태·해석 불가 시각·음수·NaN).
+   * `ignored` 와 **섞지 않는다** — 고칠 곳이 다르다(선언 목록 대 호스트의 조립, §13-3).
+   */
+  rejected?: number;
 }
 
 export interface ObservationDecision {
@@ -312,6 +317,11 @@ function healthFields(h: ObservedHealth, out: Record<string, string | number | b
   }
   if (h.ignored > 0) {
     reasons.push(`선언하지 않은 컴포넌트의 샘플 ${h.ignored}건이 버려졌습니다 — 그 장애는 §9.3 판정에 닿지 않습니다.`);
+  }
+  if (h.rejected !== undefined && h.rejected > 0) {
+    out.rejected = h.rejected;
+    reasons.push(`실측으로 볼 수 없는 샘플 ${h.rejected}건을 기록하지 않았습니다 — `
+      + '그 컴포넌트는 이 보고로 갱신되지 않습니다(§13-3).');
   }
   if (worst === 'down' || worst === 'degraded') {
     reasons.push(`엔진·회선 상태가 ${worst} 로 보고됐습니다(§9.3).`);

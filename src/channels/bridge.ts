@@ -41,8 +41,8 @@ import { assertTenantScope } from '../core/tenancy.ts';
 import type { FlowInput } from '../flow/runner.ts';
 import type { EntryPoint, LatencyMs, UsageMetrics } from '../events/schema.ts';
 import { ENTRY_POINTS, LATENCY_KEYS, USAGE_METRIC_KEYS } from '../events/schema.ts';
-import type { HealthSample, ComponentId } from '../ops/fallback.ts';
-import { isHealthState } from '../ops/fallback.ts';
+import type { HealthSample } from '../ops/fallback.ts';
+import { healthSampleDefect } from '../ops/fallback.ts';
 import type { ClosedAction } from '../routing/agentQueue.ts';
 import type {
   AlternativeCause, HandoffPlacement, HandoffUnavailableCode,
@@ -692,28 +692,27 @@ function toHealthSamples(body: Record<string, unknown>): { samples: HealthSample
   const samples: HealthSample[] = [];
   for (const s of report.samples) {
     if (!isPlainObject(s)) bad('samples 항목은 객체여야 합니다.');
-    if (!nonEmptyString(s.component)) bad('samples 항목에 component 가 없습니다.');
     // 알 수 없는 컴포넌트는 여기서 막지 않는다 — Core 가 선언 목록으로 거른다(§9.3).
-    if (!isHealthState(s.state)) {
-      // 상태 없는 샘플을 up 으로 읽으면, 장애 중인 엔진이 정상으로 집계된다(§9.3).
-      bad(`samples 항목의 state 가 유효하지 않습니다: ${String(s.state)}`);
-    }
+    // **모양 판정은 `healthSampleDefect` 하나다**(§2) — 종전에는 같은 검사를 여기 손으로
+    // 적어 두었고, 그래서 Node 호스트가 `core.reportHealth` 로 바로 넘기는 경로에는 아무
+    // 검사도 없었다(`ChannelTurnInput.usage` 와 같은 비대칭). 판정을 내보내 양쪽이 같은
+    // 규칙을 받는다. 시각 기본값은 **판정 전에** 채운다 — 샘플마다 적지 않는 것이 이 프로토콜의
+    // 종전 동작이고(보고 전체의 `observedAt` 을 쓴다) 판정은 채워진 모양을 봐야 한다.
+    // 칸은 **손으로 하나씩 옮겨 적는다**(투영과 같은 규칙) — 호스트가 보낸 객체를 그대로
+    // 흘리면 모르는 칸이 §9.3 레지스트리에 들어가 `/health` 스냅샷으로 되돌아 나간다.
     const sample: Record<string, unknown> = {
-      component: s.component as ComponentId,
+      component: s.component,
       state: s.state,
       observedAt: nonEmptyString(s.observedAt) ? s.observedAt : report.observedAt,
+      ...(s.errorRate !== undefined ? { errorRate: s.errorRate } : {}),
+      ...(s.latencyMs !== undefined ? { latencyMs: s.latencyMs } : {}),
+      ...(s.detail !== undefined ? { detail: s.detail } : {}),
     };
-    for (const key of ['errorRate', 'latencyMs'] as const) {
-      if (s[key] === undefined) continue;
-      if (typeof s[key] !== 'number' || !Number.isFinite(s[key] as number) || (s[key] as number) < 0) {
-        bad(`samples.${key} 는 음이 아닌 유한 숫자여야 합니다(§13-3).`);
-      }
-      sample[key] = s[key];
-    }
-    if (s.detail !== undefined) {
-      if (typeof s.detail !== 'string') bad('samples.detail 은 문자열이어야 합니다.');
+    const defect = healthSampleDefect(sample);
+    if (defect !== undefined) bad(`samples 항목이 §9.3 헬스 샘플로 성립하지 않습니다: ${defect}`);
+    if (sample.detail !== undefined) {
       // 호스트가 보낸 자유 문구다. 저장 경로로 들어가기 전에 여기서 한 번 마스킹한다(§10.3).
-      sample.detail = maskPii(s.detail).text;
+      sample.detail = maskPii(sample.detail as string).text;
     }
     samples.push(sample as unknown as HealthSample);
   }

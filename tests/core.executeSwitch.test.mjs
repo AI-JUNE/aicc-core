@@ -149,6 +149,53 @@ test('레지스트리 거절(토큰 중복)은 결과로 내려가고 사유 문
   assert.equal(again.reasonKo.includes('tk_abcdef123456'), false);
 });
 
+test('레지스트리가 입력을 되뱉으면 발급 실패 사유도 마스킹을 지난다(§10.3)', b, () => {
+  // 레지스트리는 **호스트가 구현한다**(인터페이스다). 그리고 `issue` 가 받는 값에는 마스킹 전
+  // 슬롯 원문이 그대로 들어 있다 — 마스킹은 레지스트리 안에서 일어나기 때문이다. 즉 입력을
+  // 되뱉는 구현이면 고객 연락처가 그대로 올라오는데, 그 문구가 가는 곳이 와이어다
+  // (`switchInvite.notIssuedKo` 는 노출 스위치와 무관하게 나간다).
+  // **토큰 없이 슬롯만 되뱉는 모양**이 핵심이다: 토큰이 섞이면 문구를 통째로 버리므로
+  // (`redactSwitchToken`) 그쪽은 이미 막혀 있었다. 남아 있던 구멍은 승계 슬롯 값만 올라오는
+  // 경우다 — 레지스트리가 "이 값은 저장할 수 없다"를 값과 함께 말하는 흔한 모양이다.
+  const echo = {
+    issue: (args) => { throw new Error(`승계 슬롯을 저장할 수 없습니다: ${Object.values(args.slots).join(', ')}`); },
+    redeem: () => ({ ok: false, rejection: 'not_found', reasonKo: '없음' }),
+    purge: () => 0,
+  };
+  const r = ex.issueSwitch(params({
+    registry: echo,
+    slots: { customer_name: '홍길동', phone: '010-1234-5678' },
+    carry: { allow: ['phone'] },
+  }));
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'E_ISSUE_FAILED');
+  assert.equal(r.reasonKo.includes('010-1234-5678'), false, '개인정보 원문이 와이어로 나갔다(§10.3)');
+  // 사실 자체는 남는다(발급하지 못했다를 말해 주는 경로가 이 사유 하나다).
+  assert.ok(r.reasonKo.includes('승계 슬롯을 저장할 수 없습니다'));
+
+  // 토큰이 섞인 문구는 종전과 같이 **통째로** 버린다 — 순서가 곧 안전장치다.
+  const leaky = {
+    issue: (args) => { throw new Error(`중복 토큰: ${args.token} / ${Object.values(args.slots).join(', ')}`); },
+    redeem: () => ({ ok: false, rejection: 'not_found', reasonKo: '없음' }),
+    purge: () => 0,
+  };
+  const r2 = ex.issueSwitch(params({ registry: leaky, carry: { allow: ['customer_name'] } }));
+  assert.equal(r2.ok, false);
+  assert.equal(r2.reasonKo.includes('tk_abcdef123456'), false);
+  assert.equal(r2.reasonKo.includes('홍길동'), false);
+});
+
+test('토큰이 섞이지 않은 레지스트리 사유는 그대로 남고 마스킹만 지난다(정상 경로)', b, () => {
+  const plain = {
+    issue: () => { throw new Error('초대 테이블이 잠겨 있습니다'); },
+    redeem: () => ({ ok: false, rejection: 'not_found', reasonKo: '없음' }),
+    purge: () => 0,
+  };
+  const r = ex.issueSwitch(params({ registry: plain }));
+  assert.equal(r.ok, false);
+  assert.ok(r.reasonKo.includes('초대 테이블이 잠겨 있습니다'), '고칠 곳을 알려 주는 문구가 사라졌다');
+});
+
 test('스코프 없는 발급·상환은 결과가 아니라 예외다(§11.1)', b, () => {
   assert.throws(() => ex.issueSwitch(params({ scope: { tenantId: '' } })), /tenant_id/);
   const { registry, ticket } = issued();

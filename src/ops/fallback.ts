@@ -65,6 +65,65 @@ export function isHealthState(v: unknown): v is HealthState {
   return typeof v === 'string' && (HEALTH_STATES as readonly string[]).includes(v);
 }
 
+/**
+ * 관측 시각을 **순간(ms)으로** 읽는다. 해석할 수 없으면 `undefined` 다 — 0 으로 바꾸지 않는다
+ * (1970년에 관측한 샘플이 되고, 그 샘플은 언제나 '낡음'으로 읽힌다).
+ */
+function instantOf(iso: unknown): number | undefined {
+  if (typeof iso !== 'string' || iso.trim() === '') return undefined;
+  const ms = Date.parse(iso);
+  return Number.isNaN(ms) ? undefined : ms;
+}
+
+/**
+ * 외부에서 온 값이 **헬스 샘플로 쓸 수 있는 모양인가**. 쓸 수 없으면 사유를, 쓸 수 있으면
+ * `undefined` 를 돌려준다. 판정은 이 함수 하나다(§2).
+ *
+ * 왜 내보내는가(2026-11-03): 같은 검사가 필요한 자리가 **둘인데 한쪽에만 있었다**.
+ * JSONL 브리지(`channels/bridge.ts` 의 `toHealthSamples`)는 상태·숫자·문구를 전부 검증하고
+ * 거절하는데, **TypeScript 호스트가 `core.reportHealth` 로 바로 넘기는 경로에는 아무 검사도
+ * 없었다** — `ChannelTurnInput.usage` 가 그랬던 것과 **같은 모양의 비대칭**이고(`turnUsage.ts`
+ * 머리말 (2)), 하필 실제로 Core 를 소비하기 시작한 두 저장소(챗봇·D-ARS)가 그 경로를 쓴다.
+ * 즉 보호는 아무도 지나가지 않는 길에 걸려 있었다.
+ *
+ * 걸러야 하는 것이 정해져 있고 **셋 다 장애로 보이지 않는다**:
+ *  - **모르는 상태**: `effectiveState` 는 아는 상태만 가려내므로(`isHealthState` 주석) 오타 하나가
+ *    `isBad`·`degraded`·`unknown` 어디에도 걸리지 않고, 그 컴포넌트는 §9.3 판정에서 **정상으로
+ *    읽힌다**. `state: 'UP'` 하나로 죽은 LLM 이 `normal` 이 되고 폴백은 걸리지 않는다.
+ *  - **해석할 수 없는 관측 시각**: 그 샘플이 레지스트리에 들어가면 `record` 의 "늦게 도착한
+ *    과거 샘플" 가드가 **순서를 판정할 수 없게 되고**, 그 뒤 진짜 샘플이 전부 늦은 것으로
+ *    버려질 수 있다 — 한 번 섞이면 그 컴포넌트는 사람이 손대기 전까지 갱신되지 않는다.
+ *  - **실측이 아닌 숫자**: 음수·NaN·무한은 관측이 아니라 계산 실수의 신호다(§13-3).
+ *
+ * **아는 컴포넌트인지는 묻지 않는다** — 그 거름은 채널이 등록 시 선언한 목록으로 한다(§9.3,
+ * 브리지도 같은 이유로 묻지 않는다). 문구(`detail`)의 마스킹도 여기서 하지 않는다: 판정과
+ * 변환을 한 함수에 묶으면 "검사했는데 저장은 원문"이 생긴다 — 저장하는 쪽이 지나게 한다(§10.3).
+ */
+export function healthSampleDefect(v: unknown): string | undefined {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return '헬스 샘플이 객체가 아닙니다.';
+  const s = v as Record<string, unknown>;
+  if (typeof s.component !== 'string' || s.component.trim() === '') {
+    return '헬스 샘플에 component 가 없습니다.';
+  }
+  if (!isHealthState(s.state)) {
+    // 상태 없는 샘플을 up 으로 읽으면, 장애 중인 엔진이 정상으로 집계된다(§9.3).
+    return `헬스 샘플의 state 가 아는 상태가 아닙니다(${HEALTH_STATES.join('·')} 중 하나여야 합니다).`;
+  }
+  if (instantOf(s.observedAt) === undefined) {
+    return '헬스 샘플의 observedAt 이 해석할 수 있는 ISO8601 시각이 아닙니다 — '
+      + '낡음을 판정할 수 없고, 이후 샘플의 도착 순서도 판정할 수 없게 됩니다(§13-3).';
+  }
+  for (const key of ['errorRate', 'latencyMs'] as const) {
+    const n = s[key];
+    if (n === undefined) continue;
+    if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) {
+      return `헬스 샘플의 ${key} 가 음이 아닌 유한 숫자가 아닙니다(§13-3).`;
+    }
+  }
+  if (s.detail !== undefined && typeof s.detail !== 'string') return '헬스 샘플의 detail 이 문자열이 아닙니다.';
+  return undefined;
+}
+
 export interface HealthSample {
   component: ComponentId;
   state: HealthState;
@@ -91,13 +150,36 @@ export interface HealthRegistry {
   snapshot(): HealthSample[];
 }
 
-/** 메모리 레지스트리 — 프로브 결과를 컴포넌트별 최신 1건만 유지한다. */
+/**
+ * 메모리 레지스트리 — 프로브 결과를 컴포넌트별 최신 1건만 유지한다.
+ *
+ * **도착 순서는 순간(ms)으로 비교한다**(2026-11-03). 종전에는 ISO 문자열을 `>` 로 비교했는데,
+ * 같은 순간이 **여러 문자열로 적힌다**: Core 의 기본 시계는 `toISOString()`(…Z)이지만
+ * `observedAt` 은 호스트·프로브가 선언하는 값이고(§13-3 — Core 가 만들어 넣지 않는다) 국내
+ * 호스트는 `+09:00` 오프셋으로 적는다. 사전식으로는 `2026-11-02T09:00:00+09:00` 이
+ * `2026-11-02T00:10:00Z` 보다 **크므로**(앞자리가 `09` 대 `00`이다) 10분 뒤에 올라온 `down`
+ * 샘플이 "늦게 도착한 과거 샘플"로 버려졌다 — 그것도 **그 뒤로 전부**다. 증상은 예외가 아니다:
+ * 그 컴포넌트는 그날 하루 종일 `up` 으로 남고, §9.3 판정은 `normal` 이며, 폴백은 걸리지 않고
+ * 복구 프로브가 올리는 샘플도 같은 가드에 걸려 사라진다. 반대 방향도 같은 무게다 — 낡은
+ * `down` 이 박히면 엔진이 돌아와도 **영구히** 상담사 직결이다(`isHealthState` 주석이 적어 둔
+ * 그 결말이고, 거기서는 샘플이 버려지는 것이 원인이었다).
+ *
+ * **순서를 판정할 수 없으면 버리지 않는다**: 어느 한쪽 시각이 해석되지 않으면 방금 온 샘플을
+ * 적는다. 그 샘플은 `effectiveState` 에서 낡음 판정 불가로 `unknown`(보수적 테넌트는 `down`)이
+ * 되므로 `up` 으로 읽히지 않고, 무엇보다 **다음 샘플이 들어올 길을 막지 않는다** — 해석되지
+ * 않는 시각 하나로 컴포넌트가 동결되는 쪽이 되돌릴 수 없다. 모양 검사는 경계에서 한다
+ * (`healthSampleDefect`) — 레지스트리는 받은 것을 적는 자리다.
+ */
 export function createHealthRegistry(initial: HealthSample[] = []): HealthRegistry & { record(s: HealthSample): void } {
   const map = new Map<ComponentId, HealthSample>();
   const record = (s: HealthSample): void => {
     const prev = map.get(s.component);
     // 늦게 도착한 과거 샘플이 최신 상태를 덮어쓰지 않게 한다.
-    if (prev && prev.observedAt > s.observedAt) return;
+    if (prev !== undefined) {
+      const prevMs = instantOf(prev.observedAt);
+      const nextMs = instantOf(s.observedAt);
+      if (prevMs !== undefined && nextMs !== undefined && prevMs > nextMs) return;
+    }
     map.set(s.component, s);
   };
   for (const s of initial) record(s);

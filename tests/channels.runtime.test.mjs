@@ -287,6 +287,57 @@ test('헬스 보고는 **접수 범위**를 돌려준다 — 버려진 사실이
   assert.deepEqual(core.reportHealth({ adapter: 'callbot', observedAt: NOW, samples: [] }).declared, ['telephony']);
 });
 
+// ── 헬스 샘플 모양 검증 — Node 경로(2026-11-03) ──────────────────────────────
+// 브리지(JSONL)는 상태·시각·숫자를 전부 검증하는데 이 경로에는 검사가 한 줄도 없었다
+// (`ChannelTurnInput.usage` 와 같은 비대칭). 타입은 방어선이 아니다 — 샘플은 엔진 SDK 응답·
+// 설정 문자열에서 조립되고 그 자리에 `any`·`as` 가 섞인다.
+test('§9.3 실측으로 볼 수 없는 헬스 샘플은 기록하지 않고 센다 — 모르는 상태는 "정상"이 된다', b, async () => {
+  const { core, health } = build({ components: ['telephony', 'llm'] });
+  const r = core.reportHealth({ adapter: 'callbot', observedAt: NOW, samples: [
+    { component: 'llm', state: 'UP', observedAt: NOW },               // 오타 — isHealthState 를 못 지난다
+    { component: 'telephony', state: 'down', observedAt: '방금' },    // 해석 불가 시각
+    { component: 'llm', state: 'degraded', observedAt: NOW, latencyMs: Number.NaN },
+    { component: 'llm', state: 'down', observedAt: NOW },             // 유일하게 성립하는 샘플
+  ] });
+  assert.equal(r.offered, 4);
+  assert.equal(r.accepted, 1);
+  assert.equal(r.rejected, 3, '버린 샘플을 세지 않으면 "올리고 있다"와 "한 건도 닿지 않는다"가 같아진다');
+  assert.equal(r.ignored, 0, '선언 밖 컴포넌트와 섞어 세면 고칠 곳을 잘못 찾는다(§13-3)');
+  // 기록된 것은 성립한 샘플 하나뿐이다 — 오타 난 상태가 레지스트리에 들어가면 §9.3 은 정상으로 읽는다.
+  assert.equal(health.latest('llm').state, 'down');
+  assert.equal(health.latest('telephony'), undefined);
+  const w = core.warnings().filter((i) => i.code === 'W_HEALTH_SAMPLE');
+  assert.ok(w.length > 0, '조용히 버리면 §9.3 미도달이 정상과 구분되지 않는다');
+  assert.ok(w.every((i) => i.severity === 'warning'));
+});
+
+test('§9.3 성립하는 샘플만 올리면 거절 0 이다 — 0 은 "검사했고 전부 통과"다', b, async () => {
+  const { core } = build({ components: ['telephony'] });
+  const r = core.reportHealth({ adapter: 'callbot', observedAt: NOW, samples: [
+    { component: 'telephony', state: 'up', observedAt: NOW, errorRate: 0, latencyMs: 12 },
+  ] });
+  assert.equal(r.rejected, 0);
+  assert.equal(r.accepted, 1);
+  assert.deepEqual(core.warnings().filter((i) => i.code === 'W_HEALTH_SAMPLE'), []);
+});
+
+test('§10.3 헬스 샘플의 자유 문구는 저장 경로로 들어가기 전에 마스킹된다', b, async () => {
+  const { core, health } = build({ components: ['telephony'] });
+  const sample = { component: 'telephony', state: 'degraded', observedAt: NOW, detail: '발신 010-1234-5678 실패' };
+  core.reportHealth({ adapter: 'callbot', observedAt: NOW, samples: [sample] });
+  assert.ok(!health.latest('telephony').detail.includes('010-1234-5678'), '원문이 §9.3 레지스트리에 남았다');
+  assert.equal(sample.detail, '발신 010-1234-5678 실패', '호스트의 원본 객체를 고쳤다');
+});
+
+test('§9.3 배열이 아닌 헬스 보고도 막지 않는다 — 던지면 호스트의 조립 실수가 통화 코드를 깨뜨린다', b, async () => {
+  const { core } = build({ components: ['telephony'] });
+  const r = core.reportHealth({ adapter: 'callbot', observedAt: NOW, samples: undefined });
+  assert.equal(r.registered, true);
+  assert.equal(r.offered, 0);
+  assert.equal(r.accepted, 0);
+  assert.equal(r.rejected, 0);
+});
+
 test('시나리오 레지스트리는 버전을 지정하지 않으면 최신을 준다', b, () => {
   const reg = R.createMemoryFlowRegistry([flowBilling, { ...flowBilling, version: 5 }]);
   assert.equal(reg.get('billing').version, 5);

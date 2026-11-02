@@ -47,9 +47,11 @@ Callbot 의 음성 에이전트는 파이썬 프로세스다. Node 로 된 채�
 11. **헬스도 보냈다와 접수됐다를 구분한다(§9.3).** 10번과 같은 질문이 폴백 쪽에도 있다.
    Core 는 등록되지 않은 어댑터의 보고와 **선언하지 않은 컴포넌트**의 샘플을 조용히 버리는데
    (아무 채널이나 전체 폴백을 유발할 수 없게 하는 규칙이다) 그 응답도 `ok: True` 다. 그래서
-   `health_accepted`·`health_ignored`·`health_registered`·`health_intake_known` 이 있고,
-   **모름을 0 으로도 `offered` 로도 읽지 않는다** — 0 으로 읽으면 멀쩡한 보고가 전부 유실로
-   집계되고, `offered` 로 읽으면 **한 건도 닿지 않는 상태가 정상으로** 집계된다(§13-3).
+   `health_accepted`·`health_ignored`·`health_rejected`·`health_registered`·`health_intake_known`
+   이 있고, **모름을 0 으로도 `offered` 로도 읽지 않는다** — 0 으로 읽으면 멀쩡한 보고가 전부
+   유실로 집계되고, `offered` 로 읽으면 **한 건도 닿지 않는 상태가 정상으로** 집계된다(§13-3).
+   버려지는 이유는 **둘이고 고칠 곳이 다르다**: 선언 밖 컴포넌트(`ignored`)와 실측으로 볼 수
+   없는 값(`rejected` — 모르는 상태·해석 불가 시각·음수·NaN)이다.
 12. **세션을 끝내는 주체가 호스트만이 아니다(§5.3·§9.3).** End 노드 도달·재시도 소진 이관·
    Api 순회 상한·장애 폴백은 Core 가 그 턴에서 세션을 닫는다. 닫힌 세션에 온 입력은 **오류가
    아니라 멱등 처리**다 — `ok: True` · `events` 0건이고 **직전 턴의 상태·단계가 그대로** 실려
@@ -625,6 +627,25 @@ class BridgeResponse:
         if intake is None or intake.get("acceptedKnown") is not True:
             return None
         value = intake.get("ignored")
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    @property
+    def health_rejected(self) -> Optional[int]:
+        """**실측으로 볼 수 없어 기록되지 않은** 샘플 수(모르는 상태·해석 불가 관측 시각·
+        음수·NaN).
+
+        `health_ignored` 와 **따로 센다** — 고칠 곳이 다르다: `ignored` 는 등록 선언
+        (`reportsComponents`)의 문제이고 이 칸은 **호스트가 조립한 값**의 문제다(엔진 SDK 응답
+        매핑·설정 문자열). 둘을 합치면 운영은 선언 목록을 뒤지는데 실제로 틀린 것은 매핑이다.
+
+        이 경로(JSONL)에서는 평시 0 이다 — 브리지가 같은 판정으로 줄 자체를 거절하기 때문이다
+        (`E_BAD_REQUEST`). 0 이 아니면 **Core 와 브리지의 판정이 갈라진 것**이므로 버전 섞임을
+        먼저 본다(§2).
+        """
+        intake = self._health_intake()
+        if intake is None or intake.get("acceptedKnown") is not True:
+            return None
+        value = intake.get("rejected")
         return value if isinstance(value, int) and not isinstance(value, bool) else None
 
     @property

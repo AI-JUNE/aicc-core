@@ -381,6 +381,15 @@ export interface HealthIntakeReceipt {
   accepted: number;
   /** 선언되지 않은 컴포넌트라 무시한 샘플 수. */
   ignored: number;
+  /**
+   * **실측으로 볼 수 없어 기록하지 않은** 샘플 수(모르는 상태·해석할 수 없는 관측 시각·
+   * 음수·NaN·무한, `healthSampleDefect`).
+   *
+   * `ignored` 와 따로 적는다 — 고칠 곳이 다르다: `ignored` 는 등록 선언(`reportsComponents`)의
+   * 문제이고 이 칸은 **호스트가 조립한 값**의 문제다. 둘을 같게 적으면 운영은 선언 목록을
+   * 뒤지는데 실제로 틀린 것은 엔진 SDK 응답 매핑이다. 0 은 "검사했고 전부 통과"다(§13-3).
+   */
+  rejected: number;
   /** 이 채널이 올릴 수 있다고 **등록 시 선언한** 컴포넌트(Core 가 가진 값). */
   declared: ComponentId[];
 }
@@ -739,7 +748,23 @@ export type ContractIssueCode =
    * 예외였고, 이 코드는 그 규칙을 한 줄로 모은다 — 문구에 던져진 값을 싣지 않는다(§10.3,
    * 그리고 경고 목록이 호출 횟수만큼 늘지 않게 한다).
    */
-  | 'W_HOST_REPORT';
+  | 'W_HOST_REPORT'
+  /**
+   * 채널이 올린 §9.3 헬스 샘플을 **실측으로 볼 수 없어 기록하지 않았다**(모르는 상태·해석할
+   * 수 없는 관측 시각·음수·NaN, `healthSampleDefect`).
+   *
+   * 왜 경고가 필요한가: 이 경로는 **막지 않는 진입점**이다(샘플을 떨어뜨리면 장애가 정상으로
+   * 집계되므로 `reportHealth` 는 거절하지 않는다). 그래서 버린 사실을 남기지 않으면
+   * "헬스를 올리고 있다"와 "한 건도 §9.3 판정에 닿지 않는다"가 바깥에서 **똑같이 보인다** —
+   * 접수 범위(`HealthIntakeReceipt.rejected`)를 읽지 않는 호스트에서는 더 그렇다.
+   *
+   * 증상은 전부 조용하다: `state: 'UP'` 같은 오타 하나는 `isHealthState` 를 지나지 못해
+   * `isBad`·`degraded`·`unknown` 어디에도 걸리지 않으므로 죽은 엔진이 `normal` 로 읽히고,
+   * 해석되지 않는 `observedAt` 하나는 레지스트리의 도착 순서 판정을 무너뜨려 그 컴포넌트를
+   * **사람이 손대기 전까지 갱신되지 않게** 만든다. 브리지(JSONL) 경로는 같은 판정으로 줄 자체를
+   * 거절하므로(`E_BAD_REQUEST`) 이 경고가 나는 것은 **Node 호스트 경로**다.
+   */
+  | 'W_HEALTH_SAMPLE';
 
 export interface ContractIssue {
   code: ContractIssueCode;

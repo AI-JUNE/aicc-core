@@ -38,6 +38,7 @@
 import type { ChannelKind } from '../domain/types.ts';
 import type { TenantScope } from './tenancy.ts';
 import { assertTenantScope } from './tenancy.ts';
+import { maskPii } from './policyGuard.ts';
 import type {
   ChannelInvite,
   InviteDeliveryKind,
@@ -220,10 +221,24 @@ export function redactSwitchToken(raw: string, token: string | undefined, instea
   return raw.includes(token) ? insteadKo : raw;
 }
 
-/** 발급 경로용 얇은 겹. 판정은 위 한 곳이다(§2). */
+/**
+ * 발급 경로용 얇은 겹. 토큰 판정은 위 한 곳이다(§2).
+ *
+ * **마스킹도 같이 지난다**(2026-11-03). 이 문구의 출처는 **호스트가 구현한 레지스트리**이고
+ * (`InviteRegistry` 는 인터페이스다 — 영속 구현으로 교체하라고 적어 두었다), 그 레지스트리가
+ * `issue` 로 받는 값에는 **마스킹 전 슬롯 원문이 그대로 들어 있다**(위 `p.registry.issue` 호출 —
+ * 마스킹은 레지스트리 **안에서** 일어난다). 즉 입력을 되뱉는 구현이면 고객 이름·연락처가
+ * 그대로 올라오는데, 그 문구가 가는 곳이 **와이어**다: `switchInvite.notIssuedKo` 는 "사유는
+ * 개인정보가 아니다"는 전제로 노출 스위치와 무관하게 나가고(`SwitchInviteNote`) 런타임의
+ * `warnings()` 에도 같은 값이 실린다.
+ *
+ * 전달 거부 쪽은 같은 규칙을 이미 받고 있었다(`channels/runtime.ts` 의 `deliverSwitchInvite` 가
+ * `maskPii(redactSwitchToken(...))` 로 둘을 겹쳐 쓴다) — 빠진 자리는 발급 실패뿐이었다.
+ * **순서도 같다**: 토큰을 먼저 지운다(마스킹을 먼저 하면 토큰이 들어 있는지 대조할 원문이 없다).
+ */
 function redactToken(e: unknown, token: string): string {
   const raw = e instanceof Error ? e.message : String(e);
-  return redactSwitchToken(raw, token, '레지스트리 거절(상세는 토큰이 포함되어 생략)');
+  return maskPii(redactSwitchToken(raw, token, '레지스트리 거절(상세는 토큰이 포함되어 생략)')).text;
 }
 
 /** 합류 거절 사유. `checkRedeem` 의 판정에 **Interaction 불일치** 하나를 더한 것이다. */

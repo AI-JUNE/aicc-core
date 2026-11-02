@@ -967,6 +967,7 @@ with client() as c:
     json.dump({"ok": res.ok, "known": res.health_intake_known,
                "registered": res.health_registered, "offered": res.health_offered,
                "accepted": res.health_accepted, "ignored": res.health_ignored,
+               "rejected": res.health_rejected,
                "declared": res.health_declared, "reason": res.health_reason_ko},
               sys.stdout, ensure_ascii=False)
 `;
@@ -979,6 +980,8 @@ with client() as c:
   assert.equal(out.offered, 3);
   assert.equal(out.accepted, 2, '버려진 샘플까지 접수됐다고 읽으면 유실이 정상으로 집계된다');
   assert.equal(out.ignored, 1);
+  // 성립하는 샘플만 올렸으므로 0 이다 — 0 은 "검사했고 전부 통과"다(모름이 아니다, §13-3).
+  assert.equal(out.rejected, 0);
   assert.equal(out.reason, null);
   // 호스트가 보낸 이름은 되돌려 오지 않는다(§10.3) — Core 가 가진 선언 목록이 온다.
   assert.ok(out.declared.includes('telephony') && out.declared.includes('stt'));
@@ -993,25 +996,28 @@ cases = {
     # Core 구현이 접수 범위를 돌려주지 않는다(종전 void 반환) — 모름이며 0 이 아니다.
     "unknown": {"offered": 3, "acceptedKnown": False, "reasonKo": "알 수 없습니다."},
     "registered_false": {"registered": False, "offered": 2, "accepted": 0, "ignored": 0,
-                         "declared": [], "acceptedKnown": True},
+                         "rejected": 0, "declared": [], "acceptedKnown": True},
     # 형태 위반 — 숫자가 아닌 값을 숫자로 읽으면 유실이 정상으로 집계된다.
-    "bad_shape": {"offered": "3", "accepted": True, "ignored": None,
+    "bad_shape": {"offered": "3", "accepted": True, "ignored": None, "rejected": "2",
                   "registered": "yes", "declared": "telephony", "acceptedKnown": True},
     # 헬스 응답이 아니다(턴 응답) — acceptedKnown 이 없으므로 전부 None 이다.
     "turn": {"interactionId": "i1", "accepted": 9, "offered": 9},
+    # 실측으로 볼 수 없어 **기록되지 않은** 샘플. ignored 와 따로 센다(고칠 곳이 다르다).
+    "rejected": {"registered": True, "offered": 3, "accepted": 1, "ignored": 1, "rejected": 1,
+                 "declared": ["telephony"], "acceptedKnown": True},
 }
 out = {}
 for k, body in cases.items():
     r = BridgeResponse(id="1", ok=True, result=body)
     out[k] = {"known": r.health_intake_known, "registered": r.health_registered,
               "offered": r.health_offered, "accepted": r.health_accepted,
-              "ignored": r.health_ignored, "declared": r.health_declared,
-              "reason": r.health_reason_ko}
+              "ignored": r.health_ignored, "rejected": r.health_rejected,
+              "declared": r.health_declared, "reason": r.health_reason_ko}
 err = BridgeResponse(id="1", ok=False, error=BridgeError("E_BAD_REQUEST", "형태 위반"))
 out["error"] = {"known": err.health_intake_known, "registered": err.health_registered,
                 "offered": err.health_offered, "accepted": err.health_accepted,
-                "ignored": err.health_ignored, "declared": err.health_declared,
-                "reason": err.health_reason_ko}
+                "ignored": err.health_ignored, "rejected": err.health_rejected,
+                "declared": err.health_declared, "reason": err.health_reason_ko}
 json.dump(out, sys.stdout, ensure_ascii=False)
 `;
   const run = withDriver(source, (f) => runPython(f));
@@ -1031,7 +1037,14 @@ json.dump(out, sys.stdout, ensure_ascii=False)
   assert.equal(out.bad_shape.offered, null, '문자열을 샘플 수로 읽었다');
   assert.equal(out.bad_shape.accepted, null, 'True 를 1 로 읽었다');
   assert.equal(out.bad_shape.ignored, null);
+  assert.equal(out.bad_shape.rejected, null, '문자열을 거절 수로 읽었다');
   assert.equal(out.bad_shape.registered, null, '문자열을 참으로 읽었다');
+  // 버려지는 이유는 둘이고 **고칠 곳이 다르다**: 선언 밖 컴포넌트와 실측으로 볼 수 없는 값이다.
+  assert.equal(out.rejected.ignored, 1);
+  assert.equal(out.rejected.rejected, 1, '실측으로 볼 수 없어 버려진 샘플을 읽지 않았다(§13-3)');
+  assert.equal(out.rejected.accepted, 1);
+  assert.equal(out.registered_false.rejected, 0, '검사했고 0건을 모름으로 읽었다');
+  assert.equal(out.unknown.rejected, null, '모름을 0 으로 읽었다');
   assert.deepEqual(out.bad_shape.declared, [], '문자열을 선언 목록으로 풀어 적었다');
   // 턴 응답의 같은 이름 필드를 헬스 접수 범위로 읽지 않는다.
   assert.equal(out.turn.known, null);
@@ -1041,6 +1054,7 @@ json.dump(out, sys.stdout, ensure_ascii=False)
   // 거부된 응답의 본문은 읽지 않는다.
   assert.equal(out.error.known, null);
   assert.equal(out.error.offered, null);
+  assert.equal(out.error.rejected, null);
   assert.deepEqual(out.error.declared, []);
 });
 
