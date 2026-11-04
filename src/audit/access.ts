@@ -19,6 +19,7 @@ import {
 } from './log.ts';
 import { canAccess, routeById, type PortalRole, type PortalRoute } from '../portal/ia.ts';
 import { assertTenantScope, type TenantScope } from '../core/tenancy.ts';
+import { compareInstants } from '../domain/instant.ts';
 
 export interface AccessActor {
   userId: string;
@@ -189,8 +190,8 @@ export function accessHistory(chain: AuditChain, q: AccessHistoryQuery): AuditRe
   const rows = chain.records.filter(r => {
     if (r.tenant_id !== q.scope.tenantId) return false;
     if (q.scope.workspaceId !== undefined && r.workspace_id !== q.scope.workspaceId) return false;
-    if (q.from !== undefined && r.occurred_at < q.from) return false;
-    if (q.to !== undefined && r.occurred_at > q.to) return false;
+    if (q.from !== undefined && compareInstants(r.occurred_at, q.from) < 0) return false;
+    if (q.to !== undefined && compareInstants(r.occurred_at, q.to) > 0) return false;
     if (q.actorUserId !== undefined && r.actor_user_id !== q.actorUserId) return false;
     if (q.routeId !== undefined && r.route_id !== q.routeId) return false;
     if (q.result !== undefined && r.result !== q.result) return false;
@@ -228,8 +229,8 @@ export function accessSummary(chain: AuditChain, q: AccessHistoryQuery): ActorAc
     if (r.result === 'denied') cur.denied += 1;
     if (r.action === 'view') cur.views += 1;
     if (r.action === 'export') cur.exports += 1;
-    if (r.occurred_at < cur.firstAt) cur.firstAt = r.occurred_at;
-    if (r.occurred_at > cur.lastAt) cur.lastAt = r.occurred_at;
+    if (compareInstants(r.occurred_at, cur.firstAt) < 0) cur.firstAt = r.occurred_at;
+    if (compareInstants(r.occurred_at, cur.lastAt) > 0) cur.lastAt = r.occurred_at;
     byActor.set(r.actor_user_id, cur);
   }
   return [...byActor.values()].sort((a, b) => b.total - a.total || a.actorUserId.localeCompare(b.actorUserId));

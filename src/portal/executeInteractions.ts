@@ -37,6 +37,7 @@ import type { EventLog, ReadOptions } from '../events/store.ts';
 import { readWasTruncated } from '../events/store.ts';
 import { assertTenantScope, type TenantScope } from '../core/tenancy.ts';
 import { maskPii } from '../core/policyGuard.ts';
+import { compareInstants } from '../domain/instant.ts';
 import type { AuditChain, AuditRecord, Hasher } from '../audit/log.ts';
 import { decideAccess, recordAccess, type AccessActor, type AccessRequest } from '../audit/access.ts';
 import {
@@ -268,7 +269,7 @@ export function projectInteractions(
       };
       byId.set(e.interaction_id, acc);
     }
-    if (e.occurred_at < acc.firstAt) acc.firstAt = e.occurred_at;
+    if (compareInstants(e.occurred_at, acc.firstAt) < 0) acc.firstAt = e.occurred_at;
     // §5.2 전환 — 채널은 관측된 전부의 합집합이다. 첫 이벤트 채널만 적으면
     // voice→visual 로 전환된 세션이 `visual` 필터에서 통째로 빠진다.
     if (!acc.channels.includes(e.channel)) acc.channels.push(e.channel);
@@ -276,7 +277,7 @@ export function projectInteractions(
     switch (e.type) {
       case 'session.started': {
         acc.sawStart = true;
-        if (acc.startedAt === undefined || e.occurred_at < acc.startedAt) acc.startedAt = e.occurred_at;
+        if (acc.startedAt === undefined || compareInstants(e.occurred_at, acc.startedAt) < 0) acc.startedAt = e.occurred_at;
         // §8.1 유입 경로. 계약 밖 값은 **그대로 적지 않는다** — 원장에는 과거 호스트가 넣은
         // 값도 남아 있고(`channelsUnknown` 과 같은 이유), 그 문자열이 목록 화면의 필터 칸에
         // 그대로 뜨면 조회 조건이 영영 맞지 않는다.
@@ -323,7 +324,7 @@ export function projectInteractions(
       case 'session.ended': {
         const s = e as SessionEndedEvent;
         acc.sawEnd = true;
-        if (acc.endedAt === undefined || e.occurred_at > acc.endedAt) acc.endedAt = e.occurred_at;
+        if (acc.endedAt === undefined || compareInstants(e.occurred_at, acc.endedAt) > 0) acc.endedAt = e.occurred_at;
         acc.outcome = s.outcome;
         if (s.duration_ms !== undefined) {
           if (typeof s.duration_ms === 'number' && Number.isFinite(s.duration_ms) && s.duration_ms >= 0) {

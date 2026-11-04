@@ -626,6 +626,15 @@
         `src/core/executeSwitch.ts`(`redactToken`) · `tests/core.executeSwitch.test.mjs`(2건 추가) ·
         `clients/python/aicc_bridge.py`·`aicc_callbot.py`(`health_rejected`) ·
         `tests/clients.callbot.test.mjs`(1건 추가) · `API.md` 반영
+      · Core 측 완료(94): **(93)의 시각 비교 결함이 감사·상호작용 조회에도 그대로 있었다(2026-11-04)** —
+        `queryAudit`·`accessHistory` 의 기간 필터, `accessSummary` 의 첫·마지막 시각,
+        `projectInteractions` 의 시작·종료 시각이 ISO 문자열을 **사전식으로** 비교했다. `+09:00`
+        표기 기록이 `Z` 기준 기간 조건에서 빠지거나(감사 조회에서 기록이 사라짐) 첫·마지막 시각이
+        거꾸로 적힌다. `domain/instant.ts`(`compareInstants`)로 순간(ms) 비교로 교체했다. 해석
+        안 되는 값은 던지지 않고 종전 사전식으로 물러난다(조회 화면 전체가 멈추지 않게, §13-3).
+        `matchesQuery` 는 이미 `Date.parse` 였다.
+        근거: `src/domain/instant.ts` · `src/audit/log.ts` · `src/audit/access.ts` ·
+        `src/portal/executeInteractions.ts` · `tests/domain.instant.test.mjs`(6건) · `API.md` 반영
       · Core 측 완료(92): **리뷰 큐 적재 실패가 점검 요약을 지웠고, 전환 초대 거절 사유에
         1회용 열쇠가 실려 나갔고, 과금 근거의 "버려진 수량" 목록만 원본 참조로 나갔고,
         흡수한 중복 종료가 live 포트에서도 드라이런으로 적혔다(2026-11-02)** — 넷 다

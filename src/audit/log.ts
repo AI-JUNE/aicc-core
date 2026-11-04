@@ -13,6 +13,7 @@
 // 비암호학적 해시를 내장하면 "변조 탐지"라는 말이 거짓이 된다. 그래서 SHA-256 구현은 호스트가 넣는다.
 
 import { maskPii } from '../core/policyGuard.ts';
+import { compareInstants } from '../domain/instant.ts';
 import { assertTenantScope, type TenantScope } from '../core/tenancy.ts';
 import type { PortalRole, PortalRoute } from '../portal/ia.ts';
 import { requiresAuditLog } from '../portal/ia.ts';
@@ -256,8 +257,8 @@ export function queryAudit(chain: AuditChain, q: AuditQuery): AuditRecord[] {
   return chain.records.filter(r => {
     if (r.tenant_id !== q.scope.tenantId) return false;
     if (q.scope.workspaceId !== undefined && r.workspace_id !== q.scope.workspaceId) return false;
-    if (q.from !== undefined && r.occurred_at < q.from) return false;
-    if (q.to !== undefined && r.occurred_at > q.to) return false;
+    if (q.from !== undefined && compareInstants(r.occurred_at, q.from) < 0) return false;
+    if (q.to !== undefined && compareInstants(r.occurred_at, q.to) > 0) return false;
     if (q.actorUserId !== undefined && r.actor_user_id !== q.actorUserId) return false;
     if (q.action !== undefined && r.action !== q.action) return false;
     if (q.targetType !== undefined && r.target_type !== q.targetType) return false;
