@@ -18,6 +18,7 @@
 import type { ChannelKind } from '../domain/types.ts';
 import type { InteractionEvent, TurnCompletedEvent, SessionStartedEvent } from '../events/schema.ts';
 import { maskPii } from '../core/policyGuard.ts';
+import { compareInstants } from '../domain/instant.ts';
 import { assertTenantScope, type TenantScope } from '../core/tenancy.ts';
 
 export type QaRuleId =
@@ -256,7 +257,9 @@ export function runComplianceCheck(
     throw new Error(`테넌트 스코프 밖 이벤트가 섞였다: ${foreign.event_id} (설계서 §11.1)`);
   }
 
-  const sorted = [...events].sort((a, b) => a.occurred_at.localeCompare(b.occurred_at));
+  // 순간(ms)으로 정렬한다 — 시각은 호스트가 선언하는 값이라 `Z` 와 `+09:00` 이 섞일 수 있고,
+  // 사전식으로는 그 둘의 순서가 뒤집혀 고지 선후(disclosure_late)·첫 이벤트 판정이 틀린다.
+  const sorted = [...events].sort((a, b) => compareInstants(a.occurred_at, b.occurred_at));
   const first = sorted[0];
   if (!first) {
     return {

@@ -626,6 +626,12 @@
         `src/core/executeSwitch.ts`(`redactToken`) · `tests/core.executeSwitch.test.mjs`(2건 추가) ·
         `clients/python/aicc_bridge.py`·`aicc_callbot.py`(`health_rejected`) ·
         `tests/clients.callbot.test.mjs`(1건 추가) · `API.md` 반영
+      · Core 측 완료(95): **QA 준수 점검도 이벤트를 시각 문자열로 정렬했다(2026-11-05)** —
+        `runComplianceCheck`(`qa/compliance.ts`)가 `occurred_at` 을 `localeCompare` 로 정렬해
+        `Z` 와 `+09:00` 이 섞이면 고지·인사 순서가 뒤집혔다. 늦게 한 AI 고지를 놓치거나(감독 점검 누락),
+        제때 한 고지를 `disclosure_late` 로 허위 적발한다. (94)의 `compareInstants` 로 교체 — 해석 안 되는
+        값은 던지지 않고 사전식으로 물러난다. 저장소 전체에서 같은 패턴은 이 한 곳이 마지막이었다.
+        근거: `src/qa/compliance.ts` · `tests/qa.compliance.test.mjs`(3건 추가)
       · Core 측 완료(94): **(93)의 시각 비교 결함이 감사·상호작용 조회에도 그대로 있었다(2026-11-04)** —
         `queryAudit`·`accessHistory` 의 기간 필터, `accessSummary` 의 첫·마지막 시각,
         `projectInteractions` 의 시작·종료 시각이 ISO 문자열을 **사전식으로** 비교했다. `+09:00`

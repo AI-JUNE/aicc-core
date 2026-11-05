@@ -166,3 +166,38 @@ test('실제로 점검한 규칙만 checked 에 남고 두 칸에 동시에 적�
   const both = r.checked.filter((c) => r.skipped.some((s) => s.ruleId === c));
   assert.deepEqual(both, []);
 });
+
+// ── 시각 표기가 섞인 이벤트 — 사전식이 아니라 순간(ms)으로 순서를 본다 ──
+const at = (n, occurredAt) => ({ ...meta(n), occurredAt });
+
+test('§10.1 +09:00 과 Z 가 섞여도 늦은 고지를 놓치지 않는다 (사전식 정렬이면 순서가 뒤집힘)', b, () => {
+  // 실제 순서: 인사(00:00:01Z) → 고지(00:00:05Z). 사전식은 "…T00:…Z" < "…T09:…+09:00" 이라 고지를 먼저 놓는다.
+  const events = [
+    ev.sessionStarted(at(0, '2026-03-01T00:00:00.000Z'), {}),
+    ev.turnCompleted(at(1, '2026-03-01T09:00:01.000+09:00'), { turnId: 't1', speaker: 'bot', utterance: '무엇을 도와드릴까요' }),
+    ev.turnCompleted(at(2, '2026-03-01T00:00:05.000Z'), { turnId: 't2', speaker: 'bot', utterance: '본 상담은 AI 상담입니다.' }),
+  ];
+  const r = qa.runComplianceCheck(events, rules(), scope);
+  assert.ok(r.findings.some((x) => x.ruleId === 'disclosure_late'));
+});
+
+test('§10.1 +09:00 과 Z 가 섞여도 제때 한 고지를 늦었다고 적지 않는다', b, () => {
+  // 실제 순서: 고지(00:00:01Z) → 인사(00:00:05Z). 사전식이면 인사가 먼저로 읽혀 허위 위반이 난다.
+  const events = [
+    ev.sessionStarted(at(0, '2026-03-01T00:00:00.000Z'), {}),
+    ev.turnCompleted(at(1, '2026-03-01T09:00:01.000+09:00'), { turnId: 't1', speaker: 'bot', utterance: '본 상담은 AI 상담입니다.' }),
+    ev.turnCompleted(at(2, '2026-03-01T00:00:05.000Z'), { turnId: 't2', speaker: 'bot', utterance: '무엇을 도와드릴까요' }),
+  ];
+  const r = qa.runComplianceCheck(events, rules(), scope);
+  assert.equal(r.findings.filter((x) => x.ruleId.startsWith('disclosure')).length, 0);
+});
+
+test('해석되지 않는 시각이 섞여도 점검은 던지지 않고 이벤트를 잃지 않는다', b, () => {
+  const events = [
+    ev.sessionStarted(at(0, '2026-03-01T00:00:00.000Z'), {}),
+    ev.turnCompleted(at(1, '시각-아님'), { turnId: 't1', speaker: 'bot', utterance: '본 상담은 AI 상담입니다.' }),
+  ];
+  const r = qa.runComplianceCheck(events, rules(), scope);
+  assert.equal(r.tenantId, 't1');
+  assert.ok(r.checked.includes('disclosure_missing'));
+});
