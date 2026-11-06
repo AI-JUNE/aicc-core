@@ -363,7 +363,8 @@ export function projectInteractions(
       ...(acc.durationMs !== undefined ? { durationMs: acc.durationMs } : {}),
     });
   }
-  rows.sort((a, b) => a.startedAt.localeCompare(b.startedAt) || a.id.localeCompare(b.id));
+  // 시작 시각은 호스트가 선언한 값이라 `+09:00` 과 `Z` 가 섞인다 — 사전식이 아니라 순간으로 정렬한다(§8.1·§13-3).
+  rows.sort((a, b) => compareInstants(a.startedAt, b.startedAt) || a.id.localeCompare(b.id));
 
   const note = indexNoteKo(counters);
   return { rows, counters, ...(note !== undefined ? { noteKo: note } : {}) };

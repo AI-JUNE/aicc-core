@@ -69,6 +69,20 @@ test('빈 입력은 행 0건이며 사실을 만들어 내지 않는다', b, () 
   assert.equal(r.noteKo, undefined);
 });
 
+test('§8.1 +09:00 과 Z 표기가 섞여도 투영 행은 시작 순간 순으로 정렬된다', b, () => {
+  // 09:00+09:00 = 00:00Z(이르다), 00:10Z(늦다). 사전식이면 이른 쪽이 뒤로 간다.
+  const early = ev.sessionStarted(meta({ eventId: 'a1', interactionId: 'early', occurredAt: '2026-01-10T09:00:00.000+09:00' }), { entryPoint: 'inbound_call' });
+  const late = ev.sessionStarted(meta({ eventId: 'b1', interactionId: 'late', occurredAt: '2026-01-10T00:10:00.000Z' }), { entryPoint: 'inbound_call' });
+  const r = m.projectInteractions([late, early], { scope });
+  assert.deepEqual(r.rows.map((x) => x.id), ['early', 'late']);
+});
+
+test('§8.1 같은 표기 시각은 종전과 같이 시작 순으로 정렬된다(회귀)', b, () => {
+  const mk = (id, sec) => ev.sessionStarted(meta({ eventId: `${id}1`, interactionId: id, occurredAt: T(sec) }), { entryPoint: 'inbound_call' });
+  const r = m.projectInteractions([mk('c', 5), mk('d', 1)], { scope });
+  assert.deepEqual(r.rows.map((x) => x.id), ['d', 'c']);
+});
+
 test('투영 결과는 질의 모듈이 그대로 거를 수 있는 모양이다 — 조회가 실제로 돈다', b, async () => {
   const q = await import('../src/portal/interactionQuery.ts');
   const r = m.projectInteractions(session(), { scope });
