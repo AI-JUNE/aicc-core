@@ -138,6 +138,17 @@ test('지연은 백분위로만 내보내고, 표본이 없으면 null 이다', 
   assert.equal(lat.stt.p95, null);
 });
 
+test('지연 표본이 아주 많아도 최댓값을 구한다(펼침 인자 한도로 죽지 않는다) · 빈 입력은 null', behavioral, () => {
+  const N = 300_000;
+  const totalMs = Array.from({ length: N }, (_, i) => i % 1000);
+  totalMs[N - 7] = 4242;
+  const lat = rp.latencyReport({ latency: { totalMs, sttMs: [], llmTtftMs: [], ttsTtfbMs: [], missing: 2 } });
+  assert.equal(lat.total.sampleCount, N);
+  assert.equal(lat.total.max, 4242);
+  assert.equal(lat.total.missing, 2);
+  assert.equal(lat.stt.max, null, '표본 없음은 0 이 아니라 null');
+});
+
 test('결측 현황이 리포트와 함께 나온다 — 완전한 표처럼 보이지 않게', behavioral, () => {
   const events = [
     ev.sessionStarted(meta(), {}),

@@ -519,8 +519,19 @@ function statOf(samples: number[], missing: number): LatencyStat {
     p50: percentile(samples, 50),
     p90: percentile(samples, 90),
     p95: percentile(samples, 95),
-    max: samples.length ? Math.max(...samples) : null,
+    max: maxOf(samples),
   };
+}
+
+/** 펼침 연산(`Math.max(...x)`)은 표본이 수십만 건이면 호출 인자 한도로 RangeError 가 난다 — 순회로 구한다. */
+function maxOf(samples: number[]): number | null {
+  if (samples.length === 0) return null;
+  let m = samples[0] as number;
+  for (let i = 1; i < samples.length; i++) {
+    const v = samples[i] as number;
+    if (v > m) m = v;
+  }
+  return m;
 }
 
 export interface LatencyReport {
