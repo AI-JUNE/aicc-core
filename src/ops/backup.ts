@@ -655,7 +655,9 @@ export function createMemoryRestoreSink(opts: { name?: string; failOnBatch?: num
     async write(records) {
       const idx = batch++;
       if (opts.failOnBatch === idx) throw new Error(`배치 ${idx} 쓰기 거부(리허설 주입 실패)`);
-      store.push(...records);
+      // 펼침(`push(...records)`)은 배치가 수십만 건이면 호출 인자 한도로 RangeError 가 난다 —
+      // 호스트가 batchSize 를 크게 잡으면 리허설이 "쓰기 실패"로 잘못 보고된다. 순회로 넣는다.
+      for (const r of records) store.push(r);
     },
     async readAll() { return store.slice(); },
   };

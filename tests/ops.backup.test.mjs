@@ -378,3 +378,16 @@ test('되읽기가 던져도 리허설은 죽지 않고 failed 로 보고한다'
   assert.equal(report.verdict, 'failed');
   assert.ok(report.issues.some((i) => i.includes('되읽기 실패')));
 });
+
+test('리허설 복구 대상은 배치가 수십만 건이어도 RangeError 없이 모두 쓴다(펼침 인자 한도)', b, async () => {
+  const sink = m.createMemoryRestoreSink();
+  await sink.write(many(300_000));
+  assert.equal(sink.written.length, 300_000);
+  assert.equal((await sink.readAll()).length, 300_000);
+});
+
+test('리허설 복구 대상의 주입 실패는 여전히 던지고 기록을 남기지 않는다', b, async () => {
+  const sink = m.createMemoryRestoreSink({ failOnBatch: 0 });
+  await assert.rejects(() => sink.write(many(3)), /리허설 주입 실패/);
+  assert.equal(sink.written.length, 0);
+});
