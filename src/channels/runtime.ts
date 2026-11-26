@@ -99,6 +99,7 @@ import type {
   ChannelTurnInput, ChannelTurnResult, ConversationCorePort, ContractIssue, ChannelCapabilities,
   ConnectorResultNote, HealthIntakeReceipt, SwitchInviteNote,
 } from './contract.ts';
+import { uniqueSuffix } from '../domain/ids.ts';
 import { ADAPTER_CHANNEL, CHANNEL_CONTRACT_VERSION, checkFlowSupported, registrationOk, validateRegistration } from './contract.ts';
 
 /**
@@ -1084,7 +1085,7 @@ export function createConversationCore(opts: ConversationCoreOptions): Conversat
 
   const sessions = opts.sessions ?? createMemorySessionStore();
   const now = opts.now ?? (() => new Date().toISOString());
-  const newId = opts.newInteractionId ?? ((req) => `i_${req.adapter}_${Date.now().toString(36)}`);
+  const newId = opts.newInteractionId ?? ((req) => `i_${req.adapter}_${uniqueSuffix()}`);
   const warnings: ContractIssue[] = [];
   const regs = new Map<ChannelAdapterId, ChannelRegistration>();
   const declared = new Map<ChannelAdapterId, Set<ComponentId>>();

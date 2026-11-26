@@ -2,8 +2,9 @@
 // 고객이 전화→화면→채팅으로 옮겨가도 하나의 Interaction으로 유지한다.
 import type { ChannelKind, Interaction, Turn } from '../domain/types.ts';
 import { maskPii } from './policyGuard.ts';
+import { uniqueSuffix } from '../domain/ids.ts';
 
-export function createInteraction(tenantId: string, channel: ChannelKind, id = `i_${Date.now().toString(36)}`): Interaction {
+export function createInteraction(tenantId: string, channel: ChannelKind, id = `i_${uniqueSuffix()}`): Interaction {
   return { id, tenantId, startedAt: new Date().toISOString(), channels: [channel], turns: [], entities: {} };
 }
 

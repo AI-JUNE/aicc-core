@@ -641,6 +641,15 @@
         `matchesQuery` 는 이미 `Date.parse` 였다.
         근거: `src/domain/instant.ts` · `src/audit/log.ts` · `src/audit/access.ts` ·
         `src/portal/executeInteractions.ts` · `tests/domain.instant.test.mjs`(6건) · `API.md` 반영
+      · Core 측 보강(2026-11-26): **상호작용 ID 기본 생성기가 밀리초 시계뿐이라, 같은 밀리초에
+        시작한 두 통화가 같은 ID 를 받아 세션 저장소에서 서로를 덮어썼다**(§11.1·§13-3).
+        `createConversationCore` 의 기본값(`i_<어댑터>_<ms>`)과 `createInteraction` 기본값이 그랬다 —
+        예외도 로그도 없고 저부하에서는 재현되지 않으며, 먼저 시작한 통화의 상태가 사라진 채 두
+        호출자가 한 세션을 쓴다. `domain/ids.ts`(`uniqueSuffix`)가 ms 뒤에 프로세스 내 단조 증가
+        일련번호를 덧붙인다(난수 미사용 — 시계를 고정해도 결정적). 프로세스가 여럿이면 호스트가
+        `newInteractionId` 로 인스턴스 식별자를 넣어야 한다(여기서 지어내지 않는다).
+        근거: `src/domain/ids.ts` · `src/channels/runtime.ts` · `src/core/session.ts` ·
+        `tests/domain.ids.test.mjs`(4건) · `API.md` 반영
       · Core 측 완료(92): **리뷰 큐 적재 실패가 점검 요약을 지웠고, 전환 초대 거절 사유에
         1회용 열쇠가 실려 나갔고, 과금 근거의 "버려진 수량" 목록만 원본 참조로 나갔고,
         흡수한 중복 종료가 live 포트에서도 드라이런으로 적혔다(2026-11-02)** — 넷 다
