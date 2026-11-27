@@ -147,7 +147,7 @@ export function dedupeHits(hits: readonly VectorHit[]): { hits: VectorHit[]; dro
     if (h.score > prev.score) byId.set(h.id, h);
   }
   const out: VectorHit[] = [];
-  for (const byId of byNamespace.values()) out.push(...byId.values());
+  for (const byId of byNamespace.values()) for (const h of byId.values()) out.push(h);
   return { hits: out, dropped };
 }
 
@@ -256,7 +256,7 @@ export function createRetriever(cfg: RetrieverConfig): Retriever {
       const failures: KnowledgeBaseFailure[] = [];
       const collected: VectorHit[] = [];
       for (const s of settled) {
-        if (s.ok) collected.push(...s.hits);
+        if (s.ok) for (const h of s.hits) collected.push(h);
         else failures.push({ knowledgeBaseId: s.kbId, code: s.code, reasonKo: s.reasonKo });
       }
       usage.hits = collected.length;

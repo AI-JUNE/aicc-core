@@ -224,3 +224,22 @@ test('설정 오류는 생성 시점에 던진다', b, () => {
   assert.throws(() => make(a, { timeoutMs: -1 }), /timeoutMs/);
   assert.throws(() => m.createEmbedder({ scope: { tenantId: '' }, embedding: a }), /./);
 });
+
+// ── 대량 입력: 배치가 수십만 건이어도 인자 펼침 한도로 죽지 않는다 ───────────────
+
+test('대량: 기본 배치(단일 호출)로 수십만 건을 받아도 RangeError 없이 전부 돌려준다', b, async () => {
+  const N = 300_000;
+  const one = [0.1, 0.2];
+  const e = fakeEmb((texts) => texts.map(() => one));
+  const texts = Array.from({ length: N }, (_, i) => `문장 ${i}`);
+  const r = await make(e.adapter).embedTexts(texts);
+  assert.equal(r.status, 'ok');
+  assert.equal(r.vectors.length, N);
+});
+
+test('대량: 실패 경로 — 개수 불일치는 대량이어도 protocol_error 로 끝난다', b, async () => {
+  const e = fakeEmb((texts) => texts.slice(1).map(() => [0.1, 0.2]));
+  const texts = Array.from({ length: 300_000 }, (_, i) => `문장 ${i}`);
+  const r = await make(e.adapter).embedTexts(texts);
+  assert.equal(r.status, 'protocol_error');
+});

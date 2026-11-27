@@ -244,7 +244,8 @@ export function createEmbedder(cfg: EmbedderConfig): Embedder {
         failures.push({ from, to, code: 'E_PROTOCOL', reasonKo: batchBad });
         continue;
       }
-      vectors.push(...(got as number[][]));
+      // 펼침(push(...x))은 배치가 수십만 건이면 호출 인자 한도로 RangeError 가 난다 — 순회로 담는다.
+      for (const v of got as number[][]) vectors.push(v);
     }
 
     const usage = {
